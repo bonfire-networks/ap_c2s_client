@@ -3,15 +3,14 @@ const CACHE_VERSION = '0.1.5';
 const CACHE_NAME = `${CACHE_PREFIX}-${CACHE_VERSION}`;
 
 const APP_SHELL = [
-  "/",
-  "/index.html",
-  "/js/checkin-activity.js",
-  "/js/checkin-choose-place.js",
-  "/js/checkin-element.js",
-  "/js/checkin-home.js",
-  "/js/checkin-inbox.js",
-  "/js/checkin-login.js",
-  "/js/checkin-save.js",
+  "../",
+  "../index.html",
+  "activitypub/activitypub-activity.js",
+  "activitypub/activitypub-inbox.js",
+  "checkin-element.js",
+  "checkin-home.js",
+  "checkin-login.js",
+  "checkin-save.js",
   "https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.15.0/cdn/themes/light.css",
   "https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.15.0/cdn/shoelace.js",
   "https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap",

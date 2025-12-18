@@ -5,10 +5,18 @@ import {
 } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
 
 import * as oauth from 'https://cdn.jsdelivr.net/npm/oauth4webapi@3/+esm'
+import {
+  getActorId,
+  getActor,
+  // getCurrentActor,
+  getAuthorizationEndpoint,
+  getTokenEndpoint,
+  getProxyUrl,
+  buildAuthorizationUrl
+} from './activitypub/auth.js'
 
 export class CheckinLoginElement extends LitElement {
-  WEBFINGER_REGEXP =
-    /^(?:acct:)?(?<username>[^@]+)@(?<domain>(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*)$/
+
 
   static styles = css`
     :host {
@@ -90,67 +98,12 @@ export class CheckinLoginElement extends LitElement {
   }
 
   isWebfinger (str) {
-    return this.WEBFINGER_REGEXP.test(str)
+    // Use the same regexp as in login.js
+    return getActorId.WEBFINGER_REGEXP
+      ? getActorId.WEBFINGER_REGEXP.test(str)
+      : /^(?:acct:)?[^@]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$/.test(str)
   }
 
-  async getActorId (id) {
-    const m = this.WEBFINGER_REGEXP.exec(id)
-    if (!m) {
-      throw new Error('bad Webfinger format')
-    }
-    const username = m.groups.username
-    const domain = m.groups.domain
-    const wfUrl = `https://${domain}/.well-known/webfinger?resource=acct:${username}%40${domain}`
-    const res = await fetch(wfUrl, {
-      headers: {
-        Accept: 'application/jrd+json,application/json'
-      }
-    })
-    if (!res.ok) {
-      throw new Error('Could not load webfinger')
-    }
-    const json = await res.json()
-    if (!json.links) {
-      throw new Error('No links in webfinger json')
-    }
-    const actorLink = json.links.find(
-      (obj) =>
-        obj.rel == 'self' &&
-        [
-          'application/activity+json',
-          'application/ld+json; profile="https://www.w3.org/ns/activitystreams"'
-        ].includes(obj.type)
-    )
-    if (!actorLink) {
-      throw new Error('No ActivityPub actor ID in Webfinger')
-    }
-    return actorLink.href
-  }
-
-  async getActor (actorId) {
-    const res = await fetch(actorId, {
-      headers: {
-        Accept:
-          'application/activity+json,application/lrd+json,application/json'
-      }
-    })
-    if (!res.ok) {
-      throw new Error('Failure fetching actor')
-    }
-    return await res.json()
-  }
-
-  async getAuthorizationEndpoint (actor) {
-    return actor.endpoints?.oauthAuthorizationEndpoint
-  }
-
-  async getTokenEndpoint (actor) {
-    return actor.endpoints?.oauthTokenEndpoint
-  }
-
-  async getProxyUrl (actor) {
-    return actor.endpoints?.proxyUrl
-  }
 
   async _login () {
     const webfingerInput = this.shadowRoot.querySelector('#webfinger')
@@ -160,28 +113,17 @@ export class CheckinLoginElement extends LitElement {
       return
     }
     try {
-      const actorId = await this.getActorId(id)
-      console.log('Actor ID:', actorId)
+      const actorId = await getActorId(id)
       localStorage.setItem('actor_id', actorId)
-      const actor = await this.getActor(actorId)
-      console.log('Actor:', actor)
-      const tokenUrl = await this.getTokenEndpoint(actor)
-      console.log('Token URL:', tokenUrl)
-      if (!tokenUrl) {
-        throw new Error('No OAuth token endpoint.')
-      }
+      const actor = await getActor(actorId)
+      const tokenUrl = getTokenEndpoint(actor)
+      if (!tokenUrl) throw new Error('No OAuth token endpoint.')
       localStorage.setItem('token_endpoint', tokenUrl)
-      const proxyUrl = await this.getProxyUrl(actor)
-      console.log('Proxy URL:', proxyUrl)
-      if (!proxyUrl) {
-        throw new Error('No Proxy endpoint.')
-      }
+      const proxyUrl = getProxyUrl(actor)
+      if (!proxyUrl) throw new Error('No Proxy endpoint.')
       localStorage.setItem('proxy_url', proxyUrl)
-      const authorizationUrl = await this.getAuthorizationEndpoint(actor)
-      console.log('Authorization URL:', authorizationUrl)
-      if (!authorizationUrl) {
-        throw new Error('No OAuth authorization endpoint.')
-      }
+      const authorizationUrl = getAuthorizationEndpoint(actor)
+      if (!authorizationUrl) throw new Error('No OAuth authorization endpoint.')
       localStorage.setItem('authorization_endpoint', authorizationUrl)
 
       const code_verifier = oauth.generateRandomCodeVerifier()
@@ -191,18 +133,27 @@ export class CheckinLoginElement extends LitElement {
       sessionStorage.setItem('code_verifier', code_verifier)
       sessionStorage.setItem('state', state)
 
-      const url = new URL(authorizationUrl)
-
-      url.searchParams.set('client_id', this.clientId)
-      url.searchParams.set('redirect_uri', this.redirectUri)
-      url.searchParams.set('response_type', 'code')
-      url.searchParams.set('scope', 'read write')
-      url.searchParams.set('code_challenge', code_challenge)
-      url.searchParams.set('code_challenge_method', 'S256')
-      url.searchParams.set('state', state)
-
-      window.location.href = url.toString() // redirect to auth server
+      const url = buildAuthorizationUrl({
+        authorizationUrl,
+        clientId: this.clientId,
+        redirectUri: this.redirectUri,
+        codeChallenge: code_challenge,
+        state
+      })
+      console.log('[checkin-login] Redirecting to OAuth authorize:', {
+        clientId: this.clientId,
+        redirectUri: this.redirectUri,
+        authorizationUrl,
+        tokenUrl,
+        proxyUrl,
+        code_verifier,
+        code_challenge,
+        state,
+        url
+      });
+      window.location.href = url
     } catch (error) {
+      console.error('[checkin-login] Error during login:', error);
       this._error = error.message
     }
   }

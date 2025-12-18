@@ -5,6 +5,7 @@ import {
 } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
 
 import * as oauth from 'https://cdn.jsdelivr.net/npm/oauth4webapi@3/+esm'
+import { handleLogin } from './activitypub/auth.js'
 
 export class CheckinSaveElement extends LitElement {
   static get properties () {
@@ -28,7 +29,7 @@ export class CheckinSaveElement extends LitElement {
 
   connectedCallback () {
     super.connectedCallback()
-    this.handleLogin()
+    handleLogin.call(this)
       .then(() => {
         window.location = this.redirectUri
       })
@@ -42,66 +43,6 @@ export class CheckinSaveElement extends LitElement {
     localStorage.removeItem('code_verifier')
   }
 
-  saveResult (result) {
-    localStorage.setItem('access_token', result.access_token)
-    localStorage.setItem('refresh_token', result.refresh_token)
-    localStorage.setItem('expires_in', result.expires_in)
-    localStorage.setItem(
-      'expires',
-      Date.now() + result.expires_in * 1000
-    )
-  }
-
-  async handleLogin () {
-    const authorizationServer = {
-      issuer: (new URL(localStorage.getItem('actor_id'))).origin,
-      authorization_endpoint: localStorage.getItem('authorization_endpoint'),
-      token_endpoint: localStorage.getItem('token_endpoint'),
-      code_challenge_methods_supported: ['S256'],
-      scopes_supported: ['read', 'write'],
-      response_types_supported: ['code'],
-      grant_types_supported: ['authorization_code', 'refresh_token']
-    }
-    const clientAuth = oauth.None()
-    const client = {
-      client_id: this.clientId
-    }
-
-    const state = sessionStorage.getItem('state')
-    const codeVerifier = sessionStorage.getItem('code_verifier')
-
-    try {
-      const params = oauth.validateAuthResponse(
-        authorizationServer,
-        client,
-        new URLSearchParams(window.location.search),
-        state
-      )
-
-      const response = await oauth.authorizationCodeGrantRequest(
-        authorizationServer,
-        client,
-        clientAuth,
-        params,
-        this.redirectUri,
-        codeVerifier
-      )
-
-      const result = await oauth.processAuthorizationCodeResponse(
-        authorizationServer,
-        client,
-        response
-      )
-
-      this.saveResult(result)
-
-      this.clearSession()
-
-      window.location = this.successUri
-    } catch (error) {
-      this._error = error.message
-    }
-  }
 
   render () {
     return (this._error)

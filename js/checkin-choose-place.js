@@ -4,6 +4,7 @@ import {
   LitElement
 } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
 import { CheckinElement } from './checkin-element.js'
+import { getCurrentActor } from './activitypub/auth.js'
 
 export class CheckinChoosePlaceElement extends CheckinElement {
   static styles = css`
@@ -197,7 +198,7 @@ export class CheckinChoosePlaceElement extends CheckinElement {
     const place = this._places.find((p) => p.id === this._selectedPlace)
     if (!place) return
 
-    const actor = await this.getActor()
+    const actor = await getCurrentActor()
     const content = (this._note) ? this._note.trim() : undefined
 
     const activity = {

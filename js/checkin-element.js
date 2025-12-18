@@ -1,3 +1,6 @@
+
+// ActivityPub base logic for C2S messaging, fetch, and helpers
+
 import {
   html,
   css,
@@ -7,26 +10,28 @@ import {
 
 import * as oauth from 'https://cdn.jsdelivr.net/npm/oauth4webapi@3/+esm'
 
+import { getCurrentActor, apFetch } from './activitypub/auth.js'
+
 export class CheckinElement extends LitElement {
-  static get properties () {
+  static get properties() {
     return {
       redirectUri: { type: String, attribute: 'redirect-uri' },
       clientId: { type: String, attribute: 'client-id' }
     }
   }
 
-  constructor () {
+  constructor() {
     super()
   }
 
-  async doActivity (obj) {
+  async doActivity(obj) {
     let outbox = localStorage.getItem('outbox')
     if (!outbox) {
-      const actor = await this.getActor()
+      const actor = await getCurrentActor()
       outbox = actor.outbox
       localStorage.setItem('outbox', outbox)
     }
-    const res = await this.apFetch(outbox, {
+    const res = await apFetch(outbox, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/activity+json'
@@ -39,105 +44,10 @@ export class CheckinElement extends LitElement {
     return await res.json()
   }
 
-  saveResult (result) {
-    localStorage.setItem('access_token', result.access_token)
-    localStorage.setItem('refresh_token', result.refresh_token)
-    localStorage.setItem('expires_in', result.expires_in)
-    localStorage.setItem(
-      'expires',
-      Date.now() + result.expires_in * 1000
-    )
-  }
 
-  async ensureFreshToken () {
-    const expires = parseInt(localStorage.getItem('expires'))
-    if (Date.now() > expires) {
-      const authorizationServer = {
-        issuer: (new URL(localStorage.getItem('actor_id'))).origin,
-        authorization_endpoint: localStorage.getItem('authorization_endpoint'),
-        token_endpoint: localStorage.getItem('token_endpoint'),
-        code_challenge_methods_supported: ['S256'],
-        scopes_supported: ['read', 'write'],
-        response_types_supported: ['code'],
-        grant_types_supported: ['authorization_code', 'refresh_token']
-      }
-      const clientAuth = oauth.None()
-      const client = {
-        client_id: this.clientId
-      }
-      const refreshToken = localStorage.getItem('refresh_token')
-      try {
-        const response = await oauth.refreshTokenGrantRequest(
-          authorizationServer,
-          client,
-          clientAuth,
-          refreshToken
-        )
-        const result = await oauth.processRefreshTokenResponse(
-          authorizationServer,
-          client,
-          response
-        )
-        this.saveResult(result)
-      } catch (error) {
-        console.error(error)
-      }
-    }
-  }
 
-  async apFetch (url, options = {}) {
-    await this.ensureFreshToken()
-    const accessToken = localStorage.getItem('access_token')
-    const actorId = localStorage.getItem('actor_id')
-    const urlObj = (typeof url === 'string')
-      ? new URL(url)
-      : url
-    if (urlObj.origin == URL.parse(actorId).origin) {
-      return await oauth.protectedResourceRequest(
-        accessToken,
-        options.method || 'GET',
-        urlObj,
-        options.headers,
-        options.body
-      )
-    } else {
-      const proxyUrl = localStorage.getItem('proxy_url')
-      return await oauth.protectedResourceRequest(
-        accessToken,
-        'POST',
-        proxyUrl,
-        {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        new URLSearchParams({
-          id: urlObj.toString()
-        })
-      )
-    }
-  }
 
-  async getActor () {
-    const actorJSON = localStorage.getItem('actor')
-    if (actorJSON) {
-      return JSON.parse(actorJSON)
-    } else {
-      const actorId = localStorage.getItem('actor_id')
-      const res = await this.apFetch(actorId, {
-        headers: {
-          Accept:
-            'application/activity+json,application/lrd+json,application/json'
-        }
-      })
-      if (!res.ok) {
-        throw new Error('Failure fetching actor')
-      }
-      const actor = await res.json()
-      localStorage.setItem('actor', JSON.stringify(actor))
-      return actor
-    }
-  }
-
-  async _getAllItems (arr) {
+  async _getAllItems(arr) {
     return await Promise.all(
       arr.map((i) =>
         this.toObject(i, { required: ['id', 'type', 'published'] })
@@ -145,7 +55,7 @@ export class CheckinElement extends LitElement {
     )
   }
 
-  async * items (coll) {
+  async * items(coll) {
     const collection = await this.toObject(coll, { noCache: true })
     if (collection.items) {
       const objects = await this._getAllItems(collection.items)
@@ -177,7 +87,7 @@ export class CheckinElement extends LitElement {
     }
   }
 
-  async toId (item) {
+  async toId(item) {
     return typeof item === 'string'
       ? item
       : typeof item === 'object' && item.id && typeof item.id === 'string'
@@ -185,7 +95,7 @@ export class CheckinElement extends LitElement {
         : null
   }
 
-  async toObject (item, options = { noCache: false, required: null }) {
+  async toObject(item, options = { noCache: false, required: null }) {
     const { noCache, required } = options
     if (
       required &&
@@ -209,7 +119,7 @@ export class CheckinElement extends LitElement {
       }
     }
     try {
-      const res = await this.apFetch(id, {
+      const res = await apFetch(id, {
         headers: {
           Accept:
             'application/activity+json,application/lrd+json,application/json'
@@ -232,7 +142,7 @@ export class CheckinElement extends LitElement {
     return json
   }
 
-  getIcon (object) {
+  getIcon(object) {
     return this.getUrl(object, {
       prop: 'icon',
       types: [
@@ -247,7 +157,7 @@ export class CheckinElement extends LitElement {
     })
   }
 
-  getUrl (object, options = { prop: 'url', types: ['text/html'] }) {
+  getUrl(object, options = { prop: 'url', types: ['text/html'] }) {
     const { prop, types } = options
     if (!object) return null
     if (!typeof object == 'object') return null
@@ -278,7 +188,7 @@ export class CheckinElement extends LitElement {
     }
   }
 
-  attrEscape (s) {
+  attrEscape(s) {
     return s
       .replace(/&/g, '&amp;')
       .replace(/"/g, '&quot;')
@@ -287,11 +197,11 @@ export class CheckinElement extends LitElement {
       .replace(/>/g, '&gt;')
   }
 
-  contentEscape (s) {
+  contentEscape(s) {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   }
 
-  makeSummaryPart (object, def = '(something)') {
+  makeSummaryPart(object, def = '(something)') {
     const name = object ? (object.name ? object.name : def) : def
     const url = this.getUrl(object)
     return url
@@ -299,7 +209,7 @@ export class CheckinElement extends LitElement {
       : `${this.contentEscape(name)}`
   }
 
-  makeSummary (activity) {
+  makeSummary(activity) {
     const actorPart = this.makeSummaryPart(activity.actor, '(someone)')
     switch (activity.type) {
       case 'Arrive': {

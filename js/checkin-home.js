@@ -6,7 +6,8 @@ import {
 
 import { CheckinElement } from './checkin-element.js'
 import { CheckinChoosePlaceElement } from './checkin-choose-place.js'
-import { CheckinInboxElement } from './checkin-inbox.js'
+import { CheckinInboxElement } from './activitypub/activitypub-inbox.js'
+import { getCurrentActor } from './activitypub/auth.js'
 
 export class CheckinHomeElement extends CheckinElement {
   static styles = css`
@@ -49,7 +50,7 @@ export class CheckinHomeElement extends CheckinElement {
 
   connectedCallback () {
     super.connectedCallback()
-    this.getActor()
+    getCurrentActor()
       .then((actor) => {
         this._actor = actor
       })
@@ -97,7 +98,7 @@ export class CheckinHomeElement extends CheckinElement {
 
     <main>
       ${(this._route === 'inbox')
-        ? html`<checkin-inbox redirect-uri=${this.redirectUri} client-id=${this.clientId} />`
+      ? html`<activitypub-inbox redirect-uri=${this.redirectUri} client-id=${this.clientId} />`
         : (this._route === 'checkin')
           ? html`<checkin-choose-place redirect-uri=${this.redirectUri}   client-id=${this.clientId} />`
           : html`<sl-alert>Unknown route</sl-alert>`

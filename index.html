@@ -53,29 +53,49 @@
       </div>
     </div>
     <script type="module">
-      const client_id = "https://checkin.swf.pub/client.jsonld";
-      const redirect_uri = "https://checkin.swf.pub/";
+            let basePath = window.location.pathname;
+            if (basePath.endsWith('index.html')) {
+              basePath = basePath.slice(0, -'index.html'.length);
+            }
+            if (!basePath.endsWith('/')) basePath += '/';
+            const client_id = window.location.origin + basePath + 'client.jsonld';
+
+            let path = window.location.origin + window.location.pathname;
+            const redirect_uri = path;
 
       document.addEventListener("DOMContentLoaded", () => {
         const params = new URLSearchParams(window.location.search);
-        document.getElementById("page").innerHTML = params.get("state")
-          ? `<checkin-save
+        const hasCode = params.has("code");
+        const hasState = params.has("state");
+        const hasToken = !!localStorage.getItem("access_token");
+        console.log("Routing:", {
+          code: params.get("code"),
+          state: params.get("state"),
+          access_token: hasToken,
+        });
+        if (hasCode || hasState) {
+          console.log("Rendering <checkin-save> for OAuth code exchange");
+          document.getElementById("page").innerHTML = `<checkin-save
                 client-id=${client_id}
                 redirect-uri=${redirect_uri}
                 success-uri=${redirect_uri}
-              />`
-          : !localStorage.getItem("access_token")
-            ? `<checkin-login
-                client-id=${client_id}
-                redirect-uri=${redirect_uri} />`
-            : `<checkin-home
+              />`;
+        } else if (!hasToken) {
+          console.log("Rendering <checkin-login> (no access_token)");
+          document.getElementById("page").innerHTML = `<checkin-login
                 client-id=${client_id}
                 redirect-uri=${redirect_uri} />`;
+        } else {
+          console.log("Rendering <checkin-home> (already logged in)");
+          document.getElementById("page").innerHTML = `<checkin-home
+                client-id=${client_id}
+                redirect-uri=${redirect_uri} />`;
+        }
       });
       if ("serviceWorker" in navigator) {
         window.addEventListener("load", () => {
           navigator.serviceWorker
-            .register("/js/service-worker.js")
+            .register(basePath + "js/service-worker.js")
             .catch((err) => console.error("SW registration failed:", err));
         });
       }
