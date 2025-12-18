@@ -36,8 +36,9 @@ export class E2EEChatView extends LitElement {
       overflow-y: auto;
       padding: 1rem;
     }
-    .message-input {
+    .message-inputs {
       display: flex;
+      flex-direction: column;
       gap: 1rem;
       padding: 1rem;
       border-top: 1px solid #e5e7eb;
@@ -67,6 +68,8 @@ export class E2EEChatView extends LitElement {
             selectedGroupId: { type: String, state: true },
             messages: { type: Array, state: true },
             input: { type: String, state: true },
+            name: { type: String, state: true },
+            summary: { type: String, state: true },
             loading: { type: Boolean, state: true },
             error: { type: String, state: true }
         }
@@ -78,6 +81,8 @@ export class E2EEChatView extends LitElement {
         this.selectedGroupId = null
         this.messages = []
         this.input = ''
+        this.name = ''
+        this.summary = ''
         this.loading = false
         this.error = ''
     }
@@ -173,10 +178,14 @@ export class E2EEChatView extends LitElement {
             const msgObj = {
                 type: 'Note',
                 id: 'uri:uuid:' + this.ulid(),
+                name: this.name.trim(),
+                summary: this.summary.trim(),
                 content: this.input.trim()
             };
             await saveMessage(this.selectedGroupId, msgObj, msgObj.id, true);
             this.input = '';
+            this.name = '';
+            this.summary = '';
             await this.loadMessages(this.selectedGroupId);
         } catch (e) {
             this.error = e.message;
@@ -206,10 +215,28 @@ export class E2EEChatView extends LitElement {
         </div>
         <div class="messages-pane">
           <div class="messages-list">
-            ${this.messages.map(msg => html`<div class="mb-2">${this.decryptedContent(msg)}</div>`)}
+            ${this.messages.map((msg, idx) => {
+                const hasSummary = msg && msg.summary;
+                const showContent = this[`showContent${idx}`] || false;
+                return html`
+                <hr/>
+                <div class="mb-2">
+                  ${msg.name ? html`<strong class="font-bold">${msg.name}</div>` : ''}
+                  ${hasSummary ? html`
+                    <div class="italic text-gray-600">${msg.summary}</div>
+                    <button class="send-btn" style="margin:0.5em 0;" @click=${() => { this[`showContent${idx}`] = !showContent; this.requestUpdate(); }}>
+                      ${showContent ? 'Hide' : 'Show'} Content
+                    </button>
+                  ` : ''}
+                  ${!hasSummary || showContent ? html`<div>${msg.content}</div>` : ''}
+                </div>
+              `;
+            })}
           </div>
-          <form class="message-input" @submit=${e => { e.preventDefault(); this.sendMessage(); }}>
-            <input class="input" type="text" .value=${this.input} @input=${e => this.input = e.target.value} placeholder="Type a message..." />
+          <form class="message-inputs" @submit=${e => { e.preventDefault(); this.sendMessage(); }}>
+            <input class="input" type="text" .value=${this.name} @input=${e => this.name = e.target.value} placeholder="Name (optional)" />
+            <input class="input" type="text" .value=${this.summary} @input=${e => this.summary = e.target.value} placeholder="CW / Summary (optional)" />
+            <textarea class="input" .value=${this.input} @input=${e => this.input = e.target.value} placeholder="Type a message..." ></textarea>
             <button class="send-btn" type="submit">Send</button>
           </form>
           ${this.error ? html`<div class="text-red-500 mt-2">${this.error}</div>` : ''}

@@ -131,10 +131,10 @@ export async function listGroupsWithLastMessage() {
         // Find all messages for this group
         const groupMsgs = allMessages.filter(m => m.state.groupId === g.id);
         // Sort by id or add a timestamp to message state for better sorting
-        groupMsgs.sort((a, b) => (b.state.timestamp || 0) - (a.state.timestamp || 0));
+        groupMsgs.sort((a, b) => (a.state.timestamp || 0) - (b.state.timestamp || 0)); // ascending
         const lastMsg = groupMsgs.length > 0 ? {
-          id: groupMsgs[0].id,
-          ...groupMsgs[0].state
+          id: groupMsgs[groupMsgs.length - 1].id,
+          ...groupMsgs[groupMsgs.length - 1].state
         } : null;
         return {
           groupId: g.id,
