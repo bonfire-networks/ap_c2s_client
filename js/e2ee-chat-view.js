@@ -130,7 +130,14 @@ export class E2EEChatView extends LitElement {
     async loadGroups() {
         this.loading = true
         try {
-            this.groups = await this.listGroupsWithLastMessageDecrypted();
+            let groups = await this.listGroupsWithLastMessageDecrypted();
+            // Sort groups by most recent ULID (descending)
+            groups.sort((a, b) => {
+                const aUlid = a.lastMessage && a.lastMessage.id ? a.lastMessage.id.replace(/^uri:uuid:/, '') : a.id;
+                const bUlid = b.lastMessage && b.lastMessage.id ? b.lastMessage.id.replace(/^uri:uuid:/, '') : b.id;
+                return bUlid.localeCompare(aUlid);
+            });
+            this.groups = groups;
             console.log('Decrypted groups with last messages:', this.groups);
             if (this.groups.length > 0 && !this.selectedGroupId) {
                 this.selectedGroupId = this.groups[0].id;
@@ -194,7 +201,7 @@ export class E2EEChatView extends LitElement {
     }
     
     decryptedSummary(msg) {
-        return typeof msg === 'string' ? msg : msg && (msg.name || msg.summary || this.decryptedContent(msg.content))
+        return typeof msg === 'string' ? msg : msg && (msg.name || msg.summary || msg.content)
     }
 
     decryptedContent(msg) {
@@ -208,8 +215,8 @@ export class E2EEChatView extends LitElement {
           <button class="send-btn" style="width:90%;margin:1rem;" @click=${() => this.createNewGroup()}>+ New Thread</button>
           ${this.groups.map(g => html`
             <div class="group-item ${this.selectedGroupId === g.id ? 'selected' : ''}" @click=${() => this.loadMessages(g.id)}>
-              <div><b>Group:</b> ${g.id}</div>
-              <div style="font-size:0.9em;color:#555;">${g.isEncrypted ? '[Encrypted]' : ''} ${this.decryptedSummary(g.decryptedContent) || this.decryptedSummary(g.lastMessage) || ''}</div>
+              <div>${g.id}</div>
+              <div style="font-size:0.9em;color:#555;">${this.decryptedSummary(g.decryptedContent) || this.decryptedSummary(g.lastMessage && g.lastMessage.content) || ''}</div>
             </div>
           `)}
         </div>
@@ -221,14 +228,14 @@ export class E2EEChatView extends LitElement {
                 return html`
                 <hr/>
                 <div class="mb-2">
-                  ${msg.name ? html`<strong class="font-bold">${msg.name}</div>` : ''}
+                  ${msg && msg.name ? html`<strong class="font-bold">${msg.name}</strong>` : ''}
                   ${hasSummary ? html`
                     <div class="italic text-gray-600">${msg.summary}</div>
                     <button class="send-btn" style="margin:0.5em 0;" @click=${() => { this[`showContent${idx}`] = !showContent; this.requestUpdate(); }}>
                       ${showContent ? 'Hide' : 'Show'} Content
                     </button>
                   ` : ''}
-                  ${!hasSummary || showContent ? html`<div>${msg.content}</div>` : ''}
+                  ${!hasSummary || showContent ? html`<div>${msg && msg.content}</div>` : ''}
                 </div>
               `;
             })}
