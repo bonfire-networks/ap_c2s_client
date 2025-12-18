@@ -5,8 +5,7 @@ import {
 } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
 
 import { CheckinElement } from './checkin-element.js'
-import { CheckinChoosePlaceElement } from './checkin-choose-place.js'
-import { CheckinInboxElement } from './activitypub/activitypub-inbox.js'
+import { E2EEChatView } from './e2ee-chat-view.js'
 import { getCurrentActor } from './activitypub/auth.js'
 
 export class CheckinHomeElement extends CheckinElement {
@@ -74,11 +73,8 @@ export class CheckinHomeElement extends CheckinElement {
 
     <header>
 
-      <span class="brand"><a href="#">Checkin</a></span>
+      <span class="brand"><a href="#">Messages</a></span>
 
-      <sl-button href="#checkin" variant="primary">
-        +
-      </sl-button>
 
       <!-- User menu dropdown -->
       <sl-dropdown>
@@ -97,16 +93,11 @@ export class CheckinHomeElement extends CheckinElement {
     </header>
 
     <main>
-      ${(this._route === 'inbox')
-      ? html`<activitypub-inbox redirect-uri=${this.redirectUri} client-id=${this.clientId} />`
-        : (this._route === 'checkin')
-          ? html`<checkin-choose-place redirect-uri=${this.redirectUri}   client-id=${this.clientId} />`
-          : html`<sl-alert>Unknown route</sl-alert>`
-      }
+    <e2ee-chat-view redirect-uri=${this.redirectUri} client-id=${this.clientId} />
     </main>
 
     <footer>
-      <a href="https://github.com/social-web-foundation/checkin/">GitHub</a>
+      <a href="https://github.com/bonfire-networks/ap_c2s_client">Code</a>
     </footer>
     `
   }

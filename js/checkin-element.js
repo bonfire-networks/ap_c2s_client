@@ -1,4 +1,3 @@
-
 // ActivityPub base logic for C2S messaging, fetch, and helpers
 
 import {
@@ -231,7 +230,13 @@ export class CheckinElement extends LitElement {
         return `${actorPart} travelled from ${originPart} to ${targetPart}`
         break
       }
+      case 'Note': {
+        // Show the note content or name
+        const content = activity.name || activity.summary || activity.content || '(no content)';
+        return `${this.contentEscape(content)}`;
+      }
       default: {
+        console.log('Unknown activity type:', activity)
         return '(Unknown activity)'
       }
     }
