@@ -38,9 +38,9 @@ export class OpenMLS {
     this.provider = provider;
   }
 
-  static async saveGroupState(id, group) {
+  static async saveGroupState(id, group, metadata = {}) {
     // Save welcome and ratchet tree if available
-    const state = {};
+    const state = { ...metadata };
     if (typeof group.export_welcome === 'function') {
       try {
         const welcome = group.export_welcome();
@@ -65,7 +65,7 @@ export class OpenMLS {
     return null;
   }
 
-  static async createOrLoad(id, userLabel = 'me') {
+  static async createOrLoad(id, userLabel = 'me', metadata = {}) {
     await initOpenMLS();
     console.log('Creating/loading OpenMLS group with id:', id);
     let state = await Storage.loadGroupState(id);
@@ -80,10 +80,11 @@ export class OpenMLS {
     } else {
       // Create new group and persist welcome and/or ratchet tree
       group = Group.create_new(provider, identity, id);
-      await OpenMLS.saveGroupState(id, group);
+      await OpenMLS.saveGroupState(id, group, metadata);
       console.log('Created new OpenMLS group:', group);
     }
-    return new OpenMLS({ id, identity, group, provider });
+    // Attach metadata to the instance for convenience
+    return new OpenMLS({ id, identity, group, provider, ...metadata });
   }
 
   async save() {

@@ -5,8 +5,8 @@ const CACHE_NAME = `${CACHE_PREFIX}-${CACHE_VERSION}`;
 const APP_SHELL = [
   "../",
   "../index.html",
-  "activitypub/activitypub-activity.js",
-  "activitypub/activitypub-inbox.js",
+  // "activitypub/activitypub-activity.js",
+  // "activitypub/activitypub-inbox.js",
   "checkin-element.js",
   "checkin-home.js",
   "checkin-login.js",

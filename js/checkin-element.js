@@ -23,26 +23,6 @@ export class CheckinElement extends LitElement {
     super()
   }
 
-  async doActivity(obj) {
-    let outbox = localStorage.getItem('outbox')
-    if (!outbox) {
-      const actor = await getCurrentActor()
-      outbox = actor.outbox
-      localStorage.setItem('outbox', outbox)
-    }
-    const res = await apFetch(outbox, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/activity+json'
-      },
-      body: JSON.stringify({
-        '@context': 'https://www.w3.org/ns/activitystreams',
-        ...obj
-      })
-    })
-    return await res.json()
-  }
-
 
 
 
