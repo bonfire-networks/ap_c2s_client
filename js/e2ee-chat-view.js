@@ -369,7 +369,16 @@ export class E2EEChatView extends LitElement {
         ...obj
       })
     })
-    return await res.json()
+    let data;
+    const contentType = res.headers && res.headers.get ? res.headers.get('content-type') : '';
+    if (contentType && contentType.includes('application/json')) {
+      data = await res.json();
+    } else {
+      data = await res.text();
+    }
+    data.status = res.status;
+    data.ok = res.ok;
+    return data;
   }
     
   decryptedSummary(msg) {
