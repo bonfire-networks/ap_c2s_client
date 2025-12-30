@@ -1,70 +1,39 @@
-// openmlsStorage.js
-// IndexedDB wrapper for OpenMLS group/session state
+// IndexedDB via Dexie.js wrapper for OpenMLS group/session state
 
+import { Dexie } from '../node_modules/dexie/dist/modern/dexie.mjs';
 
 const DB_NAME = 'openmls-db';
-const DB_VERSION = 2;
-const STORES = ['groups', 'users', 'messages'];
+const DB_VERSION = 1;
 
-function openDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (event) => {
-      const db = event.target.result;
-      for (const store of STORES) {
-        if (!db.objectStoreNames.contains(store)) {
-          db.createObjectStore(store, { keyPath: 'id' });
-        }
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
+const db = new Dexie(DB_NAME);
+// messages: store top-level fields for efficient indexing/querying
+db.version(DB_VERSION).stores({
+  groups: 'id',
+  users: 'id',
+  messages: 'id, groupId, timestamp, isLocal'
+});
 
-// Generic helpers
+// Generic helpers (groups/users store states under `state` to preserve shape)
 async function saveState(store, id, state) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
-    const objStore = tx.objectStore(store);
-    objStore.put({ id, state });
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
+  if (store === 'messages') {
+    // messages are stored with top-level fields, not under `state`
+    throw new Error('Use saveMessage for messages');
+  }
+  await db.table(store).put({ id, state });
 }
 
 async function loadState(store, id) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
-    const objStore = tx.objectStore(store);
-    const req = objStore.get(id);
-    req.onsuccess = () => resolve(req.result ? req.result.state : null);
-    req.onerror = () => reject(req.error);
-  });
+  const rec = await db.table(store).get(id);
+  return rec ? rec.state : null;
 }
 
 async function deleteState(store, id) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
-    const objStore = tx.objectStore(store);
-    objStore.delete(id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
+  await db.table(store).delete(id);
 }
 
 async function listStates(store) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
-    const objStore = tx.objectStore(store);
-    const req = objStore.getAll();
-    req.onsuccess = () => resolve(req.result.map(r => ({ id: r.id, state: r.state })));
-    req.onerror = () => reject(req.error);
-  });
+  const all = await db.table(store).toArray();
+  return all.map(r => ({ id: r.id, state: r.state }));
 }
 
 // Group-specific
@@ -90,28 +59,20 @@ export async function loadUserKeyPackage(userId) {
   return state ? state.keyPackageHex : null;
 }
 
-// Message-specific 
-export function saveMessage(groupId, content, id = undefined, isLocal = false) {
-  // id: optional unique id for the message (e.g., AP id or MLS message id)
-  return saveState('messages', id || crypto.randomUUID(), { groupId, isLocal, content });
+// Message-specific
+export async function saveMessage(groupId, content, id = undefined, isLocal = false) {
+  const messageId = id || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const timestamp = (content && content.timestamp) || Date.now();
+  const rec = { id: messageId, groupId, isLocal, content, timestamp };
+  await db.table('messages').put(rec);
+  return messageId;
 }
+
 export async function listMessagesInGroup(groupId) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('messages', 'readonly');
-    const objStore = tx.objectStore('messages');
-    const req = objStore.getAll();
-    req.onsuccess = () => {
-      // Filter by groupId/context and return full object
-      const filtered = req.result.filter(r => r.state.groupId === groupId);
-      resolve(filtered.map(r => ({
-        id: r.id,
-        ...r.state
-      })));
-    };
-    req.onerror = () => reject(req.error);
-  });
+  const msgs = await db.table('messages').where('groupId').equals(groupId).sortBy('timestamp');
+  return msgs.map(m => ({ id: m.id, groupId: m.groupId, isLocal: m.isLocal, content: m.content, timestamp: m.timestamp }));
 }
+
 export function deleteMessage(id) {
   return deleteState('messages', id);
 }
@@ -119,31 +80,16 @@ export function deleteMessage(id) {
 // List all known groups and load the last message from each
 export async function listGroupsWithLastMessage() {
   const groups = await listGroupStates();
-  console.log('loaded groups:', groups);
-  const db = await openDB();
-  const tx = db.transaction('messages', 'readonly');
-  const objStore = tx.objectStore('messages');
-  const req = objStore.getAll();
-  return new Promise((resolve, reject) => {
-    req.onsuccess = () => {
-      const allMessages = req.result;
-      const result = groups.map(g => {
-        // Find all messages for this group
-        const groupMsgs = allMessages.filter(m => m.state.groupId === g.id);
-        // Sort by id or add a timestamp to message state for better sorting
-        groupMsgs.sort((a, b) => (a.state.timestamp || 0) - (b.state.timestamp || 0)); // ascending
-        const lastMsg = groupMsgs.length > 0 ? {
-          id: groupMsgs[groupMsgs.length - 1].id,
-          ...groupMsgs[groupMsgs.length - 1].state
-        } : null;
-        return {
-          groupId: g.id,
-          groupState: g.state,
-          lastMessage: lastMsg
-        };
-      });
-      resolve(result);
+  // For each group, fetch last message by timestamp
+  const result = await Promise.all(groups.map(async (g) => {
+    const msgs = await db.table('messages').where('groupId').equals(g.id).sortBy('timestamp');
+    const last = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+    const lastMsg = last ? { id: last.id, groupId: last.groupId, isLocal: last.isLocal, content: last.content, timestamp: last.timestamp } : null;
+    return {
+      groupId: g.id,
+      groupState: g.state,
+      lastMessage: lastMsg
     };
-    req.onerror = () => reject(req.error);
-  });
+  }));
+  return result;
 }
