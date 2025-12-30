@@ -1,3 +1,3 @@
-# checkin
+# AP C2S + MLS client
 
-Example client for ActivityPub geosocial
+Example client for ActivityPub MLS
