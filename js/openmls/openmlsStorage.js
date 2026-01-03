@@ -22,6 +22,17 @@ async function saveState(store, id, state) {
   await db.table(store).put({ id, state });
 }
 
+async function updateState(store, id, updater) {
+  if (store === 'messages') {
+    throw new Error('Use saveMessage for messages');
+  }
+  const rec = await db.table(store).get(id);
+  const current = rec && rec.state ? rec.state : {};
+  const next = updater ? updater(current) : current;
+  await db.table(store).put({ id, state: next });
+  return next;
+}
+
 async function loadState(store, id) {
   const rec = await db.table(store).get(id);
   return rec ? rec.state : null;
@@ -51,12 +62,27 @@ export function listGroupStates() {
 }
 
 // User-specific (for key packages)
-export function saveUserKeyPackage(userId, keyPackageHex) {
-  return saveState('users', userId, { keyPackageHex });
+
+export function saveUserKeyPackageDraft(actorId, keyPackage) {
+  return updateState('users', actorId, (state = {}) => ({ ...state, keyPackage: keyPackage }));
 }
+
+export function saveUserKeyPackagePublished(actorId, keyPackage) {
+  return updateState('users', actorId, (state = {}) => ({ ...state, keyPackage: keyPackage, publishedDate: Date.now() }));
+}
+
 export async function loadUserKeyPackage(userId) {
   const state = await loadState('users', userId);
-  return state ? state.keyPackageHex : null;
+  return state ? state.keyPackage : null;
+}
+
+export async function getKeyPackageLastPublishedDate(userId) {
+  const state = await loadState('users', userId);
+  return state ? state.publishedDate || null : null;
+}
+
+export function setKeyPackagePublishedDate(userId, timestamp = Date.now()) {
+  return updateState('users', userId, (state = {}) => ({ ...state, publishedDate: timestamp }));
 }
 
 // Message-specific

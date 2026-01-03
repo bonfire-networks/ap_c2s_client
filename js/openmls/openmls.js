@@ -9,10 +9,14 @@
 
 
 import * as Storage from './openmlsStorage.js';
-import { getOrCreateUserKeyPackage } from './openmlsUser.js';
+import { getOrCreateUserKeyPackage, ensureKeyPackagesAvailable } from './openmlsUser.js';
+import { bytesFromInput, arrayToUint8Array } from './openmlsUtils.js';
 
 let openmlsWasm = null;
-let Provider, Identity, Group, KeyPackage, RatchetTree;
+let Provider, Identity, Group, KeyPackage, RatchetTree, AddMessages;
+
+// Cache group instances in memory to avoid re-joining
+const groupCache = new Map();
 
 export async function initOpenMLS() {
   if (!openmlsWasm) {
@@ -26,6 +30,7 @@ export async function initOpenMLS() {
     Group = openmlsWasm.Group;
     KeyPackage = openmlsWasm.KeyPackage;
     RatchetTree = openmlsWasm.RatchetTree;
+    AddMessages = openmlsWasm.AddMessages;
   }
   return openmlsWasm;
 }
@@ -39,20 +44,15 @@ export class OpenMLS {
   }
 
   static async saveGroupState(id, group, metadata = {}) {
-    // Save welcome and ratchet tree if available
+    // Save ratchet tree for reference (but can't be used to restore group)
     const state = { ...metadata };
-    if (typeof group.export_welcome === 'function') {
-      try {
-        const welcome = group.export_welcome();
-        state.welcome = Array.from(welcome);
-      } catch (e) {
-        console.warn('Failed to export welcome:', e);
-      }
-    }
+
     if (typeof group.export_ratchet_tree === 'function') {
       try {
         const ratchetTree = group.export_ratchet_tree();
-        state.ratchetTree = Array.from(ratchetTree);
+        // export_ratchet_tree() returns a RatchetTree object, need to call to_bytes()
+        const ratchetTreeBytes = ratchetTree.to_bytes();
+        state.ratchetTree = Array.from(ratchetTreeBytes);
       } catch (e) {
         console.warn('Failed to export ratchet tree:', e);
       }
@@ -67,24 +67,54 @@ export class OpenMLS {
 
   static async createOrLoad(id, userLabel = 'me', metadata = {}) {
     await initOpenMLS();
+
+    // Check if group is already loaded in memory
+    if (groupCache.has(id)) {
+      console.log('Using cached OpenMLS group:', id);
+      return groupCache.get(id);
+    }
+
     console.log('Creating/loading OpenMLS group with id:', id);
     let state = await Storage.loadGroupState(id);
     console.log('Loaded group state from storage:', state);
+
     const { provider, identity } = await getOrCreateUserKeyPackage(userLabel);
     console.log('Using identity for userLabel:', userLabel, identity);
+
+    // Ensure we have fresh key packages BEFORE any group operations
+    await ensureKeyPackagesAvailable(userLabel);
+
     let group;
+
+    // Try to join from welcome + ratchet tree (only for members, only works ONCE)
     if (state && state.welcome && state.ratchetTree) {
-      // Restore group from welcome and ratchet tree
-      group = Group.join(provider, new Uint8Array(state.welcome), new Uint8Array(state.ratchetTree));
-      console.log('Restored OpenMLS group from welcome and ratchet tree:', group);
-    } else {
-      // Create new group and persist welcome and/or ratchet tree
+      const welcomeBytes = arrayToUint8Array(state.welcome);
+      const ratchetTreeBytes = arrayToUint8Array(state.ratchetTree);
+      try {
+        const ratchetTree = RatchetTree.from_bytes(ratchetTreeBytes);
+        group = Group.join(provider, welcomeBytes, ratchetTree);
+        console.log('Joined OpenMLS group from welcome and ratchet tree:', group);
+        // Replenish key packages after join consumes one
+        await ensureKeyPackagesAvailable(userLabel);
+      } catch (e) {
+        console.error('Failed to join group from welcome/ratchet tree:', e);
+        // Clear the corrupted state and create new group
+        await Storage.saveGroupState(id, {});
+      }
+    }
+
+    // If no group yet, create new one (for group creator)
+    if (!group) {
       group = Group.create_new(provider, identity, id);
       await OpenMLS.saveGroupState(id, group, metadata);
       console.log('Created new OpenMLS group:', group);
     }
-    // Attach metadata to the instance for convenience
-    return new OpenMLS({ id, identity, group, provider, ...metadata });
+
+    // Create OpenMLS instance and cache it
+    const instance = new OpenMLS({ id, identity, group, provider, ...metadata });
+    groupCache.set(id, instance);
+
+    return instance;
   }
 
   async save() {
@@ -95,10 +125,15 @@ export class OpenMLS {
     // Accepts string or object
     const msg = typeof plaintext === 'string' ? plaintext : JSON.stringify(plaintext);
     const encoded = new TextEncoder().encode(msg);
-    const ciphertext = this.group.create_message(this.provider, this.identity, encoded);
-    // Save group state after encryption
-    this.save();
-    return Array.from(ciphertext); // Uint8Array to Array for storage/transmission
+    try {
+      const ciphertext = this.group.create_message(this.provider, this.identity, encoded);
+      // Save group state after encryption
+      this.save();
+      return Array.from(ciphertext); // Uint8Array to Array for storage/transmission
+    } catch (error) {
+      console.error('Failed to create message:', error);
+      throw error;
+    }
   }
 
   decrypt(base64Ciphertext) {
@@ -117,8 +152,9 @@ export class OpenMLS {
       console.log('Invalid ciphertext input:', base64Ciphertext);
       throw new Error('Invalid ciphertext input');
     }
+    let plaintext;
     try {
-      const plaintext = this.group.process_message(this.provider, ciphertextArr);
+      plaintext = this.group.process_message(this.provider, ciphertextArr);
     } catch (error) {
       console.log(error, 'Could not decrypt message with current group state.');
       return;
@@ -134,7 +170,48 @@ export class OpenMLS {
     }
   }
 
+  /**
+   * Add a single member to the group using their KeyPackage bytes or base64.
+   * Returns { commit, welcome, ratchetTree } as Uint8Array instances and
+   * persists the updated state.
+   */
+  async addMember(keyPackageBytesLike) {
+    const newMemberKp = KeyPackage.from_bytes(bytesFromInput(keyPackageBytesLike));
+    const addMessages = this.group.propose_and_commit_add(this.provider, this.identity, newMemberKp);
+    if (!(addMessages instanceof AddMessages)) {
+      throw new Error('Failed to add member: no AddMessages returned');
+    }
+    // Apply the pending commit to advance local state
+    this.group.merge_pending_commit(this.provider);
 
+    const ratchetTreeBytes = this.group.export_ratchet_tree().to_bytes();
+    const welcomeBytes = addMessages.welcome;
+    const commitBytes = addMessages.commit;
+
+    await Storage.saveGroupState(this.id, {
+      ratchetTree: Array.from(ratchetTreeBytes),
+      welcome: Array.from(welcomeBytes)
+    });
+
+    return { commit: commitBytes, welcome: welcomeBytes, ratchetTree: ratchetTreeBytes };
+  }
+
+  /**
+   * Join a group using received welcome and ratchet tree (both base64 or Uint8Array).
+   * Persists state and returns a new OpenMLS instance bound to the same user.
+   */
+  static async joinFromWelcome(id, welcomeBytesLike, ratchetTreeBytesLike, userLabel = 'me') {
+    await initOpenMLS();
+    const { provider, identity } = await getOrCreateUserKeyPackage(userLabel);
+    const welcome = bytesFromInput(welcomeBytesLike);
+    const ratchetTree = RatchetTree.from_bytes(bytesFromInput(ratchetTreeBytesLike));
+    const group = Group.join(provider, welcome, ratchetTree);
+    await Storage.saveGroupState(id, {
+      welcome: Array.from(welcome),
+      ratchetTree: Array.from(ratchetTree.to_bytes())
+    });
+    return new OpenMLS({ id, identity, group, provider });
+  }
 }
 
 
