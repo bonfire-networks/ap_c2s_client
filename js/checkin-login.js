@@ -126,6 +126,10 @@ export class CheckinLoginElement extends LitElement {
       if (!authorizationUrl) throw new Error('No OAuth authorization endpoint.')
       localStorage.setItem('authorization_endpoint', authorizationUrl)
 
+      if (!window.crypto || !window.crypto.subtle) {
+        throw new Error('Your browser does not support secure cryptography (crypto.subtle is missing).\n\nPlease use a modern browser, avoid private/incognito mode, and ensure you are on HTTPS or localhost.')
+      }
+
       const code_verifier = oauth.generateRandomCodeVerifier()
       const code_challenge = await oauth.calculatePKCECodeChallenge(code_verifier)
       const state = crypto.randomUUID()
@@ -153,8 +157,12 @@ export class CheckinLoginElement extends LitElement {
       });
       window.location.href = url
     } catch (error) {
-      console.error('[checkin-login] Error during login:', error);
-      this._error = error.message
+      console.error('[checkin-login] Error during login:', error, error && error.stack ? '\n' + error.stack : '')
+      if (error && error.message && error.message.includes('crypto.subtle')) {
+        this._error = 'Your browser does not support secure cryptography required for login.\nPlease use a modern browser, avoid private/incognito mode, and ensure you are on HTTPS or localhost.'
+      } else {
+        this._error = error.message || 'Unknown error during login.'
+      }
     }
   }
 }

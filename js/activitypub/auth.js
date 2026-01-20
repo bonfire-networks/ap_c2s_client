@@ -104,7 +104,9 @@ export async function getActor(actorId) {
     const res = await fetch(actorId, {
         headers: {
             Accept:
-                'application/activity+json,application/lrd+json,application/json'
+                'application/activity+json,application/lrd+json,application/json',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache'
         }
     })
     if (!res.ok) throw new Error('Failure fetching actor')

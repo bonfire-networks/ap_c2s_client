@@ -10,11 +10,28 @@ const db = new Dexie(DB_NAME);
 db.version(DB_VERSION).stores({
   groups: 'id',
   users: 'id',
-  messages: 'id, groupId, timestamp, isLocal'
+  messages: 'id, groupId, timestamp, isLocal',
+  processedActivityIds: '++id, actorId, activityId'
 });
+// Processed Activity ID helpers
+// Each processed activity is stored as {actorId, activityId}
+export async function saveProcessedActivityId(actorId, activityId) {
+  // Only add if not already present
+  const exists = await isProcessedActivityId(actorId, activityId);
+  if (!exists) {
+    await db.table('processedActivityIds').add({ actorId, activityId });
+  }
+}
+
+export async function isProcessedActivityId(actorId, activityId) {
+  // Efficient lookup by actorId and activityId
+  const found = await db.table('processedActivityIds')
+    .where({ actorId, activityId }).first();
+  return !!found;
+}
 
 // Generic helpers (groups/users store states under `state` to preserve shape)
-async function saveState(store, id, state) {
+export async function saveState(store, id, state) {
   if (store === 'messages') {
     // messages are stored with top-level fields, not under `state`
     throw new Error('Use saveMessage for messages');
@@ -33,7 +50,7 @@ async function updateState(store, id, updater) {
   return next;
 }
 
-async function loadState(store, id) {
+export async function loadState(store, id) {
   const rec = await db.table(store).get(id);
   return rec ? rec.state : null;
 }
@@ -71,18 +88,41 @@ export function saveUserKeyPackagePublished(actorId, keyPackage) {
   return updateState('users', actorId, (state = {}) => ({ ...state, keyPackage: keyPackage, publishedDate: Date.now() }));
 }
 
-export async function loadUserKeyPackage(userId) {
+export async function loadUserState(userId) {
   const state = await loadState('users', userId);
+  return state;
+}
+
+export async function loadUserKeyPackage(userId) {
+  const state = await loadUserState(userId);
   return state ? state.keyPackage : null;
 }
 
-export async function getKeyPackageLastPublishedDate(userId) {
-  const state = await loadState('users', userId);
-  return state ? state.publishedDate || null : null;
-}
 
 export function setKeyPackagePublishedDate(userId, timestamp = Date.now()) {
   return updateState('users', userId, (state = {}) => ({ ...state, publishedDate: timestamp }));
+}
+
+// Identity public key storage (needed to restore Identity from Provider)
+export async function saveIdentityPublicKey(userId, publicKeyBytes) {
+  // publicKeyBytes should be a Uint8Array or Array
+  return updateState('users', userId, (state = {}) => ({ ...state, identityPublicKey: Array.from(publicKeyBytes) }));
+}
+
+export async function loadIdentityPublicKey(userId) {
+  const state = await loadState('users', userId);
+  return state && state.identityPublicKey ? new Uint8Array(state.identityPublicKey) : null;
+}
+
+// Provider storage (for OpenMLS WASM provider key store)
+export async function saveProviderStorage(userId, storageArr) {
+  // storageArr should be a Uint8Array or Array
+  return updateState('users', userId, (state = {}) => ({ ...state, providerStorage: Array.from(storageArr) }));
+}
+
+export async function loadProviderStorage(userId) {
+  const state = await loadState('users', userId);
+  return state && state.providerStorage ? new Uint8Array(state.providerStorage) : null;
 }
 
 // Message-specific
