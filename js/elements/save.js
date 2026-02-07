@@ -5,9 +5,9 @@ import {
 } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
 
 import * as oauth from 'https://cdn.jsdelivr.net/npm/oauth4webapi@3/+esm'
-import { handleLogin } from './activitypub/auth.js'
+import { handleLogin } from '../activitypub/auth.js'
 
-export class CheckinSaveElement extends LitElement {
+export class SaveElement extends LitElement {
   static get properties () {
     return {
       redirectUri: { type: String, attribute: 'redirect-uri' },
@@ -51,4 +51,4 @@ export class CheckinSaveElement extends LitElement {
   }
 }
 
-customElements.define('checkin-save', CheckinSaveElement)
+customElements.define('checkin-save', SaveElement)

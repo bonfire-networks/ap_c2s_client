@@ -4,7 +4,7 @@
     "https://purl.archive.org/socialweb/oauth"
   ],
   "id": "https://checkin.swf.pub/client.jsonld",
-  "name": "Checkin Sample App",
+  "name": " Sample App",
   "summary": "A sample client for geosocial activities over ActivityPub",
   "redirectURI": "https://checkin.swf.pub/",
   "attributedTo": {

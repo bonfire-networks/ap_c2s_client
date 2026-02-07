@@ -13,9 +13,9 @@ import {
   getTokenEndpoint,
   getProxyUrl,
   buildAuthorizationUrl
-} from './activitypub/auth.js'
+} from '../activitypub/auth.js'
 
-export class CheckinLoginElement extends LitElement {
+export class LoginElement extends LitElement {
 
 
   static styles = css`
@@ -68,7 +68,7 @@ export class CheckinLoginElement extends LitElement {
 
   render () {
     return html`
-      <h1>Checkin</h1>
+      <h1></h1>
       <p class="intro">
         Welcome! This is an <a href="https://activitypub.rocks/">ActivityPub</a>
         geosocial Web application. To log in, you need to have an account on a
@@ -167,4 +167,4 @@ export class CheckinLoginElement extends LitElement {
   }
 }
 
-customElements.define('checkin-login', CheckinLoginElement)
+customElements.define('checkin-login', LoginElement)

@@ -4,11 +4,11 @@ import {
   LitElement
 } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
 
-import { CheckinElement } from './checkin-element.js'
-import { E2EEChatView } from './e2ee-chat-view.js'
-import { getCurrentActor } from './activitypub/auth.js'
+import { Element } from './element.js'
+import { E2EEChatView } from '../e2ee-chat-view.js'
+import { getCurrentActor } from '../activitypub/auth.js'
 
-export class CheckinHomeElement extends CheckinElement {
+export class HomeElement extends Element {
   static styles = css`
     :host {
       display: grid;
@@ -125,5 +125,5 @@ export class CheckinHomeElement extends CheckinElement {
 
 customElements.define(
   'checkin-home',
-  CheckinHomeElement
+  HomeElement
 )

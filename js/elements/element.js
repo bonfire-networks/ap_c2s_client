@@ -9,9 +9,9 @@ import {
 
 import * as oauth from 'https://cdn.jsdelivr.net/npm/oauth4webapi@3/+esm'
 
-import { getCurrentActor, apFetch } from './activitypub/auth.js'
+import { getCurrentActor, apFetch } from '../activitypub/auth.js'
 
-export class CheckinElement extends LitElement {
+export class Element extends LitElement {
   static get properties() {
     return {
       redirectUri: { type: String, attribute: 'redirect-uri' },
