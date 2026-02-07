@@ -64,7 +64,7 @@ export async function handleLogin() {
 
         console.log('[handleLogin] processAuthorizationCodeResponse result:', result);
 
-        saveResult(result)
+        saveResult(result, this.clientId)
 
         this.clearSession()
 
@@ -165,7 +165,7 @@ export function buildAuthorizationUrl({
     return url.toString()
 }
 
-export function saveResult(result) {
+export function saveResult(result, clientId) {
   localStorage.setItem('access_token', result.access_token)
   localStorage.setItem('refresh_token', result.refresh_token)
   localStorage.setItem('expires_in', result.expires_in)
@@ -173,13 +173,40 @@ export function saveResult(result) {
     'expires',
     Date.now() + result.expires_in * 1000
   )
+  if (clientId) {
+    localStorage.setItem('client_id', clientId)
+  }
+}
+
+/**
+ * Dispatch an auth error event to notify the UI that re-login is needed.
+ * Components can listen for this event to show a login prompt.
+ */
+function dispatchAuthError(reason) {
+  console.error('[Auth] Authentication failed:', reason)
+  window.dispatchEvent(new CustomEvent('auth-error', { detail: { reason } }))
 }
 
 export async function ensureFreshToken(clientId) {
+  clientId = clientId || localStorage.getItem('client_id')
+  if (!clientId) {
+    dispatchAuthError('Missing client_id - please re-login')
+    return
+  }
   const expires = parseInt(localStorage.getItem('expires'))
   if (Date.now() > expires) {
+    const actorId = localStorage.getItem('actor_id')
+    if (!actorId) {
+      dispatchAuthError('Missing actor_id - please re-login')
+      return
+    }
+    const refreshToken = localStorage.getItem('refresh_token')
+    if (!refreshToken) {
+      dispatchAuthError('Missing refresh_token - please re-login')
+      return
+    }
     const authorizationServer = {
-      issuer: (new URL(localStorage.getItem('actor_id'))).origin,
+      issuer: (new URL(actorId)).origin,
       authorization_endpoint: localStorage.getItem('authorization_endpoint'),
       token_endpoint: localStorage.getItem('token_endpoint'),
       code_challenge_methods_supported: ['S256'],
@@ -191,7 +218,6 @@ export async function ensureFreshToken(clientId) {
     const client = {
       client_id: clientId
     }
-    const refreshToken = localStorage.getItem('refresh_token')
     try {
       const response = await oauth.refreshTokenGrantRequest(
         authorizationServer,
@@ -199,14 +225,19 @@ export async function ensureFreshToken(clientId) {
         clientAuth,
         refreshToken
       )
+      if (!response.ok) {
+        dispatchAuthError('Token refresh failed - please re-login')
+        return
+      }
       const result = await oauth.processRefreshTokenResponse(
         authorizationServer,
         client,
         response
       )
-      saveResult(result)
+      saveResult(result, clientId)
     } catch (error) {
-      console.error(error)
+      console.error('[Auth] Token refresh error:', error)
+      dispatchAuthError('Token refresh failed - please re-login')
     }
   }
 }
@@ -214,21 +245,29 @@ export async function ensureFreshToken(clientId) {
  export async function apFetch(url, options = {}) {
     await ensureFreshToken()
     const accessToken = localStorage.getItem('access_token')
+    if (!accessToken) {
+      dispatchAuthError('No access token - please re-login')
+      throw new Error('Not authenticated')
+    }
     const actorId = localStorage.getItem('actor_id')
     const urlObj = (typeof url === 'string')
         ? new URL(url)
         : url
     if (urlObj.origin == URL.parse(actorId).origin) {
-        return await oauth.protectedResourceRequest(
+        const response = await oauth.protectedResourceRequest(
             accessToken,
             options.method || 'GET',
             urlObj,
             options.headers,
             options.body
         )
+        if (response.status === 401 || response.status === 403) {
+          dispatchAuthError('Server rejected credentials - please re-login')
+        }
+        return response
     } else {
         const proxyUrl = localStorage.getItem('proxy_url')
-        return await oauth.protectedResourceRequest(
+        const response = await oauth.protectedResourceRequest(
             accessToken,
             'POST',
             proxyUrl,
@@ -239,6 +278,10 @@ export async function ensureFreshToken(clientId) {
                 id: urlObj.toString()
             })
         )
+        if (response.status === 401 || response.status === 403) {
+          dispatchAuthError('Server rejected credentials - please re-login')
+        }
+        return response
     }
 }
 

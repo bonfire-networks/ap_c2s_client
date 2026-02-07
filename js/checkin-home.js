@@ -49,6 +49,16 @@ export class CheckinHomeElement extends CheckinElement {
 
   connectedCallback () {
     super.connectedCallback()
+    // Store clientId in localStorage so ensureFreshToken can use it for token refresh
+    if (this.clientId) {
+      localStorage.setItem('client_id', this.clientId)
+    }
+    // Listen for auth errors and prompt re-login
+    window.addEventListener('auth-error', (e) => {
+      console.warn('[Auth] Re-login required:', e.detail?.reason)
+      this._error = e.detail?.reason || 'Session expired'
+      this._logout()
+    })
     getCurrentActor()
       .then((actor) => {
         this._actor = actor

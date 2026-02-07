@@ -1,21 +1,35 @@
 // openmlsUser.js
 // Persistent OpenMLS user key package logic for Bonfire
-// - Generates and stores a key package on first use
-// - Sends the key package to LiveView backend via pushEvent
-// - Provides helper to retrieve the key package for group operations
-
+//
+// STORAGE ARCHITECTURE:
+// This module manages two types of persistent storage:
+//
+// 1. Provider Storage (saved to 'users' table in IndexedDB):
+//    - Contains the WASM provider's internal state with ALL MLS groups for a user
+//    - Exported via provider.export_storage() and saved to state.providerStorage
+//    - Restored via Provider.new_from_storage(bytes) on page reload
+//    - Enables Group.load() to retrieve individual groups from the provider
+//
+// 2. Per-Group Metadata (saved to 'groups' table in IndexedDB):
+//    - Contains group-specific metadata: members, name, apId, ratchetTree
+//    - Managed separately in openmlsStorage.js
+//    - Used for display and tracking, not for MLS group restoration
+//
+// Both storage systems are needed:
+// - Provider storage: Required for MLS group restoration via Group.load()
+// - Group metadata: Required for UI display and member tracking
 
 import { initOpenMLS } from './openmls.js';
 import { bytesToHex, hexToBytes } from './openmlsUtils.js';
 import { saveUserKeyPackageDraft, loadUserKeyPackage, saveProviderStorage, loadProviderStorage, loadState, saveState, loadUserState, saveIdentityPublicKey, loadIdentityPublicKey } from './openmlsStorage.js';
 import { setKeyPackagePublishedDate } from './openmlsStorage.js';
 
-// Cache providers and identities per user to avoid losing state WITHIN A SESSION
-// NOTE: These are in-memory only and are lost on page reload.
-// Combined with OpenMLS WASM's in-memory storage, this means:
-// - KeyPackages work ONLY within the same browser session
-// - Old invitations become invalid after page reload
-// - This is a fundamental limitation until OpenMLS adds persistent storage
+// Cache providers and identities per user to avoid re-creating them
+// NOTE: These are in-memory only and are lost on page reload, BUT:
+// - Provider storage IS persisted to IndexedDB and restored on reload via new_from_storage()
+// - Identity keypairs ARE persisted in provider storage and restored via Identity.from_provider()
+// - KeyPackages remain valid across sessions (until explicitly cleared)
+// - Group state persists via provider storage, accessible via Group.load()
 const providerCache = new Map();
 const identityCache = new Map();
 
@@ -31,41 +45,57 @@ export function extractPublicKey(keyPackage) {
   return null;
 }
 
-// Helper to persist provider storage in IndexedDB
-async function persistProviderStorage(provider, userLabel) {
+/**
+ * Persist provider storage to IndexedDB.
+ *
+ * Exports the provider's internal state (which contains all MLS groups for this user)
+ * and saves it to IndexedDB under 'users' table, state.providerStorage field.
+ *
+ * This exported state will be restored on page reload via Provider.new_from_storage()
+ * in prepareProviderIdentity(), which enables Group.load() to work.
+ *
+ * Must be called after any operation that modifies group state (encrypt, decrypt, etc.)
+ * to ensure changes persist across page reloads.
+ */
+export async function persistProviderStorage(provider, userLabel) {
+  if (!userLabel) {
+    console.error('[OpenMLS] Cannot persist provider storage: userLabel is required');
+    return;
+  }
   try {
     const exported = provider.export_storage();
     if (exported && exported.length) {
       await saveProviderStorage(userLabel, exported);
-      console.log('[OpenMLS] Provider storage exported and saved to Dexie.');
+      console.log('[OpenMLS] Provider storage persisted to IndexedDB for:', userLabel);
+    } else {
+      console.error('[OpenMLS] No provider storage to export.');
     }
   } catch (e) {
-    console.warn('[OpenMLS] Failed to export provider storage:', e);
+    console.error('[OpenMLS] Failed to export provider storage:', e);
   }
 }
 
-// Helper to restore provider storage using Dexie/IndexedDB
-async function restoreProviderStorage(provider, userLabel) {
-  if (typeof provider.import_storage === 'function') {
-    const saved = await loadProviderStorage(userLabel);
-    if (saved) {
-      try {
-        provider.import_storage(saved);
-        console.log('[OpenMLS] Provider storage imported from Dexie.');
-      } catch (e) {
-        console.warn('[OpenMLS] Failed to import provider storage:', e);
-      }
-    }
-  }
-}
 
-export function hasProviderAndIdentity(userLabel = 'me') {
+export function hasProviderAndIdentity(userLabel) {
   if (providerCache.has(userLabel) && identityCache.has(userLabel)) {
     return true;
   }
 }
 
-export async function prepareProviderIdentity(userLabel = 'me') {
+/**
+ * Prepare provider and identity for a user.
+ *
+ * This function handles the complete initialization flow:
+ * 1. Check in-memory cache first (fast path for same session)
+ * 2. If not cached, load from IndexedDB:
+ *    - Load provider storage bytes (contains all MLS groups)
+ *    - Restore provider via Provider.new_from_storage(bytes)
+ *    - Restore identity via Identity.from_provider() using saved public key
+ * 3. If no saved state, create new provider and identity from scratch
+ *
+ * Returns { provider, identity } ready for group operations.
+ */
+export async function prepareProviderIdentity(userLabel) {
   let provider, identity;
   if (hasProviderAndIdentity(userLabel)) {
     provider = providerCache.get(userLabel);
@@ -76,7 +106,7 @@ export async function prepareProviderIdentity(userLabel = 'me') {
     let publicKeyBytes = await loadIdentityPublicKey(userLabel);
 
     if (storageBytes && storageBytes.length) {
-      // Restore provider from storage
+      // Restore provider from saved storage (contains all MLS groups)
       provider = openmlsWasm.Provider.new_from_storage(storageBytes);
 
       if (publicKeyBytes && publicKeyBytes.length) {
@@ -121,7 +151,7 @@ export async function prepareProviderIdentity(userLabel = 'me') {
   return { provider, identity };
 }
 
-export async function getUserKeyPackage(userLabel = 'me') {
+export async function getUserKeyPackage(userLabel) {
   let keyPackage, publicKey = false;
 
   const { provider, identity } = await prepareProviderIdentity(userLabel);
@@ -131,6 +161,8 @@ export async function getUserKeyPackage(userLabel = 'me') {
   if (state.keyPackage) {
     let publishedDate = state.publishedDate;
     let keyPackageHex = state.keyPackage;
+    console.log('[OpenMLS] Found stored KeyPackage:', keyPackageHex)
+
     return { provider, identity, keyPackageHex, publishedDate }
     // console.log('[OpenMLS] Loading stored KeyPackage:', keyPackageHex)
     // let bytes = bytesFromInput(keyPackageHex)
@@ -153,7 +185,7 @@ export async function getUserKeyPackage(userLabel = 'me') {
 }
 
 
-export async function getOrCreateUserKeyPackage(userLabel = 'me') {
+export async function getOrCreateUserKeyPackage(userLabel) {
   // Try to load existing
   const loaded = await getUserKeyPackage(userLabel);
   if (loaded && loaded.keyPackage) {
@@ -164,7 +196,7 @@ export async function getOrCreateUserKeyPackage(userLabel = 'me') {
 }
 
 
-export async function createUserKeyPackage(userLabel = 'me', provider = null, identity = null) {
+export async function createUserKeyPackage(userLabel, provider = null, identity = null) {
   let keyPackage, publicKey;
   if (!provider || !identity) {
     const prepared = await prepareProviderIdentity(userLabel);
@@ -194,7 +226,7 @@ export async function clearUserKeyPackage(userId) {
 }
 
 // // Ensure provider has fresh key packages available
-// export async function ensureKeyPackagesAvailable(userLabel = 'me') {
+// export async function ensureKeyPackagesAvailable(userLabel) {
 //   const openmlsWasm = await initOpenMLS();
 //   let provider = providerCache.get(userLabel);
 //   let identity = identityCache.get(userLabel);
