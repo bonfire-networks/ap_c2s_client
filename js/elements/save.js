@@ -51,4 +51,4 @@ export class SaveElement extends LitElement {
   }
 }
 
-customElements.define('checkin-save', SaveElement)
+customElements.define('ap-save', SaveElement)

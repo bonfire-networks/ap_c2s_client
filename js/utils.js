@@ -1,4 +1,4 @@
-// Utility functions for OpenMLS integration
+// Utility functions: encoding, ID generation, byte conversions
 
 import * as ulidx from "https://cdn.jsdelivr.net/npm/ulidx@2.4.1/+esm"
 
@@ -13,6 +13,10 @@ export function bytesToBase64(bytes) {
   }
   const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   return btoa(String.fromCharCode(...arr));
+}
+
+export function base64ToBytes(b64) {
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
 }
 
 export function hexToBytes(hex) {
@@ -62,7 +66,6 @@ export function hasKeyPackage(keyPackages) {
 
 export function ulid() {
   return ulidx.ulid ? ulidx.ulid() : (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2))
-  // Process recent items (last 10)
 }
 
 export function isHexString(str) {
@@ -83,4 +86,3 @@ export function decodeKeyPackageString(str) {
   }
   throw new Error('decodeKeyPackageString: input is not valid hex or base64');
 }
-

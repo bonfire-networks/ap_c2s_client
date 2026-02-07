@@ -3,12 +3,18 @@
     "https://www.w3.org/ns/activitystreams",
     "https://purl.archive.org/socialweb/oauth"
   ],
-  "id": "https://checkin.swf.pub/client.jsonld",
-  "name": " Sample App",
-  "summary": "A sample client for geosocial activities over ActivityPub",
-  "redirectURI": "https://checkin.swf.pub/",
-  "attributedTo": {
+  "id": "https://e2ee.swf.pub/client.jsonld",
+  "name": "E2EE Sample App",
+  "summary": "A sample client for end-to-end encrypted activities over ActivityPub",
+  "redirectURI": "https://e2ee.swf.pub/",
+  "attributedTo": [
+    {
     "id": "https://socialwebfoundation.org/author/evanprodromou/",
     "name": "Evan Prodromou"
+  },
+  {
+    "id": "https://bonfire.cafe/pub/actors/bonfire",
+    "name": "Bonfire Networks"
   }
+]
 }

@@ -144,7 +144,7 @@ export class LoginElement extends LitElement {
         codeChallenge: code_challenge,
         state
       })
-      console.log('[checkin-login] Redirecting to OAuth authorize:', {
+      console.log('[login] Redirecting to OAuth authorize:', {
         clientId: this.clientId,
         redirectUri: this.redirectUri,
         authorizationUrl,
@@ -157,7 +157,7 @@ export class LoginElement extends LitElement {
       });
       window.location.href = url
     } catch (error) {
-      console.error('[checkin-login] Error during login:', error, error && error.stack ? '\n' + error.stack : '')
+      console.error('[login] Error during login:', error, error && error.stack ? '\n' + error.stack : '')
       if (error && error.message && error.message.includes('crypto.subtle')) {
         this._error = 'Your browser does not support secure cryptography required for login.\nPlease use a modern browser, avoid private/incognito mode, and ensure you are on HTTPS or localhost.'
       } else {
@@ -167,4 +167,4 @@ export class LoginElement extends LitElement {
   }
 }
 
-customElements.define('checkin-login', LoginElement)
+customElements.define('ap-login', LoginElement)

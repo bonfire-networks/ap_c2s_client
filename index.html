@@ -41,11 +41,11 @@
         padding: 1rem;
       }
     </style>
-    <script type="module" src="js/checkin-login.js"></script>
-    <script type="module" src="js/checkin-save.js"></script>
-    <script type="module" src="js/checkin-home.js"></script>
+    <script type="module" src="js/elements/login.js"></script>
+    <script type="module" src="js/elements/save.js"></script>
+    <script type="module" src="js/elements/home.js"></script>
     <script type="module" src="js/e2ee-chat-view.js"></script>
-    <title></title>
+    <title>E2EE AP</title>
   </head>
   <body>
     <div id="page">
@@ -75,20 +75,20 @@
           access_token: hasToken,
         });
         if (hasCode || hasState) {
-          console.log("Rendering <checkin-save> for OAuth code exchange");
-          document.getElementById("page").innerHTML = `<checkin-save
+          console.log("Rendering <ap-save> for OAuth code exchange");
+          document.getElementById("page").innerHTML = `<ap-save
                 client-id=${client_id}
                 redirect-uri=${redirect_uri}
                 success-uri=${redirect_uri}
               />`;
         } else if (!hasToken) {
-          console.log("Rendering <checkin-login> (no access_token)");
-          document.getElementById("page").innerHTML = `<checkin-login
+          console.log("Rendering <ap-login> (no access_token)");
+          document.getElementById("page").innerHTML = `<ap-login
                 client-id=${client_id}
                 redirect-uri=${redirect_uri} />`;
         } else {
-          console.log("Rendering <checkin-home> (already logged in)");
-          document.getElementById("page").innerHTML = `<checkin-home
+          console.log("Rendering <ap-home> (already logged in)");
+          document.getElementById("page").innerHTML = `<ap-home
                 client-id=${client_id}
                 redirect-uri=${redirect_uri} />`;
         }

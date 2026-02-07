@@ -124,6 +124,6 @@ export class HomeElement extends Element {
 }
 
 customElements.define(
-  'checkin-home',
+  'ap-home',
   HomeElement
 )

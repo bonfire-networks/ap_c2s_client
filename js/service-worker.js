@@ -1,4 +1,4 @@
-const CACHE_PREFIX = "checkin-cache-";
+const CACHE_PREFIX = "cache-";
 const CACHE_VERSION = '0.1.5';
 const CACHE_NAME = `${CACHE_PREFIX}-${CACHE_VERSION}`;
 
