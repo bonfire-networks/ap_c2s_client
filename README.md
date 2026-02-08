@@ -9,5 +9,5 @@ cargo install wasm-pack
 
 cargo build --release --verbose --target wasm32-unknown-unknown -p openmls --features js
 
-cd openmls-wasm && ./build.sh
+cd openmls-wasm && ./build.sh && cp -r pkg  ../../bonfire-app/assets/static/tauri/assets/openmls
 ```

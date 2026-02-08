@@ -33,9 +33,11 @@ export class ChatController {
    */
   async init() {
     const actor = await getCurrentActor();
+    console.log('[ChatController] Initializing for actor:', actor);
     this.currentActorId = actor.id;
 
     await this.mlsService.init(actor.id);
+    console.log('[ChatController] MLSService initialized for actor:', actor.id);
     await this.ensurePublishedKeyPackage(actor);
 
     return actor;
@@ -105,15 +107,19 @@ export class ChatController {
    */
   async loadMessages(groupId) {
     const arr = await this.storage.listMessages(groupId);
+    console.log('[loadMessages] Raw from storage for group', groupId, ':', arr.map(m => ({ id: m.id, groupId: m.groupId, isLocal: m.isLocal, type: m.content?.type })));
     const hiddenTypes = ['GroupInfo', 'Welcome'];
 
     const messages = arr
       .filter(m => !hiddenTypes.includes(m.content?.type))
       .map(m => ({
+        id: m.id,
+        timestamp: m.timestamp,
         isLocal: m.isLocal,
         attributedTo: m.content?.attributedTo,
         ...m.content
       }));
+    console.log('[loadMessages] Mapped messages:', messages.map(m => ({ id: m.id, isLocal: m.isLocal, type: m.type, attributedTo: m.attributedTo })));
 
     const members = await this.getGroupMembers(groupId);
 
@@ -186,6 +192,7 @@ export class ChatController {
    */
   async sendMessage(groupId, msgObj, options = {}) {
     const actor = await getCurrentActor();
+    console.log('[sendMessage] groupId:', groupId, 'msgObj:', msgObj, 'options:', options);
 
     // Ensure the group is loaded
     await this.mlsService.getGroup(actor.id, groupId);
@@ -201,6 +208,7 @@ export class ChatController {
     // Look up AP ID for context
     const apId = await this.storage.getGroupApId(groupId);
     const contextId = apId || groupId;
+    console.log('[sendMessage] apId:', apId, 'contextId:', contextId, 'recipients:', recipients);
 
     // Transmit
     const res = await sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, {
@@ -210,9 +218,11 @@ export class ChatController {
 
     // Extract AP ID from response
     const messageApId = await this._resolveApId(res);
+    console.log('[sendMessage] messageApId:', messageApId);
 
     if (messageApId) {
       await this.storage.saveMessage(groupId, msgObj, messageApId, true);
+      console.log('[sendMessage] Saved local message:', messageApId, 'in group:', groupId);
     }
 
     return messageApId;
@@ -307,6 +317,7 @@ export class ChatController {
       const actor = await getCurrentActor();
       const { fetchInboxItems } = await import('./activitypub/client.js');
       const items = await fetchInboxItems(actor);
+      console.log('[pollInbox] Fetched', items.length, 'inbox items');
 
       // Process recent items (last 10) - reverse so oldest are processed first
       const itemsToProcess = items.slice(0, 10).reverse();
@@ -316,8 +327,12 @@ export class ChatController {
         const itemId = item.id || item.object?.id;
         if (!itemId) continue;
 
-        if (await this.storage.isProcessed(actor.id, itemId)) continue;
+        if (await this.storage.isProcessed(actor.id, itemId)) {
+          console.log('[pollInbox] Already processed:', itemId);
+          continue;
+        }
 
+        console.log('[pollInbox] Processing item:', itemId, 'type:', item.type || item.object?.type);
         const result = await this.handleActivity(item);
         if (result) {
           await this.storage.markProcessed(actor.id, itemId);
@@ -325,6 +340,7 @@ export class ChatController {
         }
       }
 
+      console.log('[pollInbox] Processed', results.length, 'new items');
       return results;
     } catch (e) {
       console.error('[Inbox] Error polling inbox:', e);
@@ -343,10 +359,19 @@ export class ChatController {
     if (!parsed) return null;
 
     const actor = await getCurrentActor();
+    console.log('[handleActivity] type:', parsed.type, 'id:', parsed.id, 'from:', parsed.attributedTo, 'context:', parsed.context);
+
+    // Skip our own outgoing messages — they're already stored locally
+    if (parsed.attributedTo === actor.id && parsed.type === 'PrivateMessage') {
+      console.log('[handleActivity] Skipping own PrivateMessage:', parsed.id);
+      return null;
+    }
+
     const contextId = parsed.context;
 
     // Resolve MLS group ID from AP context ID
     let groupId = await this.storage.getGroupByField('apId', contextId);
+    console.log('[handleActivity] contextId:', contextId, '→ resolved groupId:', groupId || '(using contextId as groupId)');
     if (!groupId) groupId = contextId;
 
     if (parsed.type === 'Welcome') {
@@ -373,6 +398,8 @@ export class ChatController {
         const membersToAdd = [actor.id];
         if (parsed.attributedTo) membersToAdd.push(parsed.attributedTo);
         await this.persistMembers(groupId, membersToAdd);
+        // Key package was consumed by joining — replenish
+        await this._replenishKeyPackage(actor);
       } catch (e) {
         console.error('[Handler] Failed to join from Welcome:', e);
       }
@@ -394,6 +421,8 @@ export class ChatController {
         const membersToAdd = [actor.id];
         if (parsed.attributedTo) membersToAdd.push(parsed.attributedTo);
         await this.persistMembers(groupId, membersToAdd);
+        // Key package was consumed by joining — replenish
+        await this._replenishKeyPackage(actor);
       } catch (e) {
         console.error('[Handler] Failed to join from GroupInfo:', e);
       }
@@ -404,7 +433,15 @@ export class ChatController {
 
   async _handlePrivateMessage(groupId, parsed, actor) {
     const messageId = parsed.id;
+    console.log('[_handlePrivateMessage] messageId:', messageId, 'groupId:', groupId, 'from:', parsed.attributedTo);
     if (!messageId) return null;
+
+    // Skip if we already have this message stored
+    const existing = await this.storage.getMessage(messageId);
+    if (existing) {
+      console.log('[_handlePrivateMessage] Skipping already-stored message:', messageId);
+      return null;
+    }
 
     try {
       // Ensure group is loaded
@@ -413,6 +450,7 @@ export class ChatController {
       // Decrypt
       const ciphertext = bytesFromInput(parsed.content);
       const decrypted = await this.mlsService.decrypt(actor.id, groupId, ciphertext);
+      console.log('[_handlePrivateMessage] Decrypted:', typeof decrypted, decrypted);
       let decryptedContent = typeof decrypted === 'object' ? decrypted : { content: decrypted };
 
       if (parsed.attributedTo) {
@@ -420,6 +458,14 @@ export class ChatController {
       }
 
       await this.storage.saveMessage(groupId, decryptedContent, messageId, false);
+      console.log('[_handlePrivateMessage] Saved message:', messageId, 'in group:', groupId);
+
+      // Store apId mapping so future messages with this AP URI context resolve to this group
+      const existingApId = await this.storage.getGroupApId(groupId);
+      if (!existingApId && messageId) {
+        await this.storage.setGroupField(groupId, 'apId', messageId);
+        console.log('[_handlePrivateMessage] Set apId mapping:', groupId, '→', messageId);
+      }
 
       // Save group name from message if present
       if (decryptedContent.name) {
@@ -453,6 +499,27 @@ export class ChatController {
   }
 
   // ── Key packages ───────────────────────────────────────
+
+  /**
+   * Create and publish a fresh key package after the previous one was consumed
+   * (e.g., by joining a group from a Welcome message).
+   */
+  async _replenishKeyPackage(actor) {
+    try {
+      console.log('[KeyPackage] Replenishing after group join...');
+      await this.mlsService.clearKeyPackage(actor.id);
+      const { keyPackageHex } = await this.mlsService.createKeyPackage(actor.id);
+      const kpBytes = bytesFromInput(keyPackageHex);
+      const published = await publishKeyPackage(actor, kpBytes);
+      if (published) {
+        await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
+        localStorage.removeItem('actor');
+        console.log('[KeyPackage] Fresh key package published');
+      }
+    } catch (e) {
+      console.error('[KeyPackage] Failed to replenish:', e);
+    }
+  }
 
   /**
    * Ensure the current user has a published key package.

@@ -25,29 +25,13 @@ export class MLSService {
 
   /**
    * Initialize the backend and restore user state from storage.
-   *
-   * Loads saved backend state from storage and passes it to the backend.
-   * Handles migration from legacy storage format where identity public key
-   * was stored separately from provider storage.
    */
   async init(userId) {
     await this.backend.init();
 
     const savedState = await this.storage.loadBackendState(userId);
+    await this.backend.initUser(userId, savedState);
 
-    // MIGRATION: legacy storage has identityPublicKey as a separate field.
-    // Pass it to the backend so it can restore the identity properly.
-    // After the first exportState/save cycle, this is no longer needed.
-    const userState = await this.storage.loadUserState(userId);
-    const legacyPubKey = userState?.identityPublicKey
-      ? new Uint8Array(userState.identityPublicKey)
-      : null;
-
-    await this.backend.initUser(userId, savedState, {
-      identityPublicKey: legacyPubKey
-    });
-
-    // Persist in new format immediately so migration happens once
     await this.persistBackendState(userId);
   }
 

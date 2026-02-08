@@ -8,9 +8,10 @@ let wasm = null;
 
 export async function loadWasm() {
   if (!wasm) {
-    wasm = await import('/assets/openmls/openmls_wasm.js');
+    const base = localStorage.getItem('wasmBasePath') || '/assets/openmls/';
+    wasm = await import(base + 'openmls_wasm.js');
     if (wasm.default) {
-      await wasm.default('/assets/openmls/openmls_wasm_bg.wasm');
+      await wasm.default(base + 'openmls_wasm_bg.wasm');
     }
   }
   return wasm;

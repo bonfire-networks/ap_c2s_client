@@ -97,6 +97,11 @@ export async function saveMessage(groupId, content, id = undefined, isLocal = fa
   return messageId;
 }
 
+export async function getMessage(id) {
+  const rec = await db.table('messages').get(id);
+  return rec || null;
+}
+
 export async function listMessages(groupId) {
   const msgs = await db.table('messages').where('groupId').equals(groupId).sortBy('timestamp');
   return msgs.map(m => ({ id: m.id, groupId: m.groupId, isLocal: m.isLocal, content: m.content, timestamp: m.timestamp }));

@@ -4,15 +4,9 @@ import {
   LitElement
 } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
 
-import * as oauth from 'https://cdn.jsdelivr.net/npm/oauth4webapi@3/+esm'
 import {
-  getActorId,
-  getActor,
-  // getCurrentActor,
-  getAuthorizationEndpoint,
-  getTokenEndpoint,
-  getProxyUrl,
-  buildAuthorizationUrl
+  startLogin,
+  WEBFINGER_REGEXP
 } from '../activitypub/auth.js'
 
 export class LoginElement extends LitElement {
@@ -62,11 +56,19 @@ export class LoginElement extends LitElement {
     super()
   }
 
-  connectedCallback () {
+  connectedCallback() {
+
+    const webfinger = this._webfinger_url();
+    if (this.isWebfinger(webfinger)) {
+      // login immediately if we already have a valid webfinger ID (e.g. from previous session)
+      this._login(webfinger)
+    }
+
     super.connectedCallback()
   }
 
-  render () {
+  render() {
+
     return html`
       <h1></h1>
       <p class="intro">
@@ -79,11 +81,12 @@ export class LoginElement extends LitElement {
           id="webfinger"
           placeholder="username@example.com"
           @input=${this._input}
+          value=${ this._webfinger }
         ></sl-input>
         <sl-button
           variant="primary"
           ?disabled=${!this.isWebfinger(this._webfinger)}
-          @click=${this._login}
+          @click=${() => this._login()}
         >
           Log In
         </sl-button>
@@ -92,77 +95,44 @@ export class LoginElement extends LitElement {
     `
   }
 
+  _webfinger_url() {
+    const actor_id = localStorage.getItem('actor_id')
+    if (actor_id) {
+      this._webfinger = actor_id
+    }
+
+    const previousUrl = localStorage.getItem('appUsername') || localStorage.getItem('appUrl')
+    console.log('[login] Previous from localStorage:', previousUrl);
+    if (previousUrl) {
+      this._webfinger = previousUrl
+    }
+
+    return this._webfinger
+  }
+
   _input (e) {
     this._webfinger = e.target.value
     this._error = null
   }
 
   isWebfinger (str) {
-    // Use the same regexp as in login.js
-    return getActorId.WEBFINGER_REGEXP
-      ? getActorId.WEBFINGER_REGEXP.test(str)
-      : /^(?:acct:)?[^@]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$/.test(str)
+    return WEBFINGER_REGEXP.test(str)
   }
 
-
-  async _login () {
-    const webfingerInput = this.shadowRoot.querySelector('#webfinger')
-    const id = webfingerInput.value.trim()
-    if (!id) {
-      this._error = 'Please enter your Webfinger ID.'
+  async _login(webfinger = null) {
+    let id = (webfinger || this._webfinger || '')
+    if (typeof id !== 'string' || !id.trim()) {
+      console.warn('[login] No webfinger ID provided', id);
+      this._error = 'Please enter your instance domain or @user@domain.tld'
       return
     }
     try {
-      const actorId = await getActorId(id)
-      localStorage.setItem('actor_id', actorId)
-      const actor = await getActor(actorId)
-      const tokenUrl = getTokenEndpoint(actor)
-      if (!tokenUrl) throw new Error('No OAuth token endpoint.')
-      localStorage.setItem('token_endpoint', tokenUrl)
-      const proxyUrl = getProxyUrl(actor)
-      if (!proxyUrl) throw new Error('No Proxy endpoint.')
-      localStorage.setItem('proxy_url', proxyUrl)
-      const authorizationUrl = getAuthorizationEndpoint(actor)
-      if (!authorizationUrl) throw new Error('No OAuth authorization endpoint.')
-      localStorage.setItem('authorization_endpoint', authorizationUrl)
-
-      if (!window.crypto || !window.crypto.subtle) {
-        throw new Error('Your browser does not support secure cryptography (crypto.subtle is missing).\n\nPlease use a modern browser, avoid private/incognito mode, and ensure you are on HTTPS or localhost.')
-      }
-
-      const code_verifier = oauth.generateRandomCodeVerifier()
-      const code_challenge = await oauth.calculatePKCECodeChallenge(code_verifier)
-      const state = crypto.randomUUID()
-
-      sessionStorage.setItem('code_verifier', code_verifier)
-      sessionStorage.setItem('state', state)
-
-      const url = buildAuthorizationUrl({
-        authorizationUrl,
-        clientId: this.clientId,
-        redirectUri: this.redirectUri,
-        codeChallenge: code_challenge,
-        state
-      })
-      console.log('[login] Redirecting to OAuth authorize:', {
-        clientId: this.clientId,
-        redirectUri: this.redirectUri,
-        authorizationUrl,
-        tokenUrl,
-        proxyUrl,
-        code_verifier,
-        code_challenge,
-        state,
-        url
-      });
+      const url = await startLogin(id, this.clientId, this.redirectUri)
+      console.log('[login] Redirecting to OAuth authorize:', url);
       window.location.href = url
     } catch (error) {
-      console.error('[login] Error during login:', error, error && error.stack ? '\n' + error.stack : '')
-      if (error && error.message && error.message.includes('crypto.subtle')) {
-        this._error = 'Your browser does not support secure cryptography required for login.\nPlease use a modern browser, avoid private/incognito mode, and ensure you are on HTTPS or localhost.'
-      } else {
-        this._error = error.message || 'Unknown error during login.'
-      }
+      console.error('[login] Error during login:', error, error?.stack ? '\n' + error.stack : '')
+      this._error = error.message || 'Unknown error during login.'
     }
   }
 }

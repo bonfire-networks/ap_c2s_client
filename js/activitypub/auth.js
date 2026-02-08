@@ -8,9 +8,16 @@ export const WEBFINGER_REGEXP =
     /^(?:acct:)?(?<username>[^@]+)@(?<domain>(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*)$/
 
 
-export async function handleLogin() {
+export async function handleLogin({ clientId, redirectUri, successUri } = {}) {
+    // Support both options object and legacy `this`-based calling (via .call(component))
+    clientId = clientId || this?.clientId
+    redirectUri = redirectUri || this?.redirectUri
+    successUri = successUri || this?.successUri
+
+    const origin_url = localStorage.getItem('actor_id') || localStorage.getItem('appUrl')
+
     const authorizationServer = {
-        issuer: (new URL(localStorage.getItem('actor_id'))).origin,
+        issuer: URL.parse(origin_url)?.origin || origin_url,
         authorization_endpoint: localStorage.getItem('authorization_endpoint'),
         token_endpoint: localStorage.getItem('token_endpoint'),
         code_challenge_methods_supported: ['S256'],
@@ -20,65 +27,61 @@ export async function handleLogin() {
     }
     const clientAuth = oauth.None()
     const client = {
-        client_id: this.clientId
+        client_id: clientId
     }
 
     const state = sessionStorage.getItem('state')
     const codeVerifier = sessionStorage.getItem('code_verifier')
     const paramsObj = Object.fromEntries(new URLSearchParams(window.location.search).entries());
     console.log('[handleLogin] Starting token exchange with:', {
-        client_id: this.clientId,
-        redirect_uri: this.redirectUri,
+        client_id: clientId,
+        redirect_uri: redirectUri,
         state,
         codeVerifier,
         params: paramsObj,
         authorizationServer
     });
 
-    try {
-        const params = oauth.validateAuthResponse(
-            authorizationServer,
-            client,
-            new URLSearchParams(window.location.search),
-            state
-        )
+    const params = oauth.validateAuthResponse(
+        authorizationServer,
+        client,
+        new URLSearchParams(window.location.search),
+        state
+    )
 
-        console.log('[handleLogin] validateAuthResponse params:', params);
+    console.log('[handleLogin] validateAuthResponse params:', params);
 
-        const response = await oauth.authorizationCodeGrantRequest(
-            authorizationServer,
-            client,
-            clientAuth,
-            params,
-            this.redirectUri,
-            codeVerifier
-        )
+    const response = await oauth.authorizationCodeGrantRequest(
+        authorizationServer,
+        client,
+        clientAuth,
+        params,
+        redirectUri,
+        codeVerifier
+    )
 
-        console.log('[handleLogin] authorizationCodeGrantRequest response:', response);
+    console.log('[handleLogin] authorizationCodeGrantRequest response:', response);
 
-        const result = await oauth.processAuthorizationCodeResponse(
-            authorizationServer,
-            client,
-            response
-        )
+    const result = await oauth.processAuthorizationCodeResponse(
+        authorizationServer,
+        client,
+        response
+    )
 
-        console.log('[handleLogin] processAuthorizationCodeResponse result:', result);
+    console.log('[handleLogin] processAuthorizationCodeResponse result:', result);
 
-        saveResult(result, this.clientId)
+    saveResult(result, clientId)
 
-        this.clearSession()
+    sessionStorage.removeItem('state')
+    sessionStorage.removeItem('code_verifier')
 
-        window.location = this.successUri
-    } catch (error) {
-        console.error('[handleLogin] Error during token exchange:', error);
-        this._error = error.message
-    }
+    return { result, successUri }
 }
 
 
 export async function getActorId(id) {
     const m = WEBFINGER_REGEXP.exec(id)
-    if (!m) throw new Error('bad Webfinger format')
+    if (!m) throw new Error('bad Webfinger format for id: ' + id)
     const username = m.groups.username
     const domain = m.groups.domain
     const wfUrl = `https://${domain}/.well-known/webfinger?resource=acct:${username}%40${domain}`
@@ -147,12 +150,74 @@ export function getProxyUrl(actor) {
     return actor.endpoints?.proxyUrl
 }
 
+/**
+ * Shared login flow: resolve actor via webfinger, discover OAuth endpoints,
+ * generate PKCE challenge, and redirect to the authorization endpoint.
+ *
+ * @param {string} webfingerId  - user@domain (with or without leading @)
+ * @param {string} clientId     - OAuth client_id URL
+ * @param {string} redirectUri  - OAuth redirect_uri
+ * @returns {string} the authorization URL to redirect to
+ */
+export async function startLogin(webfingerId, clientId, redirectUri) {
+    const id = webfingerId.replace(/^@/, '')
+
+    // 1. Webfinger → actor
+    const actorId = await getActorId(id)
+    localStorage.setItem('actor_id', actorId)
+    const actor = await getActor(actorId)
+    localStorage.setItem('actor', JSON.stringify(actor))
+
+    const domain = id.split('@').slice(-1)[0]
+    localStorage.setItem('appUrl', domain)
+    localStorage.setItem('appUsername', id)
+
+    // 2. Discover OAuth endpoints (prefer actor endpoints, fall back to well-known)
+    let authorizationUrl = getAuthorizationEndpoint(actor)
+    let tokenUrl = getTokenEndpoint(actor)
+    const proxyUrl = getProxyUrl(actor)
+
+    if (!authorizationUrl || !tokenUrl) {
+        const wkUrl = `https://${domain}/.well-known/oauth-authorization-server`
+        const res = await fetch(wkUrl)
+        const meta = await res.json()
+        authorizationUrl = authorizationUrl || meta?.authorization_endpoint
+        tokenUrl = tokenUrl || meta?.token_endpoint
+    }
+
+    if (!authorizationUrl) throw new Error('No OAuth authorization endpoint.')
+    if (!tokenUrl) throw new Error('No OAuth token endpoint.')
+
+    localStorage.setItem('authorization_endpoint', authorizationUrl)
+    localStorage.setItem('token_endpoint', tokenUrl)
+    if (proxyUrl) localStorage.setItem('proxy_url', proxyUrl)
+
+    // 3. PKCE + state
+    const code_verifier = oauth.generateRandomCodeVerifier()
+    const code_challenge = await oauth.calculatePKCECodeChallenge(code_verifier)
+    const state = crypto.randomUUID()
+
+    sessionStorage.setItem('code_verifier', code_verifier)
+    sessionStorage.setItem('state', state)
+
+    // 4. Build authorization URL
+    return buildAuthorizationUrl({
+        authorizationUrl,
+        clientId,
+        redirectUri,
+        codeChallenge: code_challenge,
+        state,
+        loginHint: id
+    })
+}
+
 export function buildAuthorizationUrl({
     authorizationUrl,
     clientId,
     redirectUri,
     codeChallenge,
-    state
+    state,
+    loginHint
 }) {
     const url = new URL(authorizationUrl)
     url.searchParams.set('client_id', clientId)
@@ -162,6 +227,7 @@ export function buildAuthorizationUrl({
     url.searchParams.set('code_challenge', codeChallenge)
     url.searchParams.set('code_challenge_method', 'S256')
     url.searchParams.set('state', state)
+    if (loginHint) url.searchParams.set('login_hint', loginHint)
     return url.toString()
 }
 
@@ -249,11 +315,15 @@ export async function ensureFreshToken(clientId) {
       dispatchAuthError('No access token - please re-login')
       throw new Error('Not authenticated')
     }
-    const actorId = localStorage.getItem('actor_id')
+     const origin_url = localStorage.getItem('actor_id') || localStorage.getItem('appUrl')
+     if (!origin_url) {
+         dispatchAuthError('No origin URL - please re-login')
+         throw new Error('No origin URL - cannot determine same-origin for fetch')
+      }
     const urlObj = (typeof url === 'string')
         ? new URL(url)
         : url
-    if (urlObj.origin == URL.parse(actorId).origin) {
+     if (urlObj.origin == URL.parse(origin_url).origin) {
         const response = await oauth.protectedResourceRequest(
             accessToken,
             options.method || 'GET',
@@ -262,7 +332,7 @@ export async function ensureFreshToken(clientId) {
             options.body
         )
         if (response.status === 401 || response.status === 403) {
-          dispatchAuthError('Server rejected credentials - please re-login')
+          console.warn('[apFetch] Server returned', response.status, 'for', urlObj.toString())
         }
         return response
     } else {
@@ -279,7 +349,7 @@ export async function ensureFreshToken(clientId) {
             })
         )
         if (response.status === 401 || response.status === 403) {
-          dispatchAuthError('Server rejected credentials - please re-login')
+          console.warn('[apFetch] Proxy returned', response.status, 'for', urlObj.toString())
         }
         return response
     }
