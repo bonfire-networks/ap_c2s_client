@@ -1,7 +1,9 @@
 import { html, css, LitElement } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
-import { ChatController } from './chat-controller.js'
-import { MLSService } from './mls/mls-service.js'
-import * as storage from './storage/indexeddb-storage.js'
+import { ChatController } from '../chat-controller.js'
+import { MLSService } from '../mls/mls-service.js'
+import * as storage from '../storage/indexeddb-storage.js'
+import { adoptDaisyUI } from './shared-styles.js'
+import './theme-picker.js'
 
 export class E2EEChatView extends LitElement {
   static styles = css`
@@ -12,23 +14,12 @@ export class E2EEChatView extends LitElement {
     }
     .group-list {
       width: 300px;
-      border-right: 1px solid #e5e7eb;
       overflow-y: auto;
-      background: #f9fafb;
-    }
-    .group-item {
-      padding: 1rem;
-      border-bottom: 1px solid #e5e7eb;
-      cursor: pointer;
-    }
-    .group-item.selected {
-      background: #e0e7ff;
     }
     .messages-pane {
       flex: 1;
       display: flex;
       flex-direction: column;
-      background: #fff;
     }
     .messages-list {
       flex: 1;
@@ -36,113 +27,74 @@ export class E2EEChatView extends LitElement {
       padding: 1rem;
       display: flex;
       flex-direction: column;
+    }
+
+    /* Reddit-style thread nesting */
+    .thread-root {
+      border-bottom: 1px solid oklch(var(--b3) / 0.5);
+      padding: 0.5rem 0;
+    }
+    .thread-root:last-child {
+      border-bottom: none;
+    }
+    .thread-node {
+      position: relative;
+    }
+    .thread-children {
+      position: relative;
+      padding-left: 1.25rem;
+    }
+    .thread-line {
+      position: absolute;
+      left: 0.5rem;
+      top: 0;
+      bottom: 0;
+      width: 2px;
+      cursor: pointer;
+      opacity: 0.5;
+      transition: opacity 0.15s, width 0.1s;
+    }
+    .thread-line:hover {
+      opacity: 1;
+      width: 4px;
+      left: calc(0.5rem - 1px);
+    }
+    .thread-collapsed-indicator {
+      font-size: 0.7rem;
+      cursor: pointer;
+      opacity: 0.5;
+    }
+    .msg-header {
+      display: flex;
+      align-items: baseline;
       gap: 0.5rem;
+      font-size: 0.8rem;
+      margin-bottom: 0.125rem;
     }
-    .message-bubble {
-      max-width: 70%;
-      padding: 0.75rem;
-      border-radius: 0.75rem;
-      margin-bottom: 0.25rem;
-    }
-    .message-sent {
-      align-self: flex-end;
-      background: #2563eb;
-      color: white;
-      border-bottom-right-radius: 0.25rem;
-    }
-    .message-received {
-      align-self: flex-start;
-      background: #f3f4f6;
-      color: #1f2937;
-      border-bottom-left-radius: 0.25rem;
-    }
-    .thread-replies {
-      padding-left: 0.5rem;
-      margin-top: 0.25rem;
-      border-left: 2px solid rgba(37, 99, 235, 0.2);
-    }
-    .message-actor {
-      font-size: 0.75rem;
+    .msg-author {
       font-weight: 600;
-      margin-bottom: 0.25rem;
-      opacity: 0.8;
-    }
-    .message-name {
-      font-weight: 700;
-      font-size: 1.1rem;
-      margin-bottom: 0.5rem;
-    }
-    .message-summary {
-      font-style: italic;
-      font-size: 0.9rem;
-      margin-bottom: 0.5rem;
-      opacity: 0.9;
-    }
-    .message-content {
-      line-height: 1.4;
-    }
-    .toggle-content-btn {
-      font-size: 0.75rem;
-      padding: 0.25rem 0.5rem;
-      margin-top: 0.5rem;
-      background: rgba(0,0,0,0.1);
-      border: none;
-      border-radius: 0.25rem;
       cursor: pointer;
     }
-    .message-inputs {
+    .msg-author.self {
+      opacity: 0.7;
+    }
+    .msg-body {
+      padding: 0.25rem 0 0.25rem 0;
+      line-height: 1.45;
+    }
+    .msg-actions {
       display: flex;
-      flex-direction: column;
-      gap: 1rem;
-      padding: 1rem;
-      border-top: 1px solid #e5e7eb;
-      background: #f3f4f6;
-    }
-    .input {
-      flex: 1;
-      border-radius: 0.5rem;
-      border: 1px solid #e5e7eb;
-      padding: 0.75rem;
-      font-size: 1rem;
-      font-family: sans-serif;
-    }
-    .send-btn {
-      border-radius: 0.5rem;
-      background: #2563eb;
-      color: #fff;
-      padding: 0.75rem 1.5rem;
-      font-size: 1rem;
-      border: none;
-      cursor: pointer;
-    }
-    .reply-btn {
-      background: rgba(255,255,255,0.2);
-      border: 1px solid rgba(255,255,255,0.4);
-      color: inherit;
-      padding: 0.25rem 0.5rem;
-      border-radius: 0.25rem;
+      gap: 0.5rem;
       font-size: 0.75rem;
-      cursor: pointer;
-      margin-top: 0.5rem;
+      opacity: 0;
+      transition: opacity 0.15s;
+      padding-bottom: 0.25rem;
     }
-    .reply-indicator {
-      background: rgba(0,0,0,0.1);
-      padding: 0.5rem;
-      border-radius: 0.5rem;
-      margin-bottom: 0.5rem;
-      font-size: 0.85rem;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
+    .thread-node:hover > .msg-actions {
+      opacity: 0.6;
     }
-    .cancel-btn {
-      background: #ef4444;
-      color: white;
-      border: none;
-      padding: 0.25rem 0.5rem;
-      border-radius: 0.25rem;
-      font-size: 0.75rem;
-      cursor: pointer;
+    .msg-actions:hover {
+      opacity: 1 !important;
     }
   `;
 
@@ -187,20 +139,35 @@ export class E2EEChatView extends LitElement {
     this.threadNameIsAutoGenerated = false
     this.currentActorId = null
 
+    this._collapsedThreads = new Set();
+
+    // Colors for thread lines at each depth, cycling
+    this._threadColors = [
+      'oklch(var(--p))',   // primary
+      'oklch(var(--s))',   // secondary
+      'oklch(var(--a))',   // accent
+      'oklch(var(--su))',  // success
+      'oklch(var(--wa))',  // warning
+      'oklch(var(--in))',  // info
+      'oklch(var(--er))',  // error
+      'oklch(var(--neu))'  // neutral
+    ];
+
     // Backend wired up in connectedCallback (async import)
     this.controller = null;
   }
 
   async connectedCallback() {
     super.connectedCallback();
+    adoptDaisyUI(this);
     try {
       // Dynamic backend selection: Tauri native Rust or WASM
       const wasmPath = localStorage.getItem('wasmBasePath');
       const useTauri = wasmPath === 'false' && window.__TAURI__;
       console.log('[ChatView] Using backend:', useTauri ? 'Tauri Rust plugin' : 'OpenMLS WASM');
       const backend = useTauri
-        ? await import('./mls/openmls-tauri/tauri-backend.js')
-        : await import('./mls/openmls-wasm/openmls-backend.js');
+        ? await import('../mls/openmls-tauri/tauri-backend.js')
+        : await import('../mls/openmls-wasm/openmls-backend.js');
       const mlsService = new MLSService(backend, storage);
       // console.log('[ChatView] MLSService initialized with backend:', mlsService);
       this.controller = new ChatController(mlsService, storage);
@@ -209,6 +176,13 @@ export class E2EEChatView extends LitElement {
       const actor = await this.controller.init();
       console.log('[ChatView] Actor initialized:', actor);
       this.currentActorId = actor.id;
+
+      // Set window title with username so multiple instances are distinguishable
+      const nickname = this.getActorNickname(actor.id);
+      if (window.__TAURI__) {
+        window.__TAURI__.window.getCurrentWindow().setTitle(`Secure Chat - ${nickname}`);
+      }
+
       await this.loadGroups();
       this.pollInbox();
     } catch (e) {
@@ -301,12 +275,17 @@ export class E2EEChatView extends LitElement {
     if (!this.input.trim() || !this.selectedGroupId) return;
     this.loading = true;
     try {
+      const replyTo = this.replyToId;
       const msgObj = {
         type: 'Note',
         summary: this.summary.trim(),
         content: this.input.trim(),
         attributedTo: this.currentActorId
       };
+      // Include inReplyTo in the encrypted payload (not cleartext) to avoid leaking threading metadata
+      if (replyTo) {
+        msgObj.inReplyTo = replyTo;
+      }
 
       if (this.creatingNewGroup) {
         msgObj.name = this.name.trim();
@@ -329,16 +308,12 @@ export class E2EEChatView extends LitElement {
           this.error = errors.join('; ');
         }
       } else {
-        const input = this.input;
-        const replyTo = this.replyToId;
         this.input = '';
         this.summary = '';
         this.replyToId = null;
         this.replyToSnippet = '';
 
-        await this.controller.sendMessage(this.selectedGroupId, msgObj, {
-          inReplyTo: replyTo
-        });
+        await this.controller.sendMessage(this.selectedGroupId, msgObj);
       }
 
       await this.loadMessages(this.selectedGroupId);
@@ -409,6 +384,21 @@ export class E2EEChatView extends LitElement {
     this.requestUpdate();
   }
 
+  // ── Menu actions ─────────────────────────────────────
+
+  _menuAction(value) {
+    if (value === 'logout') {
+      localStorage.clear()
+      if (window.__TAURI__) {
+        window.__TAURI__.event.emit('app-logout')
+      } else {
+        window.location = this.getAttribute('redirect-uri') || '/'
+      }
+    } else {
+      window.location.hash = value
+    }
+  }
+
   // ── Display helpers ────────────────────────────────────
 
   getActorNickname(actorId) {
@@ -421,27 +411,6 @@ export class E2EEChatView extends LitElement {
 
   decryptedContent(msg) {
     return typeof msg === 'string' ? msg : msg && msg.content;
-  }
-
-  buildThreadTree(messages) {
-    const messageMap = new Map();
-    const rootMessages = [];
-
-    messages.forEach(msg => {
-      messageMap.set(msg.id, { ...msg, replies: [] });
-    });
-
-    messages.forEach(msg => {
-      const node = messageMap.get(msg.id);
-      const replyToSpecificMessage = msg.inReplyTo ? messageMap.get(msg.inReplyTo) : null;
-      if (replyToSpecificMessage) {
-        replyToSpecificMessage.replies.push(node);
-      } else {
-        rootMessages.push(node);
-      }
-    });
-
-    return rootMessages;
   }
 
   scrollToMessage(messageId) {
@@ -457,38 +426,69 @@ export class E2EEChatView extends LitElement {
     }
   }
 
+  _toggleCollapse(msgId) {
+    if (this._collapsedThreads.has(msgId)) {
+      this._collapsedThreads.delete(msgId);
+    } else {
+      this._collapsedThreads.add(msgId);
+    }
+    this.requestUpdate();
+  }
+
+  _countDescendants(msg) {
+    if (!msg.replies || msg.replies.length === 0) return 0;
+    return msg.replies.reduce((sum, r) => sum + 1 + this._countDescendants(r), 0);
+  }
+
+  _actorColor(actorId) {
+    const idx = this.controller.getActorColorIndex(actorId, this._threadColors.length);
+    return this._threadColors[idx];
+  }
+
   // ── Render ─────────────────────────────────────────────
 
   renderMessage(msg, depth = 0) {
-    const isSent = msg.isLocal;
     const hasSummary = msg && msg.summary;
     const msgIndex = this.messages.findIndex(m => m.id === msg.id);
     const showContent = this[`showContent${msgIndex}`] || false;
     const actorNickname = msg.attributedTo ? this.getActorNickname(msg.attributedTo) : 'Unknown';
+    const isCollapsed = this._collapsedThreads.has(msg.id);
+    const hasReplies = msg.replies && msg.replies.length > 0;
+    const color = this._actorColor(msg.attributedTo);
 
     return html`
-      <div id="msg-${msg.id}" style="margin-left: ${depth * 20}px;">
-        <div class="message-bubble ${isSent ? 'message-sent' : 'message-received'}" style="${depth > 0 ? 'border-left: 2px solid rgba(0,0,0,0.1);' : ''}">
-          ${!isSent ? html`<div class="message-actor" @click=${() => this.scrollToMessage(msg.id)} style="cursor: pointer;">${actorNickname}</div>` : ''}
-          ${msg.inReplyTo && msg.inReplyTo !== this.selectedGroupId ? html`
-            <div style="font-size: 0.75rem; opacity: 0.7; margin-bottom: 0.25rem; font-style: italic; cursor: pointer;"
-                 @click=${() => this.scrollToMessage(msg.inReplyTo)}>
-              ↩ Replying to message
+      <div id="msg-${msg.id}" class="thread-node" style="background: color-mix(in oklch, ${color} 10%, oklch(var(--b1))); border-radius: 0.375rem; padding: 0.125rem 0.375rem; margin: 0.0625rem 0;">
+        <div class="msg-header">
+          <span class="msg-author badge badge-sm"
+                style="background: ${color}; color: oklch(var(--b1));"
+                @click=${() => this.scrollToMessage(msg.id)}>
+            ${actorNickname}
+          </span>
+          ${isCollapsed ? html`
+            <span class="thread-collapsed-indicator" @click=${() => this._toggleCollapse(msg.id)}>
+              [+${this._countDescendants(msg)} collapsed]
+            </span>
+          ` : ''}
+        </div>
+        ${!isCollapsed ? html`
+          <div class="msg-body">
+            ${hasSummary ? html`
+              <div class="italic text-sm opacity-90">${msg.summary}</div>
+              <button class="btn btn-ghost btn-xs" @click=${() => { this[`showContent${msgIndex}`] = !showContent; this.requestUpdate(); }}>
+                ${showContent ? 'Hide' : 'Show'} Content
+              </button>
+            ` : ''}
+            ${!hasSummary || showContent ? html`<div>${msg && msg.content}</div>` : ''}
+          </div>
+          <div class="msg-actions">
+            ${msg.id ? html`<a class="link link-hover" @click=${() => this.handleReply(msg.id)}>reply</a>` : ''}
+          </div>
+          ${hasReplies ? html`
+            <div class="thread-children">
+              <div class="thread-line" style="background: ${color}" @click=${() => this._toggleCollapse(msg.id)}></div>
+              ${msg.replies.map(reply => this.renderMessage(reply, depth + 1))}
             </div>
           ` : ''}
-          ${hasSummary ? html`
-            <div class="message-summary">${msg.summary}</div>
-            <button class="toggle-content-btn" @click=${() => { this[`showContent${msgIndex}`] = !showContent; this.requestUpdate(); }}>
-              ${showContent ? 'Hide' : 'Show'} Content
-            </button>
-          ` : ''}
-          ${!hasSummary || showContent ? html`<div class="message-content">${msg && msg.content}</div>` : ''}
-          ${msg.id ? html`<button class="reply-btn" @click=${() => this.handleReply(msg.id)}>Reply</button>` : ''}
-        </div>
-        ${msg.replies && msg.replies.length > 0 ? html`
-          <div class="thread-replies">
-            ${msg.replies.map(reply => this.renderMessage(reply, depth + 1))}
-          </div>
         ` : ''}
       </div>
     `;
@@ -497,95 +497,97 @@ export class E2EEChatView extends LitElement {
   render() {
     const creatingNewGroup = this.creatingNewGroup;
     return html`
-      <div class="chat-container">
-        <div class="group-list">
-          <button class="send-btn" style="width:90%;margin:1rem;" @click=${() => this.createNewGroup()}>+ New thread</button>
-          <button class="send-btn" style="width:90%;margin:0.5rem 1rem;" @click=${() => this.pollInbox()}>Check for messages</button>
-          <button class="send-btn" style="width:90%;margin:0.5rem 1rem;background:#e11d48;" @click=${() => this.handleClearData()}>Clear all data</button>
-          ${this.groups.map(g => html`
-            <div class="group-item ${this.selectedGroupId === g.id ? 'selected' : ''}" @click=${() => { this.creatingNewGroup = false; this.loadMessages(g.id); }}>
-              <div>${g.name || g.id}</div>
-              <div style="font-size:0.9em;color:#555;">${this.decryptedSummary(g.decryptedContent) || this.decryptedSummary(g.lastMessage && g.lastMessage.content) || ''}</div>
-            </div>
-          `)}
+        <header class="flex flex-col gap-2 p-3 relative z-10">
+
+            <button class="btn btn-primary btn-sm" @click=${() => this.createNewGroup()}>+ New thread</button>
+            <button class="btn btn-success btn-sm" @click=${() => this.pollInbox()}>Check for messages</button>
+            <button class="btn btn-error btn-sm btn-outline" @click=${() => this.handleClearData()}>Clear all data</button>
+
+      <div class="dropdown dropdown-end">
+        <label tabindex="0" class="btn btn-ghost btn-sm">
+          ${this.currentActorId ? this.getActorNickname(this.currentActorId) : 'User'} ▾
+        </label>
+        <ul tabindex="0" class="dropdown-content menu menu-sm bg-base-200 rounded-box shadow-lg w-52 z-20">
+          <li><theme-picker></theme-picker></li>
+          // <li><a @click=${() => this._menuAction('settings')}>Settings</a></li>
+          <li><a @click=${() => this._menuAction('logout')}>Log out</a></li>
+        </ul>
+      </div>
+    </header>
+      <div class="chat-container z-10">
+        <div class="group-list bg-base-200 border-r border-base-300">
+
+          <ul class="menu menu-sm">
+            ${this.groups.map(g => html`
+              <li>
+                <a class="${this.selectedGroupId === g.id ? 'active' : ''}" @click=${() => { this.creatingNewGroup = false; this.loadMessages(g.id); }}>
+                  <div>
+                    <div class="font-medium">${g.name || g.id}</div>
+                    <div class="text-xs opacity-60">${this.decryptedSummary(g.decryptedContent) || this.decryptedSummary(g.lastMessage && g.lastMessage.content) || ''}</div>
+                  </div>
+                </a>
+              </li>
+            `)}
+          </ul>
         </div>
-        <div class="messages-pane">
+        <div class="messages-pane bg-base-100">
           ${this.selectedGroupId && !this.creatingNewGroup && (this.currentThreadName && !this.threadNameIsAutoGenerated) ? html`
-            <div style="padding: 1rem; border-bottom: 1px solid #e5e7eb; background: #f9fafb; display: flex; align-items: center; gap: 0.5rem;">
+            <div class="p-4 border-b border-base-300 bg-base-200 flex items-center gap-2">
               ${this.editingThreadName ? html`
                 <input
                   type="text"
+                  class="input input-bordered input-sm flex-1 font-semibold"
                   .value=${this.currentThreadName}
                   @input=${e => this.currentThreadName = e.target.value}
-                  style="flex: 1; padding: 0.5rem; border: 1px solid #d1d5db; border-radius: 0.25rem; font-size: 1rem; font-weight: 600;"
                   placeholder="Thread name"
                 />
-                <button
-                  class="send-btn"
-                  @click=${() => this.saveThreadName()}>
-                  Save
-                </button>
-                <button
-                  class="cancel-btn"
-                  @click=${() => this.cancelEditThreadName()}>
-                  Cancel
-                </button>
+                <button class="btn btn-primary btn-sm" @click=${() => this.saveThreadName()}>Save</button>
+                <button class="btn btn-error btn-sm" @click=${() => this.cancelEditThreadName()}>Cancel</button>
               ` : html`
-                <div style="flex: 1; font-weight: 600; font-size: 1.1rem;">
-                  ${this.currentThreadName}
-                </div>
-                <button
-                  class="send-btn"
-                  style="font-size: 0.85rem;"
-                  @click=${() => this.startEditingThreadName()}>
-                  Edit name
-                </button>
+                <div class="flex-1 font-semibold text-lg">${this.currentThreadName}</div>
+                <button class="btn btn-ghost btn-sm" @click=${() => this.startEditingThreadName()}>Edit name</button>
               `}
             </div>
           ` : ''}
           <div class="messages-list">
-            ${this.buildThreadTree(this.messages).map(msg => this.renderMessage(msg, 0))}
+            ${this.controller.buildThreadTree(this.messages).map(msg => html`<div class="thread-root">${this.renderMessage(msg, 0)}</div>`)}
           </div>
           ${this.selectedGroupId ? html`
-          <form class="message-inputs" @submit=${e => { e.preventDefault(); this.sendMessage(); }}>
+          <form class="flex flex-col gap-3 p-4 border-t border-base-300 bg-base-200" @submit=${e => { e.preventDefault(); this.sendMessage(); }}>
             ${(() => {
           const displayMembers = this.currentGroupMembers.filter(actorId => actorId !== this.currentActorId);
           const shouldShowReplyIndicator = !creatingNewGroup && (displayMembers.length > 0 || this.replyToId);
 
       return shouldShowReplyIndicator ? html`
-                <div class="reply-indicator">
-                  <div style="flex: 1;">
-                    <div style="font-size: 0.75rem; opacity: 0.8; margin-bottom: 0.25rem;">
-                      ${this.replyToId ? 'Replying to message:' : 'Replying to:'}
+                <div class="alert alert-info py-2 flex justify-between">
+                  <div class="flex-1">
+                    <div class="text-xs opacity-80 mb-1">
+                      ${this.replyToId ? 'Replying to:' : 'Replying to:'}
                     </div>
                     ${displayMembers.length > 0 ? html`
-                      <div style="display: flex; flex-wrap: wrap; gap: 0.25rem; margin-bottom: ${this.replyToId ? '0.5rem' : '0'};">
+                      <div class="flex flex-wrap gap-1 ${this.replyToId ? 'mb-2' : ''}">
                         ${displayMembers.map(actorId => html`
-                          <span style="background: #e5e7eb; padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-size: 0.8rem;">
-                            ${actorId ? this.getActorNickname(actorId) : 'Unknown'}
-                          </span>
+                          <span class="badge badge-sm">${actorId ? this.getActorNickname(actorId) : 'Unknown'}</span>
                         `)}
                       </div>
                     ` : ''}
                     ${this.replyToId ? html`
-                      <div style="font-size: 0.85rem; font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0.25rem 0.5rem; background: #fef3c7; border-radius: 0.25rem;">
-                        ${this.replyToSnippet || this.replyToId}
-                      </div>
+                      <div class="badge badge-sm badge-ghost italic truncate line-clamp-1 ">${this.replyToSnippet || this.replyToId}</div>
                     ` : ''}
                   </div>
                   ${this.replyToId ? html`
-                    <button class="cancel-btn" type="button" @click=${() => this.cancelReply()}>Cancel</button>
+                    <button class="btn btn-error btn-xs" type="button" @click=${() => this.cancelReply()}>Cancel</button>
                   ` : ''}
                 </div>
               ` : '';
       })()}
             ${creatingNewGroup ? html`
-              <input class="input" type="text" .value=${this.name} @input=${e => this.name = e.target.value} placeholder="Thread name (optional)" />
-              <input class="input" type="text" .value=${this.to} @input=${e => this.to = e.target.value} placeholder="To (space-separated URIs or @user@domain)" />
+              <input class="input input-bordered" type="text" .value=${this.name} @input=${e => this.name = e.target.value} placeholder="Thread name (optional)" />
+              <input class="input input-bordered" type="text" .value=${this.to} @input=${e => this.to = e.target.value} placeholder="To (space-separated URIs or @user@domain)" />
             ` : ''}
-            <input class="input" type="text" .value=${this.summary} @input=${e => this.summary = e.target.value} placeholder="CW / Summary (optional)" />
+            <input class="input input-bordered" type="text" .value=${this.summary} @input=${e => this.summary = e.target.value} placeholder="CW / Summary (optional)" />
             <textarea
-              class="input message-textarea"
+              class="textarea textarea-bordered"
               .value=${this.input}
               @input=${e => {
         this.input = e.target.value;
@@ -595,10 +597,10 @@ export class E2EEChatView extends LitElement {
               placeholder="Type a message..."
               style="resize: vertical; overflow-y: hidden; min-height: 1rem; max-height: 20rem;"
             ></textarea>
-            <button class="send-btn" type="submit">Send</button>
+            <button class="btn btn-primary" type="submit">Send</button>
           </form>
           ` : ''}
-          ${this.error ? html`<div class="text-red-500 mt-2">${this.error}</div>` : ''}
+          ${this.error ? html`<div class="alert alert-error mt-2">${this.error}</div>` : ''}
         </div>
       </div>
     `;

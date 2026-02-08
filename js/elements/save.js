@@ -1,11 +1,22 @@
 import {
   html,
+  css,
   LitElement
 } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
 
 import { handleLogin } from '../activitypub/auth.js'
+import { adoptDaisyUI } from './shared-styles.js'
 
 export class SaveElement extends LitElement {
+  static styles = css`
+    :host {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+  `
+
   static get properties () {
     return {
       redirectUri: { type: String, attribute: 'redirect-uri' },
@@ -21,6 +32,7 @@ export class SaveElement extends LitElement {
 
   connectedCallback () {
     super.connectedCallback()
+    adoptDaisyUI(this)
     handleLogin({
       clientId: this.clientId,
       redirectUri: this.redirectUri,
@@ -34,11 +46,10 @@ export class SaveElement extends LitElement {
       })
   }
 
-
   render () {
     return (this._error)
-      ? html`<sl-alert>${this._error}</sl-alert>`
-      : html`<sl-spinner style='font-size: 2rem;'></sl-spinner>`
+      ? html`<div class="alert alert-error max-w-sm">${this._error}</div>`
+      : html`<span class="loading loading-spinner loading-lg text-primary"></span>`
   }
 }
 

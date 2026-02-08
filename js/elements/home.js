@@ -1,12 +1,12 @@
 import {
   html,
-  css,
-  LitElement
+  css
 } from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
 
 import { Element } from './element.js'
-import { E2EEChatView } from '../e2ee-chat-view.js'
+import './e2ee-chat-view.js'
 import { getCurrentActor } from '../activitypub/auth.js'
+import { adoptDaisyUI } from './shared-styles.js'
 
 export class HomeElement extends Element {
   static styles = css`
@@ -20,15 +20,9 @@ export class HomeElement extends Element {
     main,
     footer {
       width: 100%;
-      max-width: var(--max-width);
+      max-width: 75ch;
       margin: 0 auto;
-      padding: var(--gap);
-    }
-
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
+      padding: 1rem;
     }
   `
 
@@ -49,6 +43,7 @@ export class HomeElement extends Element {
 
   connectedCallback () {
     super.connectedCallback()
+    adoptDaisyUI(this)
     // Store clientId in localStorage so ensureFreshToken can use it for token refresh
     if (this.clientId) {
       localStorage.setItem('client_id', this.clientId)
@@ -80,46 +75,23 @@ export class HomeElement extends Element {
 
   render () {
     return html`
-
-    <header>
-
-      <span class="brand"><a href="#">Messages</a></span>
-
-
-      <!-- User menu dropdown -->
-      <sl-dropdown>
-        <sl-button slot="trigger" caret>${(this._actor) ? this._actor.name : 'User'}</sl-button>
-        <sl-menu @sl-select=${this._menuSelect.bind(this)}>
-          <sl-menu-item value="settings">
-            <sl-icon slot="prefix" name="gear"></sl-icon>
-            Settings
-          </sl-menu-item>
-          <sl-menu-item value="logout">
-            <sl-icon slot="prefix" name="box-arrow-left"></sl-icon>
-            Log out
-          </sl-menu-item>
-        </sl-menu>
-      </sl-dropdown>
-    </header>
-
     <main>
-    <e2ee-chat-view redirect-uri=${this.redirectUri} client-id=${this.clientId} />
+      <e2ee-chat-view redirect-uri=${this.redirectUri} client-id=${this.clientId}></e2ee-chat-view>
     </main>
-
-    <footer>
-      <a href="https://github.com/bonfire-networks/ap_c2s_client">Code</a>
-    </footer>
     `
   }
 
-  _menuSelect (event) {
-    const value = event.detail.item.value
+  _menuAction(value) {
     window.location.hash = value
   }
 
   _logout () {
     localStorage.clear()
-    window.location = this.redirectUri
+    if (window.__TAURI__) {
+      window.__TAURI__.event.emit('app-logout')
+    } else {
+      window.location = this.redirectUri
+    }
   }
 }
 

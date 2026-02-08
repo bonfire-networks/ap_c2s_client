@@ -9,8 +9,9 @@ import {
   WEBFINGER_REGEXP
 } from '../activitypub/auth.js'
 
-export class LoginElement extends LitElement {
+import { adoptDaisyUI } from './shared-styles.js'
 
+export class LoginElement extends LitElement {
 
   static styles = css`
     :host {
@@ -20,26 +21,6 @@ export class LoginElement extends LitElement {
       align-items: center;
       height: 100vh;
       padding: 1rem;
-      box-sizing: border-box;
-      background: var(--bg-main, #fafafa);
-    }
-    .intro {
-      font-size: 1.25rem;
-      text-align: center;
-      margin-bottom: 1.5rem;
-      max-width: 30ch;
-    }
-    .login-form {
-      display: flex;
-      gap: 0.5rem;
-      align-items: center;
-    }
-    sl-input {
-      flex: 1;
-      --sl-input-width: 15rem;
-    }
-    sl-button {
-      white-space: nowrap;
     }
   `
 
@@ -57,41 +38,36 @@ export class LoginElement extends LitElement {
   }
 
   connectedCallback() {
+    super.connectedCallback()
+    adoptDaisyUI(this)
 
     const webfinger = this._webfinger_url();
     if (this.isWebfinger(webfinger)) {
-      // login immediately if we already have a valid webfinger ID (e.g. from previous session)
       this._login(webfinger)
     }
-
-    super.connectedCallback()
   }
 
   render() {
-
     return html`
-      <h1></h1>
-      <p class="intro">
-        Welcome! This is an <a href="https://activitypub.rocks/">ActivityPub</a>
-        geosocial Web application. To log in, you need to have an account on a
-        compatible server.
+      <p style="max-width: 30ch; text-align: center; margin-bottom: 1.5rem; font-size: 1.1rem; opacity: 0.8;">
+        Welcome! This is an <a class="link link-primary" href="https://activitypub.rocks/">ActivityPub</a>
+        geosocial Web application. To log in, you need to have an account on a compatible server.
       </p>
-      <div class="login-form">
-        <sl-input
+      <div class="join">
+        <input
+          class="input input-bordered join-item"
           id="webfinger"
           placeholder="username@example.com"
           @input=${this._input}
-          value=${ this._webfinger }
-        ></sl-input>
-        <sl-button
-          variant="primary"
+          .value=${this._webfinger || ''}
+        />
+        <button
+          class="btn btn-primary join-item"
           ?disabled=${!this.isWebfinger(this._webfinger)}
           @click=${() => this._login()}
-        >
-          Log In
-        </sl-button>
-        ${this._error ? html`<sl-alert>${this._error}</sl-alert>` : html``}
+        >Log In</button>
       </div>
+      ${this._error ? html`<div class="alert alert-error mt-4" style="max-width: 24rem;">${this._error}</div>` : html``}
     `
   }
 

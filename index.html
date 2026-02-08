@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -8,49 +8,18 @@
     <meta name="mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="mobile-web-app-title" content="" />
     <link rel="manifest" href="manifest.json" />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap"
-      rel="stylesheet"
-    />
-    <link
-      rel="stylesheet"
-      href="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.15.0/cdn/themes/light.css"
-    />
-    <script
-      type="module"
-      src="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.15.0/cdn/shoelace.js"
-    ></script>
-    <style>
-      :root {
-        --max-width: 75ch;
-        --gap: 1rem;
-        --sl-font-sans: "Inter", system-ui, sans-serif;
-      }
-      body {
-        font-family: var(--sl-font-sans);
-        display: grid;
-        grid-template-rows: auto 1fr auto;
-        min-height: 100vh;
-        margin: 0;
-      }
-      .spinner-page {
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        height: 100vh;
-        padding: 1rem;
-      }
-    </style>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4/dist/full.min.css" rel="stylesheet" />
+    <script src="https://cdn.tailwindcss.com"></script>
     <script type="module" src="js/elements/login.js"></script>
     <script type="module" src="js/elements/save.js"></script>
     <script type="module" src="js/elements/home.js"></script>
-    <script type="module" src="js/e2ee-chat-view.js"></script>
-    <title>E2EE AP</title>
+    <script type="module" src="js/elements/e2ee-chat-view.js"></script>
+    <title>Secure Chat</title>
   </head>
-  <body>
+  <body class="min-h-screen font-sans">
     <div id="page">
-      <div class="spinner-page">
-        <sl-spinner style="--size: 50vw"></sl-spinner>
+      <div class="flex items-center justify-center h-screen">
+        <span class="loading loading-spinner loading-lg"></span>
       </div>
     </div>
     <script type="module">
