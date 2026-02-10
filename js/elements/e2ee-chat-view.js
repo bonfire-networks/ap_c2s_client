@@ -497,7 +497,7 @@ export class E2EEChatView extends LitElement {
   render() {
     const creatingNewGroup = this.creatingNewGroup;
     return html`
-        <header class="flex flex-col gap-2 p-3 relative z-10">
+        <header class="flex flex-col gap-2 relative z-10" style="margin-left: 72px">
 
             <button class="btn btn-primary btn-sm" @click=${() => this.createNewGroup()}>+ New thread</button>
             <button class="btn btn-success btn-sm" @click=${() => this.pollInbox()}>Check for messages</button>
