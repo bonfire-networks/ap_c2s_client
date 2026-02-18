@@ -44,13 +44,19 @@ export async function loadGroup(userId, groupId) {
   return await invoke('plugin:openmls|load_group', { userId, groupId });
 }
 
+export async function deleteGroup(userId, groupId) {
+  await invoke('plugin:openmls|delete_group', { userId, groupId });
+}
+
 export async function joinGroup(userId, groupId, welcomeBytes, ratchetTreeBytes) {
-  await invoke('plugin:openmls|join_group', {
+  const result = await invoke('plugin:openmls|join_group', {
     userId,
     groupId,
     welcomeB64: uint8ToBase64(welcomeBytes),
     ratchetTreeB64: uint8ToBase64(ratchetTreeBytes),
   });
+  // Return the actual MLS group_id (sender's ULID) from the Welcome
+  return result.groupId;
 }
 
 export async function encrypt(userId, groupId, plaintext) {
@@ -94,4 +100,16 @@ export async function exportRatchetTree(userId, groupId) {
 export async function createKeyPackage(userId) {
   const result = await invoke('plugin:openmls|create_key_package', { userId });
   return { keyPackageBytes: base64ToUint8(result.keyPackageBytes) };
+}
+
+// ── Group ID extraction ─────────────────────────────────────────────
+
+/**
+ * Extract the MLS group_id from a ciphertext blob without decrypting.
+ * Returns null for Welcome messages (group_id is encrypted inside).
+ */
+export async function extractGroupId(messageBytes) {
+  return await invoke('plugin:openmls|extract_group_id', {
+    messageB64: uint8ToBase64(messageBytes),
+  });
 }

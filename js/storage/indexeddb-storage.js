@@ -20,6 +20,12 @@ db.version(2).stores({
   messages: 'id, groupId, timestamp, isLocal',
   processedActivityIds: '++id, actorId, activityId'
 });
+db.version(3).stores({
+  groups: 'id, apId',
+  users: 'id',
+  messages: 'id, groupId, timestamp, isLocal',
+  processedActivityIds: '++id, [actorId+activityId]'
+});
 
 // ──────────────────────────────────────────────
 // Internal helpers

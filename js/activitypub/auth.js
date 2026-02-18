@@ -85,10 +85,18 @@ export async function getActorId(id) {
     const username = m.groups.username
     const domain = m.groups.domain
     const wfUrl = `https://${domain}/.well-known/webfinger?resource=acct:${username}%40${domain}`
-    const res = await fetch(wfUrl, {
-        headers: { Accept: 'application/jrd+json,application/json' }
-    })
-    if (!res.ok) throw new Error('Could not load webfinger')
+    console.log('[getActorId] Fetching WebFinger:', wfUrl)
+    let res
+    try {
+        res = await fetch(wfUrl, {
+            headers: { Accept: 'application/jrd+json,application/json' }
+        })
+    } catch (err) {
+        console.error('[getActorId] WebFinger fetch failed:', err.name, err.message, err)
+        throw err
+    }
+    console.log('[getActorId] WebFinger response:', res.status, res.statusText)
+    if (!res.ok) throw new Error(`Could not load webfinger (${res.status} ${res.statusText})`)
     const json = await res.json()
     if (!json.links) throw new Error('No links in webfinger json')
     const actorLink = json.links.find(
@@ -100,19 +108,29 @@ export async function getActorId(id) {
             ].includes(obj.type)
     )
     if (!actorLink) throw new Error('No ActivityPub actor ID in Webfinger')
+    console.log('[getActorId] Resolved actor ID:', actorLink.href)
     return actorLink.href
 }
 
 export async function getActor(actorId) {
-    const res = await fetch(actorId, {
-        headers: {
-            Accept:
-                'application/activity+json,application/lrd+json,application/json',
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache'
-        }
-    })
-    if (!res.ok) throw new Error('Failure fetching actor')
+    console.log('[getActor] Fetching actor:', actorId)
+    let res
+    try {
+        res = await fetch(actorId, {
+            cache: 'no-store',
+            headers: {
+                Accept:
+                    'application/activity+json,application/lrd+json,application/json',
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache'
+            }
+        })
+    } catch (err) {
+        console.error('[getActor] Actor fetch failed:', err.name, err.message, err)
+        throw err
+    }
+    console.log('[getActor] Actor response:', res.status, res.statusText)
+    if (!res.ok) throw new Error(`Failure fetching actor (${res.status} ${res.statusText})`)
     return await res.json()
 }
 
@@ -161,10 +179,13 @@ export function getProxyUrl(actor) {
  */
 export async function startLogin(webfingerId, clientId, redirectUri) {
     const id = webfingerId.replace(/^@/, '')
+    console.log('[startLogin] Starting login for:', id, 'clientId:', clientId, 'redirectUri:', redirectUri)
 
     // 1. Webfinger → actor
+    console.log('[startLogin] Step 1: WebFinger lookup...')
     const actorId = await getActorId(id)
     localStorage.setItem('actor_id', actorId)
+    console.log('[startLogin] Step 2: Fetching actor...')
     const actor = await getActor(actorId)
     localStorage.setItem('actor', JSON.stringify(actor))
 
@@ -176,11 +197,21 @@ export async function startLogin(webfingerId, clientId, redirectUri) {
     let authorizationUrl = getAuthorizationEndpoint(actor)
     let tokenUrl = getTokenEndpoint(actor)
     const proxyUrl = getProxyUrl(actor)
+    console.log('[startLogin] Step 3: OAuth discovery. From actor:', { authorizationUrl, tokenUrl, proxyUrl })
 
     if (!authorizationUrl || !tokenUrl) {
         const wkUrl = `https://${domain}/.well-known/oauth-authorization-server`
-        const res = await fetch(wkUrl)
+        console.log('[startLogin] Falling back to well-known:', wkUrl)
+        let res
+        try {
+            res = await fetch(wkUrl)
+        } catch (err) {
+            console.error('[startLogin] OAuth well-known fetch failed:', err.name, err.message, err)
+            throw err
+        }
+        console.log('[startLogin] OAuth well-known response:', res.status, res.statusText)
         const meta = await res.json()
+        console.log('[startLogin] OAuth metadata:', meta)
         authorizationUrl = authorizationUrl || meta?.authorization_endpoint
         tokenUrl = tokenUrl || meta?.token_endpoint
     }

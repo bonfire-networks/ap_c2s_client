@@ -15,7 +15,15 @@ import { getCurrentActor, getActor, getActorId, apFetch } from './activitypub/au
 import { postToOutbox, fetchActorKeyPackage, resolveActorId, extractApIdFromResponse } from './activitypub/client.js';
 import { sendEncryptedMessage, sendMLSControl, publishKeyPackage, fetchKeyPackage, parseMLSActivity } from './activitypub/mls-transport.js';
 
-export class ChatController { 
+export class EncryptionLostError extends Error {
+  constructor(groupId) {
+    super('E2EE keys lost for this thread. Reset encryption to continue.');
+    this.name = 'EncryptionLostError';
+    this.groupId = groupId;
+  }
+}
+
+export class ChatController {
   /**
    * @param {import('./mls/mls-service.js').MLSService} mlsService
    * @param {object} storage - storage implementation
@@ -81,13 +89,16 @@ export class ChatController {
         decryptedContent = lastMessage;
       }
 
+      const members = await this.getGroupMembers(g.groupId);
+
       return {
         id: g.groupId,
         name: g.name,
         apId: g.apId,
         lastMessage,
         groupState: g.groupState,
-        decryptedContent
+        decryptedContent,
+        members
       };
     }));
 
@@ -121,7 +132,16 @@ export class ChatController {
       }));
     console.log('[loadMessages] Mapped messages:', messages.map(m => ({ id: m.id, isLocal: m.isLocal, type: m.type, attributedTo: m.attributedTo })));
 
-    const members = await this.getGroupMembers(groupId);
+    let members = await this.getGroupMembers(groupId);
+
+    // Derive members from message attributions if metadata is empty
+    if (members.length === 0) {
+      const derived = uniqueActors(messages.map(m => m.attributedTo).filter(Boolean));
+      if (derived.length > 0) {
+        members = derived;
+        await this.persistMembers(groupId, derived);
+      }
+    }
 
     // Determine thread name
     let threadName = '';
@@ -237,7 +257,132 @@ export class ChatController {
     await this.storage.setGroupField(groupId, 'name', name);
   }
 
+  // ── System messages ───────────────────────────────────
+
+  async _insertSystemMessage(groupId, text) {
+    const id = `system-${Date.now()}`;
+    await this.storage.saveMessage(groupId, {
+      type: 'system',
+      content: text,
+    }, id, true);
+  }
+
+  /**
+   * Reset a group whose MLS state was lost.
+   * Re-creates the group and re-invites all previous members.
+   */
+  async resetGroup(groupId) {
+    const actor = await getCurrentActor();
+    const members = await this.getGroupMembers(groupId);
+    const otherMembers = members.filter(m => m !== actor.id);
+
+    // Delete old group state before re-creating
+    await this.mlsService.deleteGroup(actor.id, groupId);
+    await this.mlsService.createGroup(actor.id, groupId);
+
+    // Re-invite previous members
+    const apId = await this.storage.getGroupApId(groupId);
+    const contextId = apId || groupId;
+    const reinvited = [];
+
+    for (const recipient of otherMembers) {
+      try {
+        const kpBytes = await this.fetchLatestKeyPackage(recipient);
+        if (!kpBytes) continue;
+        const { welcome, ratchetTree } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
+        await sendMLSControl(actor, 'Welcome', bytesToBase64(welcome), [recipient], contextId);
+        await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTree), [recipient], contextId);
+        reinvited.push(recipient);
+      } catch (err) {
+        console.error('[resetGroup] Failed to re-invite', recipient, err);
+      }
+    }
+
+    const msg = reinvited.length === otherMembers.length
+      ? 'Encryption keys were reset. All members have been re-invited.'
+      : `Encryption keys were reset. Re-invited ${reinvited.length}/${otherMembers.length} members.`;
+    await this._insertSystemMessage(groupId, msg);
+  }
+
   // ── Sending ────────────────────────────────────────────
+
+  /**
+   * Send a message in an existing group.
+   *
+   * @param {string} groupId
+   * @param {object} msgObj - message content (type, content, summary, etc.)
+   * @param {object} [options]
+   * @param {string} [options.inReplyTo] - reply-to ID
+   * @returns {string|null} AP message ID
+   */
+  /**
+   * Encrypt, transmit, and persist an encrypted message.
+   * Handles pending/failed state for retry support.
+   *
+   * @param {string} groupId - MLS group ID
+   * @param {object} msgObj - message content
+   * @param {object} [options]
+   * @param {boolean} [options.isNewThread] - true for first message in thread
+   * @param {string} [options.inReplyTo] - reply-to ID
+   * @returns {string|null} AP message ID
+   */
+  async _transmitEncrypted(groupId, msgObj, { isNewThread = false, inReplyTo } = {}) {
+    const actor = await getCurrentActor();
+
+    // Encrypt
+    const ciphertext = await this.mlsService.encrypt(actor.id, groupId, msgObj);
+    const ciphertextB64 = bytesToBase64(new Uint8Array(ciphertext));
+
+    // Get recipients
+    const members = await this.getGroupMembers(groupId);
+    const recipients = members.length > 0 ? members : [actor.id];
+
+    // Look up AP ID for context
+    const apId = await this.storage.getGroupApId(groupId);
+    const contextId = apId || groupId;
+    console.log('[_transmitEncrypted] apId:', apId, 'contextId:', contextId, 'recipients:', recipients);
+
+    // Save as pending before transmitting so it's visible immediately
+    const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    await this.storage.saveMessage(groupId, { ...msgObj, status: 'sending' }, pendingId, true);
+
+    try {
+      // Transmit
+      const res = await sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, {
+        isNewThread,
+        inReplyTo: inReplyTo || contextId
+      });
+
+      // Extract AP ID from response
+      const messageApId = await this._resolveApId(res);
+      console.log('[_transmitEncrypted] messageApId:', messageApId);
+
+      // Replace pending message with the confirmed one
+      await this.storage.deleteMessage(pendingId);
+      if (messageApId) {
+        await this.storage.saveMessage(groupId, msgObj, messageApId, true);
+        console.log('[_transmitEncrypted] Saved local message:', messageApId, 'in group:', groupId);
+      }
+
+      // Store apId mapping if not yet set — use server-assigned context if available, else messageApId
+      if (!apId) {
+        const serverContext = res?.object?.context || res?.context;
+        const newApId = serverContext || messageApId;
+        if (newApId) {
+          await this.storage.setGroupField(groupId, 'apId', newApId);
+          console.log('[_transmitEncrypted] Stored apId mapping:', groupId, '→', newApId);
+        }
+      }
+
+      return messageApId;
+    } catch (e) {
+      // Update the pending message to failed state
+      const errStr = typeof e === 'string' ? e : (e.message || String(e));
+      console.error('[_transmitEncrypted] Failed to send, saving as failed:', errStr);
+      await this.storage.saveMessage(groupId, { ...msgObj, status: 'failed', error: errStr }, pendingId, true);
+      throw e;
+    }
+  }
 
   /**
    * Send a message in an existing group.
@@ -253,37 +398,33 @@ export class ChatController {
     console.log('[sendMessage] groupId:', groupId, 'msgObj:', msgObj, 'options:', options);
 
     // Ensure the group is loaded
-    await this.mlsService.getGroup(actor.id, groupId);
-
-    // Encrypt
-    const ciphertext = await this.mlsService.encrypt(actor.id, groupId, msgObj);
-    const ciphertextB64 = bytesToBase64(new Uint8Array(ciphertext));
-
-    // Get recipients
-    const members = await this.getGroupMembers(groupId);
-    const recipients = members.length > 0 ? members : [actor.id];
-
-    // Look up AP ID for context
-    const apId = await this.storage.getGroupApId(groupId);
-    const contextId = apId || groupId;
-    console.log('[sendMessage] apId:', apId, 'contextId:', contextId, 'recipients:', recipients);
-
-    // Transmit
-    const res = await sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, {
-      isNewThread: false,
-      inReplyTo: options.inReplyTo || contextId
-    });
-
-    // Extract AP ID from response
-    const messageApId = await this._resolveApId(res);
-    console.log('[sendMessage] messageApId:', messageApId);
-
-    if (messageApId) {
-      await this.storage.saveMessage(groupId, msgObj, messageApId, true);
-      console.log('[sendMessage] Saved local message:', messageApId, 'in group:', groupId);
+    const { found } = await this.mlsService.getGroup(actor.id, groupId);
+    if (!found) {
+      throw new EncryptionLostError(groupId);
     }
 
-    return messageApId;
+    return this._transmitEncrypted(groupId, msgObj, {
+      inReplyTo: options.inReplyTo
+    });
+  }
+
+  /**
+   * Retry sending a previously failed message.
+   * Removes the failed message and re-sends its content.
+   */
+  async retrySendMessage(messageId) {
+    const rec = await this.storage.getMessage(messageId);
+    if (!rec) throw new Error('Message not found');
+
+    const { groupId, content } = rec;
+    // Extract the original message content (strip status/error fields)
+    const { status, error, ...msgObj } = content;
+
+    // Delete the failed message
+    await this.storage.deleteMessage(messageId);
+
+    // Re-send
+    return this.sendMessage(groupId, msgObj);
   }
 
   /**
@@ -294,7 +435,7 @@ export class ChatController {
    * @param {string} groupId
    * @param {object} msgObj - message content
    * @param {string[]} recipientMentions - webfinger mentions or URIs
-   * @returns {string|null} AP message ID
+   * @returns {{messageApId: string|null, errors: string[]}}
    */
   async sendFirstMessage(groupId, msgObj, recipientMentions) {
     const actor = await getCurrentActor();
@@ -344,23 +485,8 @@ export class ChatController {
       await this.persistMembers(groupId, finalMembers);
     }
 
-    // Encrypt and send
-    const ciphertext = await this.mlsService.encrypt(actor.id, groupId, msgObj);
-    const ciphertextB64 = bytesToBase64(new Uint8Array(ciphertext));
-    const members = await this.getGroupMembers(groupId);
-    const recipients = members.length > 0 ? members : [actor.id];
-
-    const res = await sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, {
-      isNewThread: true,
-      inReplyTo: contextId
-    });
-
-    const messageApId = await this._resolveApId(res);
-
-    if (messageApId) {
-      await this.storage.saveMessage(groupId, msgObj, messageApId, true);
-      await this.storage.setGroupField(groupId, 'apId', messageApId);
-    }
+    // Encrypt and send (with pending/failed handling)
+    const messageApId = await this._transmitEncrypted(groupId, msgObj, { isNewThread: true });
 
     return { messageApId, errors };
   }
@@ -391,10 +517,16 @@ export class ChatController {
         }
 
         console.log('[pollInbox] Processing item:', itemId, 'type:', item.type || item.object?.type);
-        const result = await this.handleActivity(item);
-        if (result) {
+        try {
+          const result = await this.handleActivity(item);
+          if (result) {
+            await this.storage.markProcessed(actor.id, itemId);
+            results.push(result);
+          }
+        } catch (itemErr) {
+          console.error('[pollInbox] Failed to process item:', itemId, itemErr);
+          // Mark as processed to avoid retrying a permanently broken item
           await this.storage.markProcessed(actor.id, itemId);
-          results.push(result);
         }
       }
 
@@ -427,10 +559,40 @@ export class ChatController {
 
     const contextId = parsed.context;
 
-    // Resolve MLS group ID from AP context ID
+    // Resolve MLS group ID (ULID) from AP context URI
     let groupId = await this.storage.getGroupByField('apId', contextId);
-    console.log('[handleActivity] contextId:', contextId, '→ resolved groupId:', groupId || '(using contextId as groupId)');
+
+    // Fallback: look up via inReplyTo — the reply may reference a message we already stored
+    if (!groupId && parsed.inReplyTo) {
+      const parentMsg = await this.storage.getMessage(parsed.inReplyTo);
+      if (parentMsg) {
+        groupId = parentMsg.groupId;
+        // Store the mapping so future messages with this context resolve directly
+        await this.storage.setGroupField(groupId, 'apId', contextId);
+        console.log('[handleActivity] Resolved groupId via inReplyTo:', parsed.inReplyTo, '→', groupId);
+      }
+    }
+
+    // Fallback: for PrivateMessages, extract the MLS group_id from the ciphertext header
+    if (!groupId && parsed.type === 'PrivateMessage') {
+      try {
+        const ciphertextBytes = bytesFromInput(parsed.content);
+        const mlsGroupId = await this.mlsService.extractGroupId(ciphertextBytes);
+        if (mlsGroupId) {
+          groupId = mlsGroupId;
+          // Store the mapping so future messages resolve directly
+          await this.storage.setGroupField(groupId, 'apId', contextId);
+          console.log('[handleActivity] Resolved groupId from ciphertext MLS header:', mlsGroupId);
+        }
+      } catch (e) {
+        console.warn('[handleActivity] Could not extract group_id from ciphertext:', e);
+      }
+    }
+
+    // For Welcome/GroupInfo we may not know the ULID yet — use contextId as temporary key.
+    // _tryJoinGroup will migrate to the actual ULID after processing the Welcome.
     if (!groupId) groupId = contextId;
+    console.log('[handleActivity] contextId:', contextId, '→ resolved groupId:', groupId);
 
     if (parsed.type === 'Welcome') {
       return this._handleWelcome(groupId, parsed, actor);
@@ -446,47 +608,93 @@ export class ChatController {
   async _handleWelcome(groupId, parsed, actor) {
     const welcomeBytes = bytesFromInput(parsed.content);
     const state = (await this.storage.loadGroupMeta(groupId)) || {};
+
+    // If already joined, this Welcome is from a new sequence (reset/re-invite)
+    // — the old ratchetTree is stale and must not be paired with this Welcome
     const nextState = { ...state, welcome: Array.from(welcomeBytes) };
+    if (state.joined) {
+      delete nextState.ratchetTree;
+      nextState.joined = false;
+    }
     await this.storage.saveGroupMeta(groupId, nextState);
 
+    let finalGroupId = groupId;
     if (nextState.ratchetTree) {
-      try {
-        const ratchetTreeBytes = Uint8Array.from(nextState.ratchetTree);
-        await this.mlsService.joinFromWelcome(actor.id, groupId, welcomeBytes, ratchetTreeBytes);
-        const membersToAdd = [actor.id];
-        if (parsed.attributedTo) membersToAdd.push(parsed.attributedTo);
-        await this.persistMembers(groupId, membersToAdd);
-        // Key package was consumed by joining — replenish
-        await this._replenishKeyPackage(actor);
-      } catch (e) {
-        console.error('[Handler] Failed to join from Welcome:', e);
-      }
+      finalGroupId = await this._tryJoinGroup(actor, groupId, welcomeBytes, Uint8Array.from(nextState.ratchetTree), parsed);
     }
 
-    return { type: 'welcome', groupId };
+    return { type: 'welcome', groupId: finalGroupId };
   }
 
   async _handleGroupInfo(groupId, parsed, actor) {
     const ratchetTreeBytes = bytesFromInput(parsed.content);
     const state = (await this.storage.loadGroupMeta(groupId)) || {};
+
+    // If already joined, this GroupInfo is from a new sequence (reset/re-invite)
+    // — the old welcome is stale and must not be paired with this GroupInfo
     const nextState = { ...state, ratchetTree: Array.from(ratchetTreeBytes) };
+    if (state.joined) {
+      delete nextState.welcome;
+      nextState.joined = false;
+    }
     await this.storage.saveGroupMeta(groupId, nextState);
 
+    let finalGroupId = groupId;
     if (nextState.welcome) {
-      try {
-        const welcomeBytes = Uint8Array.from(nextState.welcome);
-        await this.mlsService.joinFromWelcome(actor.id, groupId, welcomeBytes, ratchetTreeBytes);
-        const membersToAdd = [actor.id];
-        if (parsed.attributedTo) membersToAdd.push(parsed.attributedTo);
-        await this.persistMembers(groupId, membersToAdd);
-        // Key package was consumed by joining — replenish
-        await this._replenishKeyPackage(actor);
-      } catch (e) {
-        console.error('[Handler] Failed to join from GroupInfo:', e);
-      }
+      finalGroupId = await this._tryJoinGroup(actor, groupId, Uint8Array.from(nextState.welcome), ratchetTreeBytes, parsed);
     }
 
-    return { type: 'groupinfo', groupId };
+    return { type: 'groupinfo', groupId: finalGroupId };
+  }
+
+  /**
+   * Join a group from Welcome + RatchetTree.
+   * Always deletes any existing group first — Rust join_group silently
+   * no-ops if the group is already in memory, which would leave stale keys.
+   *
+   * Returns the canonical group ID (the sender's ULID from the Welcome).
+   * If the passed groupId was a temporary URI, migrates metadata to the ULID
+   * and stores the URI→ULID mapping.
+   */
+  async _tryJoinGroup(actor, groupId, welcomeBytes, ratchetTreeBytes, parsed) {
+    // Delete existing group so the new Welcome is actually processed
+    const { found } = await this.mlsService.getGroup(actor.id, groupId);
+    const wasReset = found;
+    if (found) {
+      await this.mlsService.deleteGroup(actor.id, groupId);
+    }
+
+    // joinFromWelcome returns the actual MLS group_id (sender's ULID)
+    const actualGroupId = await this.mlsService.joinFromWelcome(actor.id, groupId, welcomeBytes, ratchetTreeBytes);
+
+    // If the MLS group_id differs from the passed ID, migrate metadata
+    if (actualGroupId !== groupId) {
+      console.log('[_tryJoinGroup] Migrating group:', groupId, '→', actualGroupId);
+      const oldMeta = (await this.storage.loadGroupMeta(groupId)) || {};
+      const { welcome, ratchetTree, ...rest } = oldMeta;
+      await this.storage.saveGroupMeta(actualGroupId, { ...rest, joined: true });
+      // Store URI→ULID mapping so future activities resolve correctly
+      await this.storage.setGroupField(actualGroupId, 'apId', groupId);
+      // Clean up temporary group record
+      await this.storage.deleteGroupMeta(groupId);
+    } else {
+      // Same ID — just mark as joined and clear consumed join tokens
+      const meta = (await this.storage.loadGroupMeta(groupId)) || {};
+      const { welcome, ratchetTree, ...rest } = meta;
+      await this.storage.saveGroupMeta(groupId, { ...rest, joined: true });
+    }
+
+    const membersToAdd = [actor.id];
+    if (parsed.attributedTo) membersToAdd.push(parsed.attributedTo);
+    await this.persistMembers(actualGroupId, membersToAdd);
+    await this._replenishKeyPackage(actor);
+
+    if (wasReset) {
+      const inviter = parsed.attributedTo || 'Someone';
+      await this._insertSystemMessage(actualGroupId, `Encryption was reset by ${inviter}. You have been re-invited to the group.`);
+    }
+
+    return actualGroupId;
   }
 
   async _handlePrivateMessage(groupId, parsed, actor) {
@@ -503,7 +711,10 @@ export class ChatController {
 
     try {
       // Ensure group is loaded
-      await this.mlsService.getGroup(actor.id, groupId);
+      const { found } = await this.mlsService.getGroup(actor.id, groupId);
+      if (!found) {
+        throw new EncryptionLostError(groupId);
+      }
 
       // Decrypt
       const ciphertext = bytesFromInput(parsed.content);
@@ -518,11 +729,11 @@ export class ChatController {
       await this.storage.saveMessage(groupId, decryptedContent, messageId, false);
       console.log('[_handlePrivateMessage] Saved message:', messageId, 'in group:', groupId);
 
-      // Store apId mapping so future messages with this AP URI context resolve to this group
+      // Store apId mapping if not yet set (context URI → ULID)
       const existingApId = await this.storage.getGroupApId(groupId);
-      if (!existingApId && messageId) {
-        await this.storage.setGroupField(groupId, 'apId', messageId);
-        console.log('[_handlePrivateMessage] Set apId mapping:', groupId, '→', messageId);
+      if (!existingApId && parsed.context) {
+        await this.storage.setGroupField(groupId, 'apId', parsed.context);
+        console.log('[_handlePrivateMessage] Set apId mapping:', groupId, '→', parsed.context);
       }
 
       // Save group name from message if present
@@ -546,14 +757,19 @@ export class ChatController {
       }
     } catch (e) {
       console.error('[Handler] Failed to decrypt message:', e);
+      const errStr = typeof e === 'string' ? e : (e.message || String(e));
+      const isAeadError = errStr.includes('AeadError') || errStr.includes('UnableToDecrypt');
+      const errorText = isAeadError
+        ? 'Message encrypted with old/invalid keys'
+        : 'Failed to decrypt: ' + errStr;
       await this.storage.saveMessage(groupId, {
-        error: 'Failed to decrypt: ' + e.message,
+        error: errorText,
         encryptedContent: parsed.content,
         attributedTo: parsed.attributedTo
       }, messageId, false);
     }
 
-    return { type: 'message', groupId };
+    return { type: 'message', groupId, messageId, from: parsed.attributedTo };
   }
 
   // ── Key packages ───────────────────────────────────────

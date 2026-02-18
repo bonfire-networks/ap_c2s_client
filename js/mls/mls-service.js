@@ -51,6 +51,20 @@ export class MLSService {
   // ── Groups ─────────────────────────────────────────────
 
   /**
+   * Delete an MLS group from the backend (cache + storage).
+   * Does not touch IndexedDB metadata — caller manages that.
+   *
+   * @param {string} userId - actor ID
+   * @param {string} groupId - group identifier
+   */
+  async deleteGroup(userId, groupId) {
+    if (this.backend.deleteGroup) {
+      await this.backend.deleteGroup(userId, groupId);
+      await this.persistBackendState(userId);
+    }
+  }
+
+  /**
    * Create a new MLS group.
    * Saves group metadata and persists backend state.
    *
@@ -74,22 +88,19 @@ export class MLSService {
 
   /**
    * Get (load) an existing group. Tries backend internal state first.
-   * Returns true if available, false if not found.
    *
    * @param {string} userId - actor ID
    * @param {string} groupId - group identifier
-   * @returns {boolean}
+   * @returns {{ found: boolean, members: string[] }}
+   *   found=false means MLS state is lost; caller should offer resetGroup.
    */
   async getGroup(userId, groupId) {
     const loaded = await this.backend.loadGroup(userId, groupId);
-    if (loaded) return true;
+    if (loaded) return { found: true, members: [] };
 
-    // Check storage for context about why it wasn't found
     const state = await this.storage.loadGroupMeta(groupId);
-    if (state && state.welcome && state.ratchetTree) {
-      throw new Error(`Group ${groupId} not joined yet — waiting for Welcome and GroupInfo`);
-    }
-    throw new Error(`Group ${groupId} not found — you may need to be invited first`);
+    const members = state?.members || [];
+    return { found: false, members };
   }
 
   /**
@@ -101,20 +112,12 @@ export class MLSService {
    * @param {Uint8Array} ratchetTreeBytes - RatchetTree bytes
    * @param {object} [metadata] - additional metadata to save (members, etc.)
    */
-  async joinFromWelcome(userId, groupId, welcomeBytes, ratchetTreeBytes, metadata = {}) {
-    await this.backend.joinGroup(userId, groupId, welcomeBytes, ratchetTreeBytes);
-
-    // Save group metadata
-    const existingState = (await this.storage.loadGroupMeta(groupId)) || {};
-    await this.storage.saveGroupMeta(groupId, {
-      ...existingState,
-      ...metadata,
-      welcome: Array.from(welcomeBytes),
-      ratchetTree: Array.from(ratchetTreeBytes),
-      joined: true
-    });
-
+  async joinFromWelcome(userId, groupId, welcomeBytes, ratchetTreeBytes) {
+    // Backend returns the actual MLS group_id (sender's ULID) from the Welcome
+    const actualGroupId = await this.backend.joinGroup(userId, groupId, welcomeBytes, ratchetTreeBytes);
     await this.persistBackendState(userId);
+    // Return the canonical group ID — caller manages metadata migration
+    return actualGroupId || groupId;
   }
 
   /**
@@ -230,6 +233,22 @@ export class MLSService {
    */
   async clearKeyPackage(userId) {
     await this.storage.clearUserKeyData(userId);
+  }
+
+  // ── Group ID extraction ──────────────────────────────────
+
+  /**
+   * Extract the MLS group_id from a ciphertext blob without decrypting.
+   * Returns null for Welcome messages (group_id is encrypted inside).
+   *
+   * @param {Uint8Array} messageBytes - MLS ciphertext
+   * @returns {string|null} group_id string, or null
+   */
+  async extractGroupId(messageBytes) {
+    if (this.backend.extractGroupId) {
+      return this.backend.extractGroupId(messageBytes);
+    }
+    return null;
   }
 
   // ── Internal helpers ───────────────────────────────────

@@ -180,13 +180,24 @@ export async function joinGroup(userId, groupId, welcomeBytes, ratchetTreeBytes)
 
   if (groupCache.has(groupId)) {
     console.log('[OpenMLS Backend] Group already joined:', groupId);
-    return;
+    return groupId;
   }
 
   const ratchetTree = wasm.RatchetTree.from_bytes(ratchetTreeBytes);
   const group = wasm.Group.join(provider, welcomeBytes, ratchetTree);
-  groupCache.set(groupId, group);
-  console.log('[OpenMLS Backend] Joined group:', groupId);
+
+  // Extract actual MLS group_id (sender's ULID) from the joined group
+  let actualGroupId = groupId;
+  if (group.group_id) {
+    try {
+      const gidBytes = group.group_id();
+      actualGroupId = new TextDecoder().decode(gidBytes);
+    } catch { /* fall back to passed groupId */ }
+  }
+
+  groupCache.set(actualGroupId, group);
+  console.log('[OpenMLS Backend] Joined group:', actualGroupId, '(passed:', groupId, ')');
+  return actualGroupId;
 }
 
 export async function encrypt(userId, groupId, plaintext) {
