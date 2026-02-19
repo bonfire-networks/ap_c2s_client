@@ -15,6 +15,11 @@ import { getCurrentActor, getActor, getActorId, apFetch } from './activitypub/au
 import { postToOutbox, fetchActorKeyPackage, resolveActorId, extractApIdFromResponse } from './activitypub/client.js';
 import { sendEncryptedMessage, sendMLSControl, publishKeyPackage, fetchKeyPackage, parseMLSActivity } from './activitypub/mls-transport.js';
 
+/** Check if a value looks like an AP URI (not a local ULID or null). */
+function isApUri(value) {
+  return typeof value === 'string' && (value.startsWith('http://') || value.startsWith('https://'));
+}
+
 export class EncryptionLostError extends Error {
   constructor(groupId) {
     super('E2EE keys lost for this thread. Reset encryption to continue.');
@@ -280,9 +285,8 @@ export class ChatController {
     await this.mlsService.deleteGroup(actor.id, groupId);
     await this.mlsService.createGroup(actor.id, groupId);
 
-    // Re-invite previous members
+    // Re-invite previous members — use AP ID if available, never local ULID
     const apId = await this.storage.getGroupApId(groupId);
-    const contextId = apId || groupId;
     const reinvited = [];
 
     for (const recipient of otherMembers) {
@@ -290,8 +294,8 @@ export class ChatController {
         const kpBytes = await this.fetchLatestKeyPackage(recipient);
         if (!kpBytes) continue;
         const { welcome, ratchetTree } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
-        await sendMLSControl(actor, 'Welcome', bytesToBase64(welcome), [recipient], contextId);
-        await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTree), [recipient], contextId);
+        await sendMLSControl(actor, 'Welcome', bytesToBase64(welcome), [recipient], apId || null);
+        await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTree), [recipient], apId || null);
         reinvited.push(recipient);
       } catch (err) {
         console.error('[resetGroup] Failed to re-invite', recipient, err);
@@ -337,20 +341,19 @@ export class ChatController {
     const members = await this.getGroupMembers(groupId);
     const recipients = members.length > 0 ? members : [actor.id];
 
-    // Look up AP ID for context
+    // Look up AP ID for context — never fall back to local ULID
     const apId = await this.storage.getGroupApId(groupId);
-    const contextId = apId || groupId;
-    console.log('[_transmitEncrypted] apId:', apId, 'contextId:', contextId, 'recipients:', recipients);
+    console.log('[_transmitEncrypted] apId:', apId, 'groupId:', groupId, 'recipients:', recipients);
 
     // Save as pending before transmitting so it's visible immediately
     const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     await this.storage.saveMessage(groupId, { ...msgObj, status: 'sending' }, pendingId, true);
 
     try {
-      // Transmit
-      const res = await sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, {
+      // Transmit — pass null context/inReplyTo for new threads (server assigns them)
+      const res = await sendEncryptedMessage(actor, ciphertextB64, recipients, apId || null, {
         isNewThread,
-        inReplyTo: inReplyTo || contextId
+        inReplyTo: inReplyTo || apId || null
       });
 
       // Extract AP ID from response
@@ -458,8 +461,8 @@ export class ChatController {
     // Invite each recipient
     const successfulInvites = [];
     const errors = [];
+    // Look up AP ID — never fall back to local ULID for AP fields
     const apId = await this.storage.getGroupApId(groupId);
-    const contextId = apId || groupId;
 
     for (const recipient of toUris) {
       try {
@@ -470,8 +473,8 @@ export class ChatController {
         }
 
         const { welcome, ratchetTree } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
-        await sendMLSControl(actor, 'Welcome', bytesToBase64(welcome), [recipient], contextId);
-        await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTree), [recipient], contextId);
+        await sendMLSControl(actor, 'Welcome', bytesToBase64(welcome), [recipient], apId || null);
+        await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTree), [recipient], apId || null);
         successfulInvites.push(recipient);
       } catch (err) {
         console.error('Failed to invite', recipient, err);
@@ -568,7 +571,9 @@ export class ChatController {
       if (parentMsg) {
         groupId = parentMsg.groupId;
         // Store the mapping so future messages with this context resolve directly
-        await this.storage.setGroupField(groupId, 'apId', contextId);
+        if (isApUri(contextId)) {
+          await this.storage.setGroupField(groupId, 'apId', contextId);
+        }
         console.log('[handleActivity] Resolved groupId via inReplyTo:', parsed.inReplyTo, '→', groupId);
       }
     }
@@ -581,7 +586,9 @@ export class ChatController {
         if (mlsGroupId) {
           groupId = mlsGroupId;
           // Store the mapping so future messages resolve directly
-          await this.storage.setGroupField(groupId, 'apId', contextId);
+          if (isApUri(contextId)) {
+            await this.storage.setGroupField(groupId, 'apId', contextId);
+          }
           console.log('[handleActivity] Resolved groupId from ciphertext MLS header:', mlsGroupId);
         }
       } catch (e) {
@@ -673,8 +680,10 @@ export class ChatController {
       const oldMeta = (await this.storage.loadGroupMeta(groupId)) || {};
       const { welcome, ratchetTree, ...rest } = oldMeta;
       await this.storage.saveGroupMeta(actualGroupId, { ...rest, joined: true });
-      // Store URI→ULID mapping so future activities resolve correctly
-      await this.storage.setGroupField(actualGroupId, 'apId', groupId);
+      // Store URI→ULID mapping so future activities resolve correctly (only if it's actually a URI)
+      if (isApUri(groupId)) {
+        await this.storage.setGroupField(actualGroupId, 'apId', groupId);
+      }
       // Clean up temporary group record
       await this.storage.deleteGroupMeta(groupId);
     } else {
@@ -731,7 +740,7 @@ export class ChatController {
 
       // Store apId mapping if not yet set (context URI → ULID)
       const existingApId = await this.storage.getGroupApId(groupId);
-      if (!existingApId && parsed.context) {
+      if (!existingApId && isApUri(parsed.context)) {
         await this.storage.setGroupField(groupId, 'apId', parsed.context);
         console.log('[_handlePrivateMessage] Set apId mapping:', groupId, '→', parsed.context);
       }

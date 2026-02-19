@@ -49,9 +49,11 @@ export async function sendEncryptedMessage(actor, ciphertextB64, recipients, con
     mediaType: 'message/mls',
     encoding: 'base64',
     content: ciphertextB64,
-    context: contextId,
-    inReplyTo: inReplyTo || contextId
   };
+  // Only include context/inReplyTo when they're actual AP URIs (not local ULIDs)
+  if (contextId) message.context = contextId;
+  if (inReplyTo) message.inReplyTo = inReplyTo;
+  else if (contextId) message.inReplyTo = contextId;
 
   const res = await postToOutbox(actor, message);
   if (res && (res.ok === false || res.status >= 400)) {
@@ -174,8 +176,7 @@ export function parseMLSActivity(activity) {
     return null;
   }
 
-  const contextId = obj.context || activity.context;
-  if (!contextId) return null;
+  const contextId = obj.context || activity.context || null;
 
   let type;
   if (types.includes('Welcome')) type = 'Welcome';
