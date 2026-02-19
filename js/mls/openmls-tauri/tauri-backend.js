@@ -102,6 +102,16 @@ export async function createKeyPackage(userId) {
   return { keyPackageBytes: base64ToUint8(result.keyPackageBytes) };
 }
 
+// ── Fingerprints ────────────────────────────────────────────────────
+
+/**
+ * Get emoji fingerprints for all members in a group.
+ * Returns [{identity, fingerprint: [{emoji, description}], isOwn}]
+ */
+export async function getGroupFingerprints(userId, groupId) {
+  return await invoke('plugin:openmls|get_group_fingerprints', { userId, groupId });
+}
+
 // ── Group ID extraction ─────────────────────────────────────────────
 
 /**

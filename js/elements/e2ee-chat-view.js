@@ -142,6 +142,7 @@ export class E2EEChatView extends LitElement {
     this.groupEncryptionLost = false
 
     this._collapsedThreads = new Set();
+    this._fingerprintCache = {}; // groupId -> {actorId -> emoji string}
 
     // Colors for thread lines at each depth, cycling
     this._threadColors = [
@@ -492,6 +493,47 @@ export class E2EEChatView extends LitElement {
     return this.controller.getActorNickname(actorId);
   }
 
+  async _loadFingerprints(el) {
+    const gid = this.selectedGroupId;
+    if (!gid) return;
+    // If already cached, just patch the hovered element
+    if (this._fingerprintCache[gid]) {
+      const fp = this._fingerprintCache[gid][el?.dataset?.actorId];
+      if (fp && el) { el.dataset.tip = fp; el.classList.add('tooltip', 'tooltip-right', 'tooltip-info'); }
+      return;
+    }
+    this._fingerprintCache[gid] = {}; // mark loading to prevent duplicate calls
+    try {
+      const backend = this.controller.mlsService?.backend;
+      if (!backend?.getGroupFingerprints) return;
+      const results = await backend.getGroupFingerprints(this.currentActorId, gid);
+      const map = {};
+      for (const r of results) {
+        map[r.identity] = r.fingerprint.map(e => e.emoji).join(' ');
+      }
+      this._fingerprintCache[gid] = map;
+      // Only patch the hovered element — not all elements
+      if (el) {
+        const fp = map[el.dataset?.actorId];
+        if (fp) { el.dataset.tip = fp; el.classList.add('tooltip', 'tooltip-right', 'tooltip-accent'); }
+      }
+    } catch (e) {
+      console.warn('[Fingerprint] Failed to load:', e);
+      delete this._fingerprintCache[gid]; // allow retry
+    }
+  }
+
+  /** Render a username badge with emoji fingerprint tooltip on hover. */
+  _renderUsername(actorId, { classes = '', style = '' } = {}) {
+    const name = actorId ? this.getActorNickname(actorId) : 'Unknown';
+    return html`<span
+      class="badge badge-sm ${classes}"
+      style="${style}"
+      data-actor-id="${actorId || ''}"
+      @mouseenter=${(e) => this._loadFingerprints(e.currentTarget)}
+    >${name}</span>`;
+  }
+
   decryptedSummary(msg) {
     return typeof msg === 'string' ? msg : msg && (msg.summary || msg.content);
   }
@@ -581,10 +623,9 @@ export class E2EEChatView extends LitElement {
     }
 
     if (msg && msg.error) {
-      const actorNickname = msg.attributedTo ? this.getActorNickname(msg.attributedTo) : 'Unknown';
       return html`
         <div class="text-xs my-1 py-1 px-2 opacity-60 italic">
-          <span class="font-semibold">${actorNickname}:</span> ${msg.error}
+          ${this._renderUsername(msg.attributedTo, { classes: 'font-semibold' })}: ${msg.error}
         </div>
       `;
     }
@@ -592,7 +633,6 @@ export class E2EEChatView extends LitElement {
     const hasSummary = msg && msg.summary;
     const msgIndex = this.messages.findIndex(m => m.id === msg.id);
     const showContent = this[`showContent${msgIndex}`] || false;
-    const actorNickname = msg.attributedTo ? this.getActorNickname(msg.attributedTo) : 'Unknown';
     const isCollapsed = this._collapsedThreads.has(msg.id);
     const hasReplies = msg.replies && msg.replies.length > 0;
     const color = this._actorColor(msg.attributedTo);
@@ -600,11 +640,7 @@ export class E2EEChatView extends LitElement {
     return html`
       <div id="msg-${msg.id}" class="thread-node" style="background: color-mix(in oklch, ${color} 10%, oklch(var(--b1))); border-radius: 0.375rem; padding: 0.125rem 0.375rem; margin: 0.0625rem 0;">
         <div class="msg-header">
-          <span class="msg-author badge badge-sm"
-                style="background: ${color}; color: oklch(var(--b1));"
-                @click=${() => this.scrollToMessage(msg.id)}>
-            ${actorNickname}
-          </span>
+          ${this._renderUsername(msg.attributedTo, { classes: 'msg-author', style: `background: ${color}; color: oklch(var(--b1));` })}
           ${isCollapsed ? html`
             <span class="thread-collapsed-indicator" @click=${() => this._toggleCollapse(msg.id)}>
               [+${this._countDescendants(msg)} collapsed]
@@ -647,7 +683,7 @@ export class E2EEChatView extends LitElement {
 
       <div class="dropdown dropdown-end">
         <label tabindex="0" class="btn btn-ghost btn-sm">
-          ${this.currentActorId ? this.getActorNickname(this.currentActorId) : 'User'} ▾
+          ${this.currentActorId ? this._renderUsername(this.currentActorId) : 'User'} ▾
         </label>
         <ul tabindex="0" class="dropdown-content menu menu-sm bg-base-200 rounded-box shadow-lg w-52 z-20">
           <li><theme-picker></theme-picker></li>
@@ -704,9 +740,7 @@ export class E2EEChatView extends LitElement {
                   <p class="text-sm opacity-80">The local encryption state is no longer available. Reset encryption to re-create the group and re-invite members.</p>
                   
                   <div class="flex flex-wrap gap-1"> <span class="text-xs opacity-80">Will re-invite:</span> 
-                    ${reinviteMembers.map(actorId => html`
-                      <span class="badge badge-sm badge-warning badge-outline">${this.getActorNickname(actorId)}</span>
-                    `)}
+                    ${reinviteMembers.map(actorId => this._renderUsername(actorId, { classes: 'badge-warning badge-outline' }))}
                   </div>
                   <div class="card-actions">
                     <button class="btn btn-warning btn-sm" @click=${() => this.handleResetEncryption()} ?disabled=${this.loading}>
@@ -731,9 +765,7 @@ export class E2EEChatView extends LitElement {
                     </div>
                     ${displayMembers.length > 0 ? html`
                       <div class="flex flex-wrap gap-1 ${this.replyToId ? 'mb-2' : ''}">
-                        ${displayMembers.map(actorId => html`
-                          <span class="badge badge-sm">${actorId ? this.getActorNickname(actorId) : 'Unknown'}</span>
-                        `)}
+                        ${displayMembers.map(actorId => this._renderUsername(actorId))}
                       </div>
                     ` : ''}
                     ${this.replyToId ? html`
