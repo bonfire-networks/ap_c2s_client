@@ -285,8 +285,8 @@ export class ChatController {
     await this.mlsService.deleteGroup(actor.id, groupId);
     await this.mlsService.createGroup(actor.id, groupId);
 
-    // Re-invite previous members — use AP ID if available, never local ULID
-    const apId = await this.storage.getGroupApId(groupId);
+    // Re-invite previous members — use AP ID if available
+    let apId = await this.storage.getGroupApId(groupId);
     const reinvited = [];
 
     for (const recipient of otherMembers) {
@@ -294,8 +294,7 @@ export class ChatController {
         const kpBytes = await this.fetchLatestKeyPackage(recipient);
         if (!kpBytes) continue;
         const { welcome, ratchetTree } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
-        await sendMLSControl(actor, 'Welcome', bytesToBase64(welcome), [recipient], apId || null);
-        await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTree), [recipient], apId || null);
+        apId = await this._sendInvite(actor, groupId, recipient, welcome, ratchetTree, apId);
         reinvited.push(recipient);
       } catch (err) {
         console.error('[resetGroup] Failed to re-invite', recipient, err);
@@ -306,6 +305,24 @@ export class ChatController {
       ? 'Encryption keys were reset. All members have been re-invited.'
       : `Encryption keys were reset. Re-invited ${reinvited.length}/${otherMembers.length} members.`;
     await this._insertSystemMessage(groupId, msg);
+  }
+
+  /**
+   * Send Welcome + GroupInfo to a recipient, chaining the server-assigned AP ID
+   * from the Welcome as context for the GroupInfo.
+   * Returns the (possibly updated) apId.
+   */
+  async _sendInvite(actor, groupId, recipient, welcomeBytes, ratchetTreeBytes, apId) {
+    const welcomeRes = await sendMLSControl(actor, 'Welcome', bytesToBase64(welcomeBytes), [recipient], apId || null);
+    if (!apId) {
+      apId = await this._resolveApId(welcomeRes);
+      if (apId) {
+        await this.storage.setGroupField(groupId, 'apId', apId);
+        console.log('[_sendInvite] Stored group AP ID from Welcome:', apId);
+      }
+    }
+    await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTreeBytes), [recipient], apId || null);
+    return apId;
   }
 
   // ── Sending ────────────────────────────────────────────
@@ -461,8 +478,8 @@ export class ChatController {
     // Invite each recipient
     const successfulInvites = [];
     const errors = [];
-    // Look up AP ID — never fall back to local ULID for AP fields
-    const apId = await this.storage.getGroupApId(groupId);
+    // Look up or derive AP ID so Welcome, GroupInfo, and PrivateMessage share the same context
+    let apId = await this.storage.getGroupApId(groupId);
 
     for (const recipient of toUris) {
       try {
@@ -473,8 +490,7 @@ export class ChatController {
         }
 
         const { welcome, ratchetTree } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
-        await sendMLSControl(actor, 'Welcome', bytesToBase64(welcome), [recipient], apId || null);
-        await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTree), [recipient], apId || null);
+        apId = await this._sendInvite(actor, groupId, recipient, welcome, ratchetTree, apId);
         successfulInvites.push(recipient);
       } catch (err) {
         console.error('Failed to invite', recipient, err);

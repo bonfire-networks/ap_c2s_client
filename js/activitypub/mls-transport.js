@@ -70,6 +70,7 @@ export async function sendEncryptedMessage(actor, ciphertextB64, recipients, con
  * @param {string} contentB64 - base64-encoded content
  * @param {string[]} recipients - recipient actor URIs
  * @param {string} contextId - AP thread/group context ID
+ * @returns {object} response from outbox
  */
 export async function sendMLSControl(actor, type, contentB64, recipients, contextId) {
   const controlObj = {
@@ -89,6 +90,7 @@ export async function sendMLSControl(actor, type, contentB64, recipients, contex
     throw new Error(`Failed to send MLS ${type}: ` + (res.status || 'unknown status'));
   }
   console.log(`MLS ${type} sent to`, recipients);
+  return res;
 }
 
 /**
