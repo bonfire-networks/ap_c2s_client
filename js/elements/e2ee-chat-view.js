@@ -189,6 +189,46 @@ export class E2EEChatView extends LitElement {
       await this.loadGroups();
       this.pollInbox();
 
+      // Deep-link navigation: Rust calls this via eval() when a deep link targets the chat tab
+      // mls://g/{ulid} or mls://m/{ulid} = internal IDs (direct IndexedDB lookup)
+      // ap-mls://{instance.tld}/path = shareable links (convert to https:// apId for lookup)
+      window.navigateToGroup = async (groupId, rawUrl) => {
+        // ap-mls://instance/path → https://instance/path for apId lookup
+        const toApId = (u) => {
+          if (!u || !u.startsWith('ap-mls://')) return null;
+          return 'https://' + u.slice('ap-mls://'.length);
+        };
+        let resolved = groupId;
+        let scrollToMsgId = null;
+
+        const apId = toApId(rawUrl) || toApId(groupId);
+        if (apId) {
+          // Shareable link — resolve via apId
+          const groupMatch = await this.controller.storage.getGroupByField('apId', apId);
+          if (groupMatch) {
+            resolved = groupMatch;
+          } else {
+            const msg = await this.controller.storage.getMessageByApId(apId);
+            if (msg) {
+              resolved = msg.groupId;
+              scrollToMsgId = msg.id;
+            }
+          }
+        } else if (rawUrl && rawUrl.startsWith('mls://m/')) {
+          // Internal message ID — find its group
+          const msg = await this.controller.storage.getMessage(rawUrl);
+          if (msg) {
+            resolved = msg.groupId;
+            scrollToMsgId = msg.id;
+          }
+        }
+        // mls://g/{ulid} falls through as-is (resolved = groupId = the mls:// URI)
+
+        await this.loadGroups();
+        await this.loadMessages(resolved);
+        if (scrollToMsgId) this.scrollToMessage(scrollToMsgId);
+      };
+
       // Listen for SSE push via Tauri — debounce, poll once, notify grouped by sender
       if (window.__TAURI__?.event) {
         const invoke = window.__TAURI__.core?.invoke;
@@ -223,6 +263,7 @@ export class E2EEChatView extends LitElement {
 
   disconnectedCallback() {
     super.disconnectedCallback();
+    delete window.navigateToGroup;
     if (this._unlistenNewMessage) {
       this._unlistenNewMessage();
     }

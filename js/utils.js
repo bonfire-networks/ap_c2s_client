@@ -103,3 +103,10 @@ export function base64ToUint8(b64) {
   }
   return bytes;
 }
+
+// ── MLS URI helpers ──────────────────────────────────
+// Internal IDs:  mls://g/{ulid}  mls://m/{ulid}
+// Shareable:     ap-mls://{instance}/path  (maps to https:// apId)
+
+export function groupUri(id = ulid())   { return `mls://g/${id}`; }
+export function messageUri(id = ulid()) { return `mls://m/${id}`; }

@@ -4,6 +4,7 @@
  */
 
 import { Dexie } from '../node_modules/dexie/dist/modern/dexie.mjs';
+import { messageUri } from '../utils.js';
 
 const DB_NAME = 'openmls-db';
 
@@ -24,6 +25,12 @@ db.version(3).stores({
   groups: 'id, apId',
   users: 'id',
   messages: 'id, groupId, timestamp, isLocal',
+  processedActivityIds: '++id, [actorId+activityId]'
+});
+db.version(4).stores({
+  groups: 'id, apId',
+  users: 'id',
+  messages: 'id, groupId, timestamp, isLocal, apId',
   processedActivityIds: '++id, [actorId+activityId]'
 });
 
@@ -95,16 +102,22 @@ export async function listGroupsWithLastMessage() {
 // Messages
 // ──────────────────────────────────────────────
 
-export async function saveMessage(groupId, content, id = undefined, isLocal = false) {
-  const messageId = id || (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+export async function saveMessage(groupId, content, id = undefined, isLocal = false, apId = undefined) {
+  const messageId = id || messageUri();
   const timestamp = (content && content.timestamp) || Date.now();
   const rec = { id: messageId, groupId, isLocal, content, timestamp };
+  if (apId) rec.apId = apId;
   await db.table('messages').put(rec);
   return messageId;
 }
 
 export async function getMessage(id) {
   const rec = await db.table('messages').get(id);
+  return rec || null;
+}
+
+export async function getMessageByApId(apId) {
+  const rec = await db.table('messages').where('apId').equals(apId).first();
   return rec || null;
 }
 

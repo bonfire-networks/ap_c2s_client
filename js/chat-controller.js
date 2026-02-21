@@ -10,7 +10,7 @@
  * Dependencies are injected via constructor.
  */
 
-import { ulid, bytesToBase64, bytesToHex, bytesFromInput } from './utils.js';
+import { bytesToBase64, bytesFromInput, groupUri, messageUri } from './utils.js';
 import { getCurrentActor, getActor, getActorId, apFetch } from './activitypub/auth.js';
 import { postToOutbox, fetchActorKeyPackage, resolveActorId, extractApIdFromResponse } from './activitypub/client.js';
 import { sendEncryptedMessage, sendMLSControl, publishKeyPackage, fetchKeyPackage, parseMLSActivity } from './activitypub/mls-transport.js';
@@ -63,7 +63,7 @@ export class ChatController {
    * Returns the groupId.
    */
   async createGroup() {
-    const newGroupId = ulid();
+    const newGroupId = groupUri();
     const actor = await getCurrentActor();
     await this.mlsService.createGroup(actor.id, newGroupId);
     return newGroupId;
@@ -350,8 +350,12 @@ export class ChatController {
   async _transmitEncrypted(groupId, msgObj, { isNewThread = false, inReplyTo } = {}) {
     const actor = await getCurrentActor();
 
-    // Encrypt
-    const ciphertext = await this.mlsService.encrypt(actor.id, groupId, msgObj);
+    // Generate client-side message ID and embed in content before encryption
+    const msgId = messageUri();
+    const contentWithId = { ...msgObj, id: msgId };
+
+    // Encrypt (inner AS object now carries its own ap-mls:// id)
+    const ciphertext = await this.mlsService.encrypt(actor.id, groupId, contentWithId);
     const ciphertextB64 = bytesToBase64(new Uint8Array(ciphertext));
 
     // Get recipients
@@ -360,11 +364,10 @@ export class ChatController {
 
     // Look up AP ID for context — never fall back to local ULID
     const apId = await this.storage.getGroupApId(groupId);
-    console.log('[_transmitEncrypted] apId:', apId, 'groupId:', groupId, 'recipients:', recipients);
+    console.log('[_transmitEncrypted] apId:', apId, 'groupId:', groupId, 'msgId:', msgId);
 
-    // Save as pending before transmitting so it's visible immediately
-    const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    await this.storage.saveMessage(groupId, { ...msgObj, status: 'sending' }, pendingId, true);
+    // Save as pending with the client-generated ID
+    await this.storage.saveMessage(groupId, { ...msgObj, status: 'sending' }, msgId, true);
 
     try {
       // Transmit — pass null context/inReplyTo for new threads (server assigns them)
@@ -373,33 +376,26 @@ export class ChatController {
         inReplyTo: inReplyTo || apId || null
       });
 
-      // Extract AP ID from response
-      const messageApId = await this._resolveApId(res);
-      console.log('[_transmitEncrypted] messageApId:', messageApId);
+      // Extract server-assigned AP IDs from response
+      const messageApId = extractApIdFromResponse(res);
+      const serverContext = res?.object?.context || res?.context;
 
-      // Replace pending message with the confirmed one
-      await this.storage.deleteMessage(pendingId);
-      if (messageApId) {
-        await this.storage.saveMessage(groupId, msgObj, messageApId, true);
-        console.log('[_transmitEncrypted] Saved local message:', messageApId, 'in group:', groupId);
+      // Mark as confirmed with server-assigned apId
+      await this.storage.saveMessage(groupId, msgObj, msgId, true, messageApId || undefined);
+      console.log('[_transmitEncrypted] Confirmed message:', msgId, 'apId:', messageApId, 'in group:', groupId);
+
+      // Store group apId mapping if not yet set
+      if (!apId && serverContext) {
+        await this.storage.setGroupField(groupId, 'apId', serverContext);
+        console.log('[_transmitEncrypted] Stored group apId mapping:', groupId, '→', serverContext);
       }
 
-      // Store apId mapping if not yet set — use server-assigned context if available, else messageApId
-      if (!apId) {
-        const serverContext = res?.object?.context || res?.context;
-        const newApId = serverContext || messageApId;
-        if (newApId) {
-          await this.storage.setGroupField(groupId, 'apId', newApId);
-          console.log('[_transmitEncrypted] Stored apId mapping:', groupId, '→', newApId);
-        }
-      }
-
-      return messageApId;
+      return msgId;
     } catch (e) {
-      // Update the pending message to failed state
+      // Update the message to failed state
       const errStr = typeof e === 'string' ? e : (e.message || String(e));
       console.error('[_transmitEncrypted] Failed to send, saving as failed:', errStr);
-      await this.storage.saveMessage(groupId, { ...msgObj, status: 'failed', error: errStr }, pendingId, true);
+      await this.storage.saveMessage(groupId, { ...msgObj, status: 'failed', error: errStr }, msgId, true);
       throw e;
     }
   }
@@ -723,14 +719,14 @@ export class ChatController {
   }
 
   async _handlePrivateMessage(groupId, parsed, actor) {
-    const messageId = parsed.id;
-    console.log('[_handlePrivateMessage] messageId:', messageId, 'groupId:', groupId, 'from:', parsed.attributedTo);
-    if (!messageId) return null;
+    const outerMessageId = parsed.id;
+    console.log('[_handlePrivateMessage] outerMessageId:', outerMessageId, 'groupId:', groupId, 'from:', parsed.attributedTo);
+    if (!outerMessageId) return null;
 
-    // Skip if we already have this message stored
-    const existing = await this.storage.getMessage(messageId);
+    // Quick dedup check against outer AP id (catches messages stored under old scheme)
+    const existing = await this.storage.getMessage(outerMessageId);
     if (existing) {
-      console.log('[_handlePrivateMessage] Skipping already-stored message:', messageId);
+      console.log('[_handlePrivateMessage] Skipping already-stored message:', outerMessageId);
       return null;
     }
 
@@ -751,8 +747,22 @@ export class ChatController {
         decryptedContent.attributedTo = parsed.attributedTo;
       }
 
-      await this.storage.saveMessage(groupId, decryptedContent, messageId, false);
-      console.log('[_handlePrivateMessage] Saved message:', messageId, 'in group:', groupId);
+      // Use inner ap-mls:// id if present, fall back to outer AP id
+      const messageId = decryptedContent.id || outerMessageId;
+
+      // Dedup check against inner id too
+      if (decryptedContent.id) {
+        const existingInner = await this.storage.getMessage(messageId);
+        if (existingInner) {
+          console.log('[_handlePrivateMessage] Skipping already-stored message (inner id):', messageId);
+          return null;
+        }
+      }
+
+      // Store with outer AP ID for deep link resolution
+      const messageApId = (messageId !== outerMessageId) ? outerMessageId : undefined;
+      await this.storage.saveMessage(groupId, decryptedContent, messageId, false, messageApId);
+      console.log('[_handlePrivateMessage] Saved message:', messageId, 'apId:', messageApId, 'in group:', groupId);
 
       // Store apId mapping if not yet set (context URI → ULID)
       const existingApId = await this.storage.getGroupApId(groupId);
@@ -791,10 +801,10 @@ export class ChatController {
         error: errorText,
         encryptedContent: parsed.content,
         attributedTo: parsed.attributedTo
-      }, messageId, false);
+      }, outerMessageId, false);
     }
 
-    return { type: 'message', groupId, messageId, from: parsed.attributedTo };
+    return { type: 'message', groupId, messageId: outerMessageId, from: parsed.attributedTo };
   }
 
   // ── Key packages ───────────────────────────────────────
