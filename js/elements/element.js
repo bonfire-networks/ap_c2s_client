@@ -3,11 +3,11 @@
 import {
   html,
   css,
-  LitElement,
-  unsafeHTML
-} from 'https://cdn.jsdelivr.net/gh/lit/dist@3/all/lit-all.min.js'
+  LitElement
+} from 'lit'
+import { unsafeHTML } from 'lit/directives/unsafe-html.js'
 
-import * as oauth from 'https://cdn.jsdelivr.net/npm/oauth4webapi@3/+esm'
+import * as oauth from 'oauth4webapi'
 
 import { getCurrentActor, apFetch } from '../activitypub/auth.js'
 

@@ -1,7 +1,7 @@
 import {
   html,
   css
-} from 'https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js'
+} from 'lit'
 
 import { Element } from './element.js'
 import './e2ee-chat-view.js'
@@ -11,18 +11,14 @@ import { adoptDaisyUI } from './shared-styles.js'
 export class HomeElement extends Element {
   static styles = css`
     :host {
-      display: grid;
-      grid-template-rows: auto 1fr auto;
-      min-height: 100vh;
+      display: block;
+      height: calc(100dvh - var(--bonfire-nav-height, 0px));
+      overflow: hidden;
     }
 
-    header,
-    main,
-    footer {
+    main {
       width: 100%;
-      max-width: 75ch;
-      margin: 0 auto;
-      padding: 1rem;
+      height: 100%;
     }
   `
 

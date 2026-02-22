@@ -2,22 +2,21 @@
 <html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#111827" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="mobile-web-app-title" content="" />
     <link rel="manifest" href="manifest.json" />
-    <link href="https://cdn.jsdelivr.net/npm/daisyui@4/dist/full.min.css" rel="stylesheet" />
-    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="../dist/styles.css" rel="stylesheet" />
     <script src="../tauri-init.js"></script>
-    <script type="module" src="js/elements/login.js"></script>
-    <script type="module" src="js/elements/save.js"></script>
-    <script type="module" src="js/elements/home.js"></script>
-    <script type="module" src="js/elements/e2ee-chat-view.js"></script>
+    <script type="module" src="js/dist/elements/login.js"></script>
+    <script type="module" src="js/dist/elements/save.js"></script>
+    <script type="module" src="js/dist/elements/home.js"></script>
+    <script type="module" src="js/dist/elements/e2ee-chat-view.js"></script>
     <title>Secure Chat</title>
   </head>
-  <body class="min-h-screen font-sans">
+  <body class="min-h-screen font-sans m-0 p-0 overflow-x-hidden">
     <div id="page">
       <div class="flex items-center justify-center h-screen">
         <span class="loading loading-spinner loading-lg"></span>

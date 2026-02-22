@@ -1,5 +1,16 @@
 {
+  "private": true,
+  "scripts": {
+    "build": "esbuild elements/e2ee-chat-view.js elements/login.js elements/save.js elements/home.js activitypub/auth.js --bundle --format=esm --splitting --outdir=dist --target=es2020 --minify",
+    "watch": "esbuild elements/e2ee-chat-view.js elements/login.js elements/save.js elements/home.js activitypub/auth.js --bundle --format=esm --splitting --outdir=dist --target=es2020 --watch"
+  },
   "dependencies": {
-    "dexie": "^4.2.1"
+    "dexie": "^4.2.1",
+    "lit": "^3.0.0",
+    "oauth4webapi": "^3.0.0",
+    "ulidx": "^2.4.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
   }
 }

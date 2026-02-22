@@ -3,7 +3,7 @@
  * Implements the storage interface defined in storage-interface.js
  */
 
-import { Dexie } from '../node_modules/dexie/dist/modern/dexie.mjs';
+import { Dexie } from 'dexie';
 import { messageUri } from '../utils.js';
 
 const DB_NAME = 'openmls-db';

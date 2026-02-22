@@ -1,6 +1,6 @@
 // Utility functions: encoding, ID generation, byte conversions
 
-import * as ulidx from "https://cdn.jsdelivr.net/npm/ulidx@2.4.1/+esm"
+import * as ulidx from 'ulidx'
 
 export function bytesToHex(bytes) {
   return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');

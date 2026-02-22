@@ -1,12 +1,16 @@
-// Shared DaisyUI stylesheet for shadow DOM components.
-// Fetches once, browser caches it, all components adopt the same sheet.
+// Shared compiled Tailwind + DaisyUI stylesheet for shadow DOM components.
+// Built at compile time via `npm run build:css` at the tauri level.
+// Fetched once at runtime, all components adopt the same constructed sheet.
 
 const daisySheet = new CSSStyleSheet();
 
-// TODO: for production, consider building this CSS (with only classes we use) at compile time instead of fetching the whole thing at runtime.
-fetch('https://cdn.jsdelivr.net/npm/daisyui@4/dist/full.min.css')
-  .then(r => r.text())
-  .then(css => daisySheet.replace(css));
+// Find the compiled CSS URL from the page's <link> tag (already resolved by HTML)
+const styleLink = document.querySelector('link[href*="styles.css"]');
+if (styleLink) {
+  fetch(styleLink.href)
+    .then(r => r.text())
+    .then(css => daisySheet.replace(css));
+}
 
 export function adoptDaisyUI(element) {
   if (element.shadowRoot) {

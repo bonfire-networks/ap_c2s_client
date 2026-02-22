@@ -1,7 +1,7 @@
 // auth.js
 // Shared OAuth, Webfinger, and token management helpers for ActivityPub and UI components
 
-import * as oauth from 'https://cdn.jsdelivr.net/npm/oauth4webapi@3/+esm'
+import * as oauth from 'oauth4webapi'
 
 
 export const WEBFINGER_REGEXP =
