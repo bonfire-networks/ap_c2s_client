@@ -4,6 +4,7 @@ import { MLSService } from '../mls/mls-service.js'
 import * as storage from '../storage/indexeddb-storage.js'
 import { adoptDaisyUI } from './shared-styles.js'
 import './theme-picker.js'
+import './my-devices-panel.js'
 
 export class E2EEChatView extends LitElement {
   static styles = css`
@@ -144,7 +145,11 @@ export class E2EEChatView extends LitElement {
       groupEncryptionLost: { type: Boolean, state: true },
       sidebarOpen: { type: Boolean, state: true },
       _isWide: { type: Boolean, state: true },
-      showCW: { type: Boolean, state: true }
+      showCW: { type: Boolean, state: true },
+      showMembersPanel: { type: Boolean, state: true },
+      _membersData: { type: Array, state: true },
+      _membersLoading: { type: Boolean, state: true },
+      _highlightedMember: { type: String, state: true }
     }
   }
 
@@ -158,6 +163,10 @@ export class E2EEChatView extends LitElement {
     this._onResize = (e) => { this._isWide = e.matches; this.sidebarOpen = e.matches }
     this._lgQuery.addEventListener('change', this._onResize)
     this.showCW = false
+    this.showMembersPanel = false
+    this._membersData = []
+    this._membersLoading = false
+    this._highlightedMember = null
     this.messages = []
     this.input = ''
     this.name = ''
@@ -176,7 +185,6 @@ export class E2EEChatView extends LitElement {
     this.groupEncryptionLost = false
 
     this._collapsedThreads = new Set();
-    this._fingerprintCache = {}; // groupId -> {actorId -> emoji string}
 
     // Colors for thread lines at each depth, cycling
     this._threadColors = [
@@ -484,16 +492,6 @@ export class E2EEChatView extends LitElement {
     }
   }
 
-  async handleClearData() {
-    try {
-      await this.controller.clearAllData();
-      this.error = 'Identity and message history cleared. Reloading...';
-      window.location.reload();
-    } catch (e) {
-      this.error = 'Failed to reset: ' + (e.message || e);
-    }
-  }
-
   // ── Thread name editing ────────────────────────────────
 
   startEditingThreadName() {
@@ -571,50 +569,25 @@ export class E2EEChatView extends LitElement {
     return this.controller.getActorNickname(actorId);
   }
 
-  async _showFingerprint(actorId) {
-    const gid = this.selectedGroupId;
-    if (!gid) return;
-    // Load fingerprints if not cached
-    if (!this._fingerprintCache[gid]) {
-      this._fingerprintCache[gid] = {};
-      try {
-        const backend = this.controller.mlsService?.backend;
-        if (!backend?.getGroupFingerprints) return;
-        const results = await backend.getGroupFingerprints(this.currentActorId, gid);
-        for (const r of results) {
-          this._fingerprintCache[gid][r.identity] = r.fingerprint.map(e => e.emoji).join(' ');
-        }
-      } catch (e) {
-        console.warn('[Fingerprint] Failed to load:', e);
-        delete this._fingerprintCache[gid];
-        return;
-      }
-    }
-    const emojis = this._fingerprintCache[gid][actorId];
-    if (!emojis) return;
-    // Remove any existing popup
-    const existing = this.shadowRoot.querySelector('.fingerprint-popup');
-    if (existing) existing.remove();
-    // Show floating banner
-    const name = this.getActorNickname(actorId);
-    const popup = document.createElement('div');
-    popup.className = 'fingerprint-popup alert alert-info shadow-lg';
-    popup.style.cssText = 'position:absolute;top:0.5rem;left:0.5rem;right:0.5rem;z-index:100;cursor:pointer;';
-    popup.innerHTML = `<div><div class="font-semibold text-sm">${name}</div><div class="text-lg">${emojis}</div></div>`;
-    const container = this.shadowRoot.querySelector('.messages-pane');
-    if (container) container.prepend(popup);
-    const dismiss = () => popup.remove();
-    popup.addEventListener('click', dismiss);
-    setTimeout(dismiss, 4000);
+  /** Open the members panel and highlight a specific actor. */
+  async _showMember(actorId) {
+    if (!this.selectedGroupId) return;
+    this._highlightedMember = actorId;
+    this.showMembersPanel = true;
+    await this._loadMembersData();
+    // Scroll to the highlighted member card after render
+    await this.updateComplete;
+    const card = this.shadowRoot.querySelector(`[data-member-id="${CSS.escape(actorId)}"]`);
+    if (card) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
-  /** Render a username badge — tap to show emoji fingerprint banner. */
+  /** Render a username badge — tap to open members panel with this actor highlighted. */
   _renderUsername(actorId, { classes = '', style = '' } = {}) {
     const name = actorId ? this.getActorNickname(actorId) : 'Unknown';
     return html`<span
       class="badge badge-sm ${classes}"
       style="${style}"
-      @click=${(e) => { e.stopPropagation(); this._showFingerprint(actorId); }}
+      @click=${(e) => { e.stopPropagation(); this._showMember(actorId); }}
     >${name}</span>`;
   }
 
@@ -672,6 +645,161 @@ export class E2EEChatView extends LitElement {
   _actorColor(actorId) {
     const idx = this.controller.getActorColorIndex(actorId, this._threadColors.length);
     return this._threadColors[idx];
+  }
+
+  // ── Members panel ──────────────────────────────────────
+
+  async toggleMembersPanel() {
+    if (this.showMembersPanel) {
+      this.showMembersPanel = false;
+      this._highlightedMember = null;
+      return;
+    }
+    this._highlightedMember = null;
+    this.showMembersPanel = true;
+    await this._loadMembersData();
+  }
+
+  async _loadMembersData() {
+    if (!this.selectedGroupId || !this.currentActorId) return;
+    this._membersLoading = true;
+    try {
+      const fingerprints = await this.controller.mlsService.getGroupFingerprints(
+        this.currentActorId, this.selectedGroupId);
+
+      // Group by identity (actor URI)
+      const byActor = new Map();
+      for (const fp of fingerprints) {
+        if (!byActor.has(fp.identity)) byActor.set(fp.identity, []);
+        byActor.get(fp.identity).push(fp);
+      }
+      this._membersData = Array.from(byActor.entries()).map(([identity, clients]) => ({
+        identity,
+        nickname: this.getActorNickname(identity),
+        isOwn: clients[0].isOwn,
+        clients,
+      }));
+    } catch (e) {
+      console.error('[MembersPanel] Failed to load:', e);
+      this._membersData = [];
+    }
+    this._membersLoading = false;
+  }
+
+  async _handleRemoveClient(groupId, leafIndex) {
+    try {
+      const result = await this.controller.removeGroupMemberClient(groupId, leafIndex);
+      if (result?.cancelled) return;
+      await this._loadMembersData();
+    } catch (e) {
+      this.error = 'Failed to remove client: ' + (e.message || e);
+    }
+  }
+
+  async _handleRemoveMember(groupId, actorIdentity) {
+    try {
+      const result = await this.controller.removeGroupMember(groupId, actorIdentity);
+      if (result?.cancelled) return;
+      await this._loadMembersData();
+      await this.loadMessages(this.selectedGroupId);
+    } catch (e) {
+      this.error = 'Failed to remove member: ' + (e.message || e);
+    }
+  }
+
+  _openMyDevicesPanel() {
+    const panel = document.createElement('my-devices-panel');
+    panel.controller = this.controller;
+    panel.currentActorId = this.currentActorId;
+    panel.addEventListener('close', () => panel.remove());
+    this.shadowRoot.appendChild(panel);
+  }
+
+  _renderMembersPanel() {
+    if (!this.showMembersPanel) return '';
+    const groupId = this.selectedGroupId;
+
+    return html`
+      <div class="absolute inset-0 z-50 flex flex-col bg-base-100 text-base-content">
+        <div class="flex items-center gap-2 p-3 border-b border-base-300 bg-base-200">
+          <button class="btn btn-ghost btn-sm btn-square" @click=${() => { this.showMembersPanel = false; this._highlightedMember = null; }}>
+            <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-5">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5 3 12m0 0 7.5-7.5M3 12h18"/>
+            </svg>
+          </button>
+          <span class="font-semibold flex-1">Group Members</span>
+          <button class="btn btn-ghost btn-xs" @click=${() => this._loadMembersData()}>
+            <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-4">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182"/>
+            </svg>
+          </button>
+        </div>
+        <div class="flex-1 overflow-y-auto p-3">
+          ${this._membersLoading ? html`
+            <div class="flex justify-center py-8"><span class="loading loading-spinner"></span></div>
+          ` : this._membersData.length === 0 ? html`
+            <div class="text-center opacity-60 py-8">No members found</div>
+          ` : this._membersData.map(member => html`
+            <div class="card card-bordered mb-3 ${this._highlightedMember === member.identity ? 'bg-primary/10 border-primary' : 'bg-base-200'}"
+              data-member-id="${member.identity}">
+              <div class="card-body p-3 gap-2">
+                <div class="flex items-center gap-2">
+                  <span class="font-semibold text-sm">${member.nickname}</span>
+                  ${member.isOwn ? html`<span class="badge badge-sm badge-primary">You</span>` : ''}
+                </div>
+                ${member.clients.map(client => html`
+                  <div class="flex items-center gap-2 pl-2 py-1 border-l-2 ${client.isCurrentClient ? 'border-primary' : 'border-base-300'}">
+                    <span class="text-lg flex-1" title="Emoji fingerprint">
+                      ${client.fingerprint.map(e => e.emoji).join(' ')}
+                    </span>
+                    ${client.isCurrentClient ? html`
+                      <span class="badge badge-xs badge-primary gap-1">
+                        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" class="size-3">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="m4.5 12.75 6 6 9-13.5"/>
+                        </svg>
+                        this device
+                      </span>
+                    ` : !member.isOwn ? html`
+                      <button class="btn btn-error btn-outline btn-xs"
+                        @click=${() => this._handleRemoveClient(groupId, client.index)}>
+                        Remove device
+                      </button>
+                    ` : ''}
+                  </div>
+                `)}
+                ${member.isOwn ? html`
+                  <button class="btn btn-ghost btn-xs btn-block mt-1" @click=${() => this._openMyDevicesPanel()}>
+                    Manage my devices
+                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-4">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5"/>
+                    </svg>
+                  </button>
+                ` : html`
+                  <button class="btn btn-error btn-outline btn-xs btn-block mt-1"
+                    @click=${() => this._handleRemoveMember(groupId, member.identity)}>
+                    Remove member
+                  </button>
+                `}
+              </div>
+            </div>
+          `)}
+          <details class="mt-4 border-t border-base-300 pt-3">
+            <summary class="text-sm cursor-pointer select-none">Advanced</summary>
+            <div class="mt-2">
+              <button class="btn btn-warning btn-outline btn-sm btn-block"
+                @click=${() => this.handleResetEncryption()}
+                ?disabled=${this.loading}>
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-4">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z"/>
+                </svg>
+                ${this.loading ? 'Resetting...' : 'Reset encryption'}
+              </button>
+              <p class="text-xs opacity-50 mt-1">Re-creates the group and re-invites all members.</p>
+            </div>
+          </details>
+        </div>
+      </div>
+    `;
   }
 
   // ── Render ─────────────────────────────────────────────
@@ -758,7 +886,7 @@ export class E2EEChatView extends LitElement {
   _selectGroup(groupId) {
     this.creatingNewGroup = false;
     this.loadMessages(groupId);
-    this.sidebarOpen = false;
+    if (!this._isWide) this.sidebarOpen = false;
   }
 
   render() {
@@ -790,17 +918,11 @@ export class E2EEChatView extends LitElement {
           </div>
           <ul tabindex="0" class="dropdown-content menu menu-sm bg-base-200 rounded-box shadow-lg w-52 z-50 mt-1">
             <li><theme-picker></theme-picker></li>
-            <li><a @click=${() => this.handleResetEncryption()} class="${!this.selectedGroupId || this.creatingNewGroup ? 'btn-disabled opacity-50' : ''}">
+            <li><a @click=${() => this._openMyDevicesPanel()}>
               <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-4">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z"/>
+                <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 1.5H8.25A2.25 2.25 0 0 0 6 3.75v16.5a2.25 2.25 0 0 0 2.25 2.25h7.5A2.25 2.25 0 0 0 18 20.25V3.75a2.25 2.25 0 0 0-2.25-2.25H13.5m-3 0V3h3V1.5m-3 0h3m-3 18.75h3"/>
               </svg>
-              Reset encryption
-            </a></li>
-            <li><a @click=${() => this.handleClearData()} class="text-error">
-              <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-4">
-                <path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0"/>
-              </svg>
-              Clear all data
+              My devices
             </a></li>
             <li class="border-t border-base-300 mt-1 pt-1"><a @click=${() => this._menuAction('logout')} class="text-warning">
               <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-4">
@@ -819,19 +941,27 @@ export class E2EEChatView extends LitElement {
 
         <div class="drawer-content flex">
           <div class="messages-pane bg-base-100">
-            ${this.selectedGroupId && !this.creatingNewGroup && (this.currentThreadName && !this.threadNameIsAutoGenerated) ? html`
-              <div class="p-4 border-b border-base-300 bg-base-200 flex items-center gap-2">
-                ${this.editingThreadName ? html`
-                  <input type="text" class="input input-bordered input-sm flex-1 font-semibold"
-                    .value=${this.currentThreadName}
-                    @input=${e => this.currentThreadName = e.target.value}
-                    placeholder="Thread name" />
-                  <button class="btn btn-primary btn-sm" @click=${() => this.saveThreadName()}>Save</button>
-                  <button class="btn btn-error btn-sm" @click=${() => this.cancelEditThreadName()}>Cancel</button>
-                ` : html`
-                  <div class="flex-1 font-semibold text-lg">${this.currentThreadName}</div>
-                  <button class="btn btn-ghost btn-sm" @click=${() => this.startEditingThreadName()}>Edit name</button>
-                `}
+            ${this._renderMembersPanel()}
+            ${this.selectedGroupId && !this.creatingNewGroup ? html`
+              <div class="px-3 py-2 border-b border-base-300 bg-base-200 flex items-center gap-2">
+                ${this.currentThreadName && !this.threadNameIsAutoGenerated ? html`
+                  ${this.editingThreadName ? html`
+                    <input type="text" class="input input-bordered input-sm flex-1 font-semibold"
+                      .value=${this.currentThreadName}
+                      @input=${e => this.currentThreadName = e.target.value}
+                      placeholder="Thread name" />
+                    <button class="btn btn-primary btn-sm" @click=${() => this.saveThreadName()}>Save</button>
+                    <button class="btn btn-ghost btn-sm" @click=${() => this.cancelEditThreadName()}>Cancel</button>
+                  ` : html`
+                    <div class="flex-1 font-semibold truncate">${this.currentThreadName}</div>
+                    <button class="btn btn-ghost btn-xs" @click=${() => this.startEditingThreadName()}>Edit</button>
+                  `}
+                ` : html`<div class="flex-1"></div>`}
+                <button class="btn btn-ghost btn-sm btn-square ${this.showMembersPanel ? 'btn-active' : ''}" @click=${() => this.toggleMembersPanel()} aria-label="Group members" title="Group members">
+                  <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-5">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 19.128a9.38 9.38 0 0 0 2.625.372 9.337 9.337 0 0 0 4.121-.952 4.125 4.125 0 0 0-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 0 1 8.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0 1 11.964-3.07M12 6.375a3.375 3.375 0 1 1-6.75 0 3.375 3.375 0 0 1 6.75 0Zm8.25 2.25a2.625 2.625 0 1 1-5.25 0 2.625 2.625 0 0 1 5.25 0Z"/>
+                  </svg>
+                </button>
               </div>
             ` : ''}
             <div class="messages-list">

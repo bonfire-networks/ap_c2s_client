@@ -235,6 +235,58 @@ export class MLSService {
     await this.storage.clearUserKeyData(userId);
   }
 
+  // ── Member management ──────────────────────────────────
+
+  /**
+   * Remove one or more clients (by leaf index) from a group.
+   * Returns { commit: base64 string } for distribution to remaining members.
+   *
+   * @param {string} userId - actor ID
+   * @param {string} groupId - group identifier
+   * @param {number[]} leafIndexes - leaf node indexes to remove
+   * @returns {{ commit: string }}
+   */
+  async removeGroupMemberClient(userId, groupId, leafIndexes) {
+    const result = await this.backend.removeGroupMemberClient(userId, groupId, leafIndexes);
+    await this._persistAfterGroupOp(userId, groupId);
+    return result;
+  }
+
+  /**
+   * Remove all clients of a given actor from a group.
+   * The backend resolves leaf indexes by matching member identity against memberId.
+   *
+   * @param {string} userId - actor ID of the caller
+   * @param {string} groupId - group identifier
+   * @param {string} memberId - actor URI of the member to remove
+   * @returns {{ commit: string, removedCount: number }}
+   */
+  async removeGroupMember(userId, groupId, memberId) {
+    const result = await this.backend.removeGroupMember(userId, groupId, memberId);
+    await this._persistAfterGroupOp(userId, groupId);
+    return result;
+  }
+
+  /**
+   * Get emoji fingerprints for all members in a group.
+   * Returns [{identity, fingerprint, isOwn, index, signatureKey, isCurrentClient}]
+   *
+   * @param {string} userId - actor ID
+   * @param {string} groupId - group identifier
+   * @returns {Array<{identity: string, fingerprint: Array<{emoji: string, description: string}>, isOwn: boolean, index: number, signatureKey: string, isCurrentClient: boolean}>}
+   */
+  async decommissionClient(userId, signatureKey) {
+    return await this.backend.decommissionClient(userId, signatureKey);
+  }
+
+  async clearAllData(userId) {
+    return await this.backend.clearAllData(userId);
+  }
+
+  async getGroupFingerprints(userId, groupId) {
+    return await this.backend.getGroupFingerprints(userId, groupId);
+  }
+
   // ── Group ID extraction ──────────────────────────────────
 
   /**

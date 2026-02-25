@@ -90,6 +90,18 @@ export async function addMember(userId, groupId, keyPackageBytes) {
   };
 }
 
+export async function removeGroupMemberClient(userId, groupId, leafIndexes) {
+  return await invoke('plugin:openmls|remove_group_member_client', {
+    userId, groupId, leafIndexes,
+  });
+}
+
+export async function removeGroupMember(userId, groupId, memberId) {
+  return await invoke('plugin:openmls|remove_group_member', {
+    userId, groupId, memberId,
+  });
+}
+
 export async function exportRatchetTree(userId, groupId) {
   const b64 = await invoke('plugin:openmls|export_ratchet_tree', { userId, groupId });
   return base64ToUint8(b64);
@@ -106,10 +118,23 @@ export async function createKeyPackage(userId) {
 
 /**
  * Get emoji fingerprints for all members in a group.
- * Returns [{identity, fingerprint: [{emoji, description}], isOwn}]
+ * Returns [{identity, fingerprint: [{emoji, description}], isOwn, index, signatureKey, isCurrentClient}]
  */
 export async function getGroupFingerprints(userId, groupId) {
   return await invoke('plugin:openmls|get_group_fingerprints', { userId, groupId });
+}
+
+/**
+ * Decommission a client (by signature key) from all loaded groups.
+ * Shows a native confirmation dialog, then removes from all groups.
+ * Returns {results: [{groupId, commit}], cancelled: bool}
+ */
+export async function decommissionClient(userId, signatureKey) {
+  return await invoke('plugin:openmls|decommission_client', { userId, signatureKey });
+}
+
+export async function clearAllData(userId) {
+  return await invoke('plugin:openmls|clear_all_data', { userId });
 }
 
 // ── Group ID extraction ─────────────────────────────────────────────

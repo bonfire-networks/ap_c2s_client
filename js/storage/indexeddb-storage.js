@@ -207,6 +207,7 @@ export async function isProcessed(actorId, activityId) {
 // ──────────────────────────────────────────────
 
 export async function clearAll() {
+  await db.table('users').clear();
   await db.table('groups').clear();
   await db.table('messages').clear();
   await db.table('processedActivityIds').clear();

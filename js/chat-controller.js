@@ -13,7 +13,7 @@
 import { bytesToBase64, bytesFromInput, groupUri, messageUri } from './utils.js';
 import { getCurrentActor, getActor, getActorId, apFetch } from './activitypub/auth.js';
 import { postToOutbox, fetchActorKeyPackage, resolveActorId, extractApIdFromResponse } from './activitypub/client.js';
-import { sendEncryptedMessage, sendMLSControl, publishKeyPackage, fetchKeyPackage, parseMLSActivity } from './activitypub/mls-transport.js';
+import { sendEncryptedMessage, sendMLSControl, publishKeyPackage, deleteKeyPackage, fetchKeyPackage, parseMLSActivity } from './activitypub/mls-transport.js';
 
 /** Check if a value looks like an AP URI (not a local ULID or null). */
 function isApUri(value) {
@@ -897,8 +897,107 @@ export class ChatController {
 
   async clearAllData() {
     const actor = await getCurrentActor();
-    await this.mlsService.clearKeyPackage(actor.id);
+
+    // Rust handles: native dialog → leave all groups → back up & delete SQLite DB
+    const response = await this.mlsService.clearAllData(actor.id);
+    if (response.cancelled || !response.results) {
+      console.warn('[clearAllData] Clear cancelled or failed:', response);
+      return false;
+    } 
+
+    // Distribute self-remove proposals so other members update their state
+    for (const result of response.results) {
+      try {
+        const recipients = await this.getGroupMembers(result.groupId);
+        const meta = (await this.storage.loadGroupMeta(result.groupId)) || {};
+        const apId = meta.apId || null;
+        if (apId && recipients.length > 0) {
+          const type = result.isSelfRemove ? 'Proposal' : 'Commit';
+          await sendMLSControl(actor, type, result.commit, recipients, apId);
+        }
+      } catch (err) {
+        console.error(`[clearAllData] Failed to distribute for ${result.groupId}:`, err);
+      }
+    }
+
+    // Clear JS-side storage and auth
     await this.storage.clearAll();
+    // logout as well?
+    // localStorage.clear();
+    // sessionStorage.clear();
+    return true;
+  }
+
+  // ── Member / client management ──────────────────────────
+
+  /**
+   * Distribute an MLS commit to remaining group members via AP.
+   * Shared by all removal methods.
+   */
+  async _distributeCommit(actor, groupId, commitB64, recipients) {
+    const meta = (await this.storage.loadGroupMeta(groupId)) || {};
+    const apId = meta.apId || null;
+    if (apId && recipients.length > 0) {
+      await sendMLSControl(actor, 'Commit', commitB64, recipients, apId);
+    }
+  }
+
+  /**
+   * Remove a single client (leaf node) from a group and distribute
+   * the commit to remaining members.
+   *
+   * @param {string} groupId - group identifier
+   * @param {number} leafIndex - leaf node index to remove
+   */
+  async removeGroupMemberClient(groupId, leafIndex) {
+    const actor = await getCurrentActor();
+    const result = await this.mlsService.removeGroupMemberClient(actor.id, groupId, [leafIndex]);
+    await this._distributeCommit(actor, groupId, result.commit, await this.getGroupMembers(groupId));
+    return result;
+  }
+
+  /**
+   * Remove all of an actor's clients from a group (kick a member).
+   * The Rust backend resolves leaf indexes internally by matching member identity.
+   *
+   * @param {string} groupId - group identifier
+   * @param {string} actorIdentity - actor URI of the member to remove
+   */
+  async removeGroupMember(groupId, actorIdentity) {
+    const actor = await getCurrentActor();
+    const result = await this.mlsService.removeGroupMember(actor.id, groupId, actorIdentity);
+
+    // Update persisted member list and distribute to remaining
+    const remaining = (await this.getGroupMembers(groupId)).filter(id => id !== actorIdentity);
+    await this.persistMembers(groupId, remaining);
+    await this._distributeCommit(actor, groupId, result.commit, remaining);
+    return result;
+  }
+
+  /**
+   * Decommission one of the current actor's other devices.
+   * Removes the client (by signatureKey) from ALL groups, then deletes
+   * the key package from the server via AP Remove.
+   *
+   * @param {string} signatureKeyB64 - base64-encoded signature key of the device to remove
+   */
+  async removeOwnClient(signatureKeyB64) {
+    const actor = await getCurrentActor();
+
+    const response = await this.mlsService.decommissionClient(actor.id, signatureKeyB64);
+    if (response.cancelled) return { cancelled: true };
+
+    // Distribute commits for each affected group
+    for (const { groupId, commit } of response.results) {
+      try {
+        await this._distributeCommit(actor, groupId, commit, await this.getGroupMembers(groupId));
+      } catch (err) {
+        console.error(`[removeOwnClient] Failed to distribute commit for group ${groupId}:`, err);
+      }
+    }
+
+    await deleteKeyPackage(actor, signatureKeyB64);
+    return { cancelled: false };
   }
 
   // ── Helpers ────────────────────────────────────────────

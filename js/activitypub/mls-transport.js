@@ -150,6 +150,50 @@ export async function publishKeyPackage(actor, keyPackageBytes) {
 }
 
 /**
+ * Delete (revoke) a key package from the actor's keyPackages collection.
+ * Sends an AP Remove activity when a collection exists, or an Update with empty keyPackages when it doesn't (like in publishKeyPackage).
+ *
+ * @param {object} actor - current actor
+ * @param {Uint8Array} keyPackageBytes - raw key package bytes to remove
+ * @returns {boolean} true if removed successfully
+ */
+export async function deleteKeyPackage(actor, keyPackageBytes) {
+  const kpB64 = bytesToBase64(keyPackageBytes);
+
+  const keyPackages = actor.keyPackages;
+  const target = keyPackages ? (typeof keyPackages === 'string' ? keyPackages : keyPackages.id) : null;
+
+  let res;
+  if (target) {
+    res = await postToOutbox(actor, {
+      type: 'Remove',
+      actor: actor.id,
+      object: {
+        type: 'KeyPackage',
+        attributedTo: actor.id,
+        mediaType: 'message/mls',
+        encoding: 'base64',
+        content: kpB64,
+      },
+      target,
+    });
+  } else {
+    res = await postToOutbox(actor, {
+      type: 'Update',
+      actor: actor.id,
+      to: 'as:Public',
+      object: {
+        id: actor.id,
+        type: actor.type,
+        keyPackages: []
+      }
+    });
+  }
+
+  return res && res.ok;
+}
+
+/**
  * Fetch the latest key package for a remote actor.
  * Returns the content as bytes, or null if not found.
  *
