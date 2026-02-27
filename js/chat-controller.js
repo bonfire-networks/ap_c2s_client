@@ -895,6 +895,13 @@ export class ChatController {
 
   // ── Cleanup ────────────────────────────────────────────
 
+  async archiveThread(groupId) {
+    const actor = await getCurrentActor();
+    await this.mlsService.deleteGroup(actor.id, groupId);
+    await this.storage.deleteGroupMessages(groupId);
+    await this.storage.deleteGroupMeta(groupId);
+  }
+
   async clearAllData() {
     const actor = await getCurrentActor();
 

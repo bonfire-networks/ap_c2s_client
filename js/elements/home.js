@@ -2,6 +2,7 @@ import {
   html,
   css
 } from 'lit'
+import { logout } from '../activitypub/auth.js'
 
 import { Element } from './element.js'
 import './e2ee-chat-view.js'
@@ -81,8 +82,8 @@ export class HomeElement extends Element {
     window.location.hash = value
   }
 
-  _logout () {
-    localStorage.clear()
+  async _logout () {
+    await logout()
     if (window.__TAURI__) {
       window.__TAURI__.event.emit('app-logout')
     } else {

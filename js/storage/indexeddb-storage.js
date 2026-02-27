@@ -148,6 +148,10 @@ export async function deleteMessage(id) {
   await db.table('messages').delete(id);
 }
 
+export async function deleteGroupMessages(groupId) {
+  await db.table('messages').where('groupId').equals(groupId).delete();
+}
+
 // ──────────────────────────────────────────────
 // MLS backend state (opaque bytes)
 // ──────────────────────────────────────────────

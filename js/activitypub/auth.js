@@ -284,6 +284,21 @@ function dispatchAuthError(reason) {
   window.dispatchEvent(new CustomEvent('auth-error', { detail: { reason } }))
 }
 
+/**
+ * Log out: clear server session (HttpOnly cookie) and local storage.
+ */
+export async function logout() {
+  try {
+    const actorId = localStorage.getItem('actor_id')
+    if (actorId) {
+      const origin = new URL(actorId).origin
+      await fetch(`${origin}/logout`, { credentials: 'include' })
+    }
+  } catch (_) { /* best-effort */ }
+  localStorage.clear()
+  sessionStorage.clear()
+}
+
 export async function ensureFreshToken(clientId) {
   clientId = clientId || localStorage.getItem('client_id')
   if (!clientId) {

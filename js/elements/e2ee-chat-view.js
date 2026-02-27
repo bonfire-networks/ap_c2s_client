@@ -2,6 +2,7 @@ import { html, css, LitElement } from 'lit'
 import { ChatController, EncryptionLostError } from '../chat-controller.js'
 import { MLSService } from '../mls/mls-service.js'
 import * as storage from '../storage/indexeddb-storage.js'
+import { logout } from '../activitypub/auth.js'
 import { adoptDaisyUI } from './shared-styles.js'
 import './theme-picker.js'
 import './my-devices-panel.js'
@@ -481,6 +482,21 @@ export class E2EEChatView extends LitElement {
     this.loading = false;
   }
 
+  async _handleArchiveThread() {
+    if (!this.selectedGroupId) return;
+    this.loading = true;
+    try {
+      await this.controller.archiveThread(this.selectedGroupId);
+      this.selectedGroupId = null;
+      this.messages = [];
+      this.showMembersPanel = false;
+      await this.loadGroups();
+    } catch (e) {
+      this.error = 'Archive failed: ' + (e.message || e);
+    }
+    this.loading = false;
+  }
+
   async handleRetry(messageId) {
     try {
       await this.controller.retrySendMessage(messageId);
@@ -544,16 +560,16 @@ export class E2EEChatView extends LitElement {
 
   // ── Menu actions ─────────────────────────────────────
 
-  _menuAction(value) {
+  async _menuAction(value) {
     if (value === 'logout') {
-      localStorage.clear()
+      await logout();
       if (window.__TAURI__) {
-        window.__TAURI__.event.emit('app-logout')
+        window.__TAURI__.event.emit('app-logout');
       } else {
-        window.location = this.getAttribute('redirect-uri') || '/'
+        window.location = this.getAttribute('redirect-uri') || '/';
       }
     } else {
-      window.location.hash = value
+      window.location.hash = value;
     }
   }
 
@@ -795,6 +811,15 @@ export class E2EEChatView extends LitElement {
                 ${this.loading ? 'Resetting...' : 'Reset encryption'}
               </button>
               <p class="text-xs opacity-50 mt-1">Re-creates the group and re-invites all members.</p>
+              <button class="btn btn-error btn-outline btn-sm btn-block mt-3"
+                @click=${() => this._handleArchiveThread()}
+                ?disabled=${this.loading}>
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-4">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="m20.25 7.5-.625 10.632a2.25 2.25 0 0 1-2.247 2.118H6.622a2.25 2.25 0 0 1-2.247-2.118L3.75 7.5m8.25 3v6.75m0 0-3-3m3 3 3-3M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125Z"/>
+                </svg>
+                Archive thread
+              </button>
+              <p class="text-xs opacity-50 mt-1">Removes this thread and its messages from your device.</p>
             </div>
           </details>
         </div>
