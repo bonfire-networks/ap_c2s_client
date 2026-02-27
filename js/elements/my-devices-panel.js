@@ -10,7 +10,7 @@
  */
 
 import { html, css, LitElement } from 'lit'
-import { adoptDaisyUI } from './shared-styles.js'
+import { adoptDaisyUI, icon } from './shared-styles.js'
 
 export class MyDevicesPanel extends LitElement {
   static styles = css`
@@ -85,6 +85,19 @@ export class MyDevicesPanel extends LitElement {
           console.warn(`[MyDevices] Skipping group ${group.id}:`, e)
         }
       }
+
+      // Ensure the current device always appears (even with no groups)
+      const ownFp = await this.controller.mlsService.getOwnFingerprint(this.currentActorId)
+      if (ownFp && !deviceMap.has(ownFp.signatureKey)) {
+        deviceMap.set(ownFp.signatureKey, {
+          signatureKey: ownFp.signatureKey,
+          fingerprint: ownFp.fingerprint,
+          isCurrentClient: true,
+          groupCount: 0,
+          groups: []
+        })
+      }
+
       this._devices = Array.from(deviceMap.values())
     } catch (e) {
       console.error('[MyDevices] Failed to load:', e)
@@ -126,15 +139,11 @@ export class MyDevicesPanel extends LitElement {
       <div class="flex flex-col h-full bg-base-100 text-base-content">
       <div class="flex items-center gap-2 p-3 border-b border-base-300 bg-base-200">
         <button class="btn btn-ghost btn-sm btn-square" @click=${() => this._close()}>
-          <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-5">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M10.5 19.5 3 12m0 0 7.5-7.5M3 12h18"/>
-          </svg>
+          ${icon('arrow-left', { size: 20 })}
         </button>
         <span class="font-semibold flex-1">My Devices</span>
         <button class="btn btn-ghost btn-xs" @click=${() => this._loadDevices()}>
-          <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-4">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182"/>
-          </svg>
+          ${icon('arrows-clockwise')}
         </button>
       </div>
       <div class="flex-1 overflow-y-auto p-3">
@@ -152,9 +161,7 @@ export class MyDevicesPanel extends LitElement {
                 </span>
                 ${device.isCurrentClient ? html`
                   <span class="badge badge-sm badge-primary gap-1">
-                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" class="size-3">
-                      <path stroke-linecap="round" stroke-linejoin="round" d="m4.5 12.75 6 6 9-13.5"/>
-                    </svg>
+                    ${icon('check', { size: 12 })}
                     this device
                   </span>
                 ` : ''}
@@ -178,9 +185,7 @@ export class MyDevicesPanel extends LitElement {
             <button class="btn btn-error btn-outline btn-sm btn-block"
               @click=${() => this._handleClearData()}
               ?disabled=${this._loading}>
-              <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" class="size-4">
-                <path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0"/>
-              </svg>
+              ${icon('trash')}
               Delete this device and local data
             </button>
             <p class="text-xs opacity-50 mt-1">Deletes identity, keys, and message history. You will need to log in again.</p>

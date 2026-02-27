@@ -13,7 +13,7 @@
 import { bytesToBase64, bytesFromInput, groupUri, messageUri } from './utils.js';
 import { getCurrentActor, getActor, getActorId, apFetch } from './activitypub/auth.js';
 import { postToOutbox, fetchActorKeyPackage, resolveActorId, extractApIdFromResponse } from './activitypub/client.js';
-import { sendEncryptedMessage, sendMLSControl, publishKeyPackage, deleteKeyPackage, fetchKeyPackage, parseMLSActivity } from './activitypub/mls-transport.js';
+import { sendEncryptedMessage, sendMLSControl, publishKeyPackage, deleteKeyPackage, parseMLSActivity } from './activitypub/mls-transport.js';
 
 /** Check if a value looks like an AP URI (not a local ULID or null). */
 function isApUri(value) {
@@ -48,6 +48,12 @@ export class ChatController {
     const actor = await getCurrentActor();
     console.log('[ChatController] Initializing for actor:', actor);
     this.currentActorId = actor.id;
+
+    // Store own profile from the (possibly cached) actor object
+    await this._saveActorProfileFromAP(actor);
+
+    // Re-fetch own actor in background so avatar/name stay fresh
+    this._refreshMyActorProfile(actor.id);
 
     await this.mlsService.init(actor.id);
     console.log('[ChatController] MLSService initialized for actor:', actor.id);
@@ -384,6 +390,14 @@ export class ChatController {
       await this.storage.saveMessage(groupId, msgObj, msgId, true, messageApId || undefined);
       console.log('[_transmitEncrypted] Confirmed message:', msgId, 'apId:', messageApId, 'in group:', groupId);
 
+      // Mark the activity ID or object ID as processed so pollInbox won't reprocess the echo (inbox items may arrive wrapped in a Create with a different ID than the inner object)
+      const activityApId = res?.id;
+      if (activityApId) {
+        await this.storage.markProcessed(actor.id, activityApId);
+      } else {
+        if (messageApId) await this.storage.markProcessed(actor.id, messageApId);
+      }
+
       // Store group apId mapping if not yet set
       if (!apId && serverContext) {
         await this.storage.setGroupField(groupId, 'apId', serverContext);
@@ -518,8 +532,8 @@ export class ChatController {
       const items = await fetchInboxItems(actor);
       console.log('[pollInbox] Fetched', items.length, 'inbox items');
 
-      // Process recent items (last 10) - reverse so oldest are processed first
-      const itemsToProcess = items.slice(0, 10).reverse();
+      // Process oldest-first so group joins happen before messages
+      const itemsToProcess = [...items].reverse();
       const results = [];
 
       for (const item of itemsToProcess) {
@@ -565,12 +579,6 @@ export class ChatController {
 
     const actor = await getCurrentActor();
     console.log('[handleActivity] type:', parsed.type, 'id:', parsed.id, 'from:', parsed.attributedTo, 'context:', parsed.context);
-
-    // Skip our own outgoing messages — they're already stored locally
-    if (parsed.attributedTo === actor.id && parsed.type === 'PrivateMessage') {
-      console.log('[handleActivity] Skipping own PrivateMessage:', parsed.id);
-      return null;
-    }
 
     const contextId = parsed.context;
 
@@ -872,8 +880,11 @@ export class ChatController {
    */
   async fetchLatestKeyPackage(actorUri) {
     try {
-      const content = await fetchKeyPackage(actorUri);
-      if (content) {
+      const result = await fetchActorKeyPackage(actorUri);
+      if (result) {
+        const { content, actor } = result;
+        // Store the actor's profile from the fetched AP object
+        await this._saveActorProfileFromAP(actor);
         // Cache the fetched key package
         await this.storage.saveUserField(actorUri, 'keyPackage', content);
         await this.storage.saveUserField(actorUri, 'publishedDate', Date.now());
@@ -1025,21 +1036,82 @@ export class ChatController {
     return idx;
   }
 
+  /**
+   * Extract and persist an actor's profile from a full AP actor object.
+   */
+  async _saveActorProfileFromAP(actor) {
+    if (!actor?.id) return;
+    const iconUrl = typeof actor.icon === 'string' ? actor.icon
+      : actor.icon?.url || actor.icon?.href || null;
+    await this.storage.saveActorProfile(actor.id, {
+      name: actor.name || null,
+      preferredUsername: actor.preferredUsername || null,
+      icon: iconUrl
+    });
+  }
+
+  /**
+   * Re-fetch my actor's profile from the server and update storage + localStorage cache.
+   * Fire-and-forget — errors are silently logged.
+   */
+  _refreshMyActorProfile(actorId) {
+    getActor(actorId).then(async (actor) => {
+      await this._saveActorProfileFromAP(actor);
+      // Also update the localStorage cache so getCurrentActor() returns fresh data
+      localStorage.setItem('actor', JSON.stringify(actor));
+      console.log('[ChatController] Refreshed actor profile:', actorId);
+    }).catch(e => {
+      console.warn('[ChatController] Background profile refresh failed:', e.message || e);
+    });
+  }
+
+  /**
+   * Get a stored actor profile (name, avatar, etc.) from Dexie.
+   */
+  async getActorProfile(actorId) {
+    if (!actorId) return null;
+    return this.storage.getActorProfile(actorId);
+  }
+
+  /**
+   * Resolve a single recipient input (mention or URI), fetch their key package
+   * and profile. Returns a result object for the UI to display.
+   */
+  async resolveRecipient(input) {
+    const currentDomain = this.currentActorId ? new URL(this.currentActorId).hostname : null;
+    const actorUri = await resolveActorId(input, currentDomain);
+    if (!actorUri) return { input, resolved: false, error: 'Could not resolve actor' };
+    if (actorUri === this.currentActorId) return { input, resolved: false, error: 'Cannot add yourself' };
+
+    let hasKey = false;
+    let fingerprint = null;
+    try {
+      const kpBytes = await this.fetchLatestKeyPackage(actorUri);
+      hasKey = !!kpBytes;
+      // Extract emoji fingerprint from the key package
+      if (kpBytes) {
+        const kpB64 = bytesToBase64(kpBytes);
+        const fp = await this.mlsService.getKeyPackageFingerprint(kpB64);
+        if (fp?.fingerprint) fingerprint = fp.fingerprint;
+      }
+    } catch {}
+
+    const profile = await this.getActorProfile(actorUri);
+    return {
+      input, resolved: true, actorUri,
+      displayName: profile?.name || this.getActorNickname(actorUri),
+      avatar: profile?.icon || null,
+      hasKey, fingerprint,
+      error: hasKey ? null : 'No encryption key available'
+    };
+  }
+
   getActorNickname(actorId) {
     if (!actorId) return null;
     try {
       const url = new URL(actorId);
       const parts = url.pathname.split('/').filter(Boolean);
-      const lastPart = parts[parts.length - 1];
-      if (this.currentActorId) {
-        try {
-          const currentHost = new URL(this.currentActorId).host;
-          if (currentHost && url.host === currentHost) {
-            return lastPart.replace(/^@/, '');
-          }
-        } catch {}
-      }
-      return lastPart.replace(/^@/, '') + '@' + url.host;
+      return parts[parts.length - 1].replace(/^@/, '') + '@' + url.host;
     } catch {
       return actorId;
     }

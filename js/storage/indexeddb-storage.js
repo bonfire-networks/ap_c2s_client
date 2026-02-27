@@ -190,6 +190,27 @@ export async function clearUserKeyData(userId) {
 }
 
 // ──────────────────────────────────────────────
+// Actor profiles (stored in users table)
+// ──────────────────────────────────────────────
+
+export async function saveActorProfile(actorId, profile) {
+  await _updateUserState(actorId, (state = {}) => ({
+    ...state,
+    profile: {
+      name: profile.name || null,
+      preferredUsername: profile.preferredUsername || null,
+      icon: profile.icon || null,
+      updatedAt: Date.now()
+    }
+  }));
+}
+
+export async function getActorProfile(actorId) {
+  const state = await loadUserState(actorId);
+  return state?.profile || null;
+}
+
+// ──────────────────────────────────────────────
 // Activity deduplication
 // ──────────────────────────────────────────────
 
@@ -214,7 +235,8 @@ export async function clearAll() {
   await db.table('users').clear();
   await db.table('groups').clear();
   await db.table('messages').clear();
-  await db.table('processedActivityIds').clear();
+  // NOTE: processedActivityIds intentionally preserved so already-processed
+  // inbox items are not re-fetched after a data clear.
 }
 
 // ──────────────────────────────────────────────

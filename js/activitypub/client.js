@@ -17,15 +17,18 @@ import { apFetch, getActorId, getActor } from './auth.js';
  */
 export async function postToOutbox(actor, obj) {
   const outbox = actor.outbox;
+  const bodyObj = {
+    '@context': 'https://www.w3.org/ns/activitystreams',
+    ...obj
+  };
+  console.log('[postToOutbox] URL:', outbox, 'type:', bodyObj.type, 'to:', bodyObj.to);
+
   const res = await apFetch(outbox, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/activity+json'
     },
-    body: JSON.stringify({
-      '@context': 'https://www.w3.org/ns/activitystreams',
-      ...obj
-    })
+    body: JSON.stringify(bodyObj)
   });
 
   let data = {
@@ -51,6 +54,7 @@ export async function postToOutbox(actor, obj) {
     data.error = `Failed to parse response: ${e.message}`;
   }
 
+  console.log('[postToOutbox] Response:', data.status, data.ok ? 'OK' : 'FAIL', data.id || data.error || '');
   return data;
 }
 
@@ -241,6 +245,7 @@ export async function fetchInboxItems(actor) {
   }
 
   const inbox = await res.json();
+  console.log('[fetchInboxItems] Raw response keys:', Object.keys(inbox), 'totalItems:', inbox.totalItems, 'type:', inbox.type);
   let items = [];
 
   // Check for direct items in response
@@ -270,6 +275,9 @@ export async function fetchInboxItems(actor) {
     }
   }
 
+  console.log('[fetchInboxItems] Total items:', items.length,
+    items.length > 0 ? 'First item type:' : '',
+    items.length > 0 ? (items[0]?.type || items[0]?.object?.type || 'unknown') : '');
   return items;
 }
 

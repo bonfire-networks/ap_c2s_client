@@ -287,6 +287,22 @@ export class MLSService {
     return await this.backend.getGroupFingerprints(userId, groupId);
   }
 
+  async getOwnFingerprint(userId) {
+    if (!this.backend.getOwnFingerprint) return null;
+    return await this.backend.getOwnFingerprint(userId);
+  }
+
+  /**
+   * Extract the emoji fingerprint from a key package (no group/user needed).
+   * Returns {fingerprint: [{emoji, description}], signatureKey} or null.
+   *
+   * @param {string} keyPackageB64 - base64-encoded MLS key package
+   */
+  async getKeyPackageFingerprint(keyPackageB64) {
+    if (!this.backend.getKeyPackageFingerprint) return null;
+    return await this.backend.getKeyPackageFingerprint(keyPackageB64);
+  }
+
   // ── Group ID extraction ──────────────────────────────────
 
   /**

@@ -125,6 +125,22 @@ export async function getGroupFingerprints(userId, groupId) {
 }
 
 /**
+ * Get the current client's emoji fingerprint (no group needed).
+ * Returns {fingerprint: [{emoji, description}], signatureKey} or null.
+ */
+export async function getOwnFingerprint(userId) {
+  return await invoke('plugin:openmls|get_own_fingerprint', { userId });
+}
+
+/**
+ * Extract the emoji fingerprint from a key package (no group or user needed).
+ * Returns {fingerprint: [{emoji, description}], signatureKey}.
+ */
+export async function getKeyPackageFingerprint(keyPackageB64) {
+  return await invoke('plugin:openmls|get_key_package_fingerprint', { keyPackageB64 });
+}
+
+/**
  * Decommission a client (by signature key) from all loaded groups.
  * Shows a native confirmation dialog, then removes from all groups.
  * Returns {results: [{groupId, commit}], cancelled: bool}

@@ -180,6 +180,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@iconify/types@npm:^2.0.0":
+  version: 2.0.0
+  resolution: "@iconify/types@npm:2.0.0"
+  checksum: 10c0/65a3be43500c7ccacf360e136d00e1717f050b7b91da644e94370256ac66f582d59212bdb30d00788aab4fc078262e91c95b805d1808d654b72f6d2072a7e4b2
+  languageName: node
+  linkType: hard
+
 "@lit-labs/ssr-dom-shim@npm:^1.5.0":
   version: 1.5.1
   resolution: "@lit-labs/ssr-dom-shim@npm:1.5.1"
@@ -296,6 +303,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"iconify-icon@npm:^3.0.2":
+  version: 3.0.2
+  resolution: "iconify-icon@npm:3.0.2"
+  dependencies:
+    "@iconify/types": "npm:^2.0.0"
+  checksum: 10c0/2b168ec72280e5bdefe20df987f8b18987fbd34bce137596e8fb42ad6d4c0f7615daf96a4cdb5e10a8e107f1338a310a3134e8027cc42a7f5b01aad8628bb223
+  languageName: node
+  linkType: hard
+
 "layerr@npm:^3.0.0":
   version: 3.0.0
   resolution: "layerr@npm:3.0.0"
@@ -347,6 +363,7 @@ __metadata:
   dependencies:
     dexie: "npm:^4.2.1"
     esbuild: "npm:^0.24.0"
+    iconify-icon: "npm:^3.0.2"
     lit: "npm:^3.0.0"
     oauth4webapi: "npm:^3.0.0"
     ulidx: "npm:^2.4.1"

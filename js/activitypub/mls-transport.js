@@ -55,6 +55,12 @@ export async function sendEncryptedMessage(actor, ciphertextB64, recipients, con
   if (inReplyTo) message.inReplyTo = inReplyTo;
   else if (contextId) message.inReplyTo = contextId;
 
+  console.log('[sendEncryptedMessage] Sending:', JSON.stringify({
+    type: message.type, to: message.to, attributedTo: message.attributedTo,
+    context: message.context, inReplyTo: message.inReplyTo, isNewThread,
+    hasContent: !!message.content, recipientCount: recipients.length
+  }, null, 2));
+
   const res = await postToOutbox(actor, message);
   if (res && (res.ok === false || res.status >= 400)) {
     throw new Error('Failed to send encrypted message: ' + (res.status || 'unknown status'));
@@ -214,11 +220,15 @@ export async function fetchKeyPackage(actorUri) {
  */
 export function parseMLSActivity(activity) {
   const obj = activity && activity.object ? activity.object : activity;
-  if (!obj || !obj.type) return null;
+  if (!obj || !obj.type) {
+    console.log('[parseMLSActivity] Rejected: no obj or type', { hasObj: !!obj, type: obj?.type, activityType: activity?.type });
+    return null;
+  }
 
   const types = Array.isArray(obj.type) ? obj.type : [obj.type];
 
   if (!obj.content || !obj.encoding || obj.encoding !== 'base64') {
+    console.log('[parseMLSActivity] Rejected: missing content/encoding', { types, hasContent: !!obj.content, encoding: obj.encoding, id: obj.id || activity?.id });
     return null;
   }
 
@@ -228,7 +238,10 @@ export function parseMLSActivity(activity) {
   if (types.includes('Welcome')) type = 'Welcome';
   else if (types.includes('GroupInfo')) type = 'GroupInfo';
   else if (types.includes('PrivateMessage')) type = 'PrivateMessage';
-  else return null;
+  else {
+    console.log('[parseMLSActivity] Rejected: unknown MLS type', { types, id: obj.id || activity?.id });
+    return null;
+  }
 
   return {
     type,
