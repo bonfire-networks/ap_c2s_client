@@ -87,6 +87,7 @@ export async function addMember(userId, groupId, keyPackageBytes) {
   return {
     welcome: base64ToUint8(result.welcome),
     ratchetTree: base64ToUint8(result.ratchetTree),
+    commit: result.commit, // base64 string — passed through as-is to _distributeCommit
   };
 }
 

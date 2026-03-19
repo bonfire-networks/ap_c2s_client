@@ -155,7 +155,10 @@ export class E2EEChatView extends LitElement {
       _membersLoading: { type: Boolean, state: true },
       _highlightedMember: { type: String, state: true },
       _actorProfiles: { type: Object, state: true },
-      _deliveryPanel: { type: Object, state: true }
+      _deliveryPanel: { type: Object, state: true },
+      _addMemberInput: { type: String, state: true },
+      _addMemberLoading: { type: Boolean, state: true },
+      _addMemberError: { type: String, state: true }
     }
   }
 
@@ -175,6 +178,9 @@ export class E2EEChatView extends LitElement {
     this._highlightedMember = null
     this._actorProfiles = new Map()
     this._deliveryPanel = null
+    this._addMemberInput = ''
+    this._addMemberLoading = false
+    this._addMemberError = null
     this._profileLoadPending = new Set()
     this.messages = []
     this.input = ''
@@ -855,6 +861,52 @@ export class E2EEChatView extends LitElement {
     this.shadowRoot.appendChild(panel);
   }
 
+  /**
+   * Shared member card used by both the members panel and the delivery panel.
+   * @param {object} member - entry from _membersData
+   * @param {object} opts
+   * @param {function} [opts.clientAction] - (client) => html — right slot per client row
+   * @param {unknown} [opts.badge] - html shown in header row after name (replaces/alongside You badge)
+   * @param {unknown} [opts.footer] - html shown below all client rows
+   * @param {boolean} [opts.highlight] - whether to apply highlight border
+   */
+  _renderMemberCard(member, { clientAction, badge, footer, highlight = false } = {}) {
+    return html`
+      <div class="card card-bordered mb-3 ${highlight ? 'bg-primary/10 border-primary' : 'bg-base-200'}"
+        data-member-id="${member.identity}">
+        <div class="card-body p-3 gap-2">
+          <div class="flex items-center gap-2">
+            ${this._renderAvatar(member.identity, { size: 24 })}
+            <div class="flex-1 min-w-0">
+              <div class="font-semibold text-sm truncate">${this._getDisplayName(member.identity)}</div>
+              <div class="text-xs opacity-60 truncate">${this.getActorNickname(member.identity)}</div>
+            </div>
+            ${badge ?? (member.isOwn ? html`<span class="badge badge-sm badge-primary">You</span>` : '')}
+          </div>
+          ${member.clients.map(client => html`
+            <div class="flex items-center gap-2 pl-2 py-1 border-l-2 ${client.isCurrentClient ? 'border-primary' : 'border-base-300'}">
+              <span class="text-lg flex-1" title="Emoji fingerprint">
+                ${client.fingerprint.map(e => e.emoji).join(' ')}
+              </span>
+              ${clientAction ? clientAction(client) : ''}
+            </div>
+          `)}
+          ${footer ?? ''}
+        </div>
+      </div>
+    `;
+  }
+
+  _deliveryStatusEmoji(status) {
+    switch (status) {
+      case 'acknowledged': return { emoji: '✅', label: 'Received & decrypted' };
+      case 'failed':       return { emoji: '🟠', label: 'Delivery failed' };
+      case 'keys_broken':  return { emoji: '🔴', label: 'Encryption keys out of sync' };
+      case 'sent':         return { emoji: '📮', label: 'Sent' };
+      default:             return { emoji: '🛫', label: 'Sending…' };
+    }
+  }
+
   _renderDeliveryTicks(deliveryStatus) {
     if (!deliveryStatus) return html`<span title="Sending…">◌</span>`;
     const entries = Object.values(deliveryStatus);
@@ -874,7 +926,9 @@ export class E2EEChatView extends LitElement {
     if (!this._deliveryPanel) return '';
     const { msg } = this._deliveryPanel;
     const ds = msg.deliveryStatus || {};
-    const allFailed = Object.values(ds).length > 0 && Object.values(ds).every(e => e.status === 'failed');
+    const entries = Object.values(ds);
+    const anyKeysBroken = entries.some(e => e.status === 'keys_broken');
+    const allFailed = entries.length > 0 && entries.every(e => e.status === 'failed');
     return html`
       <div class="absolute inset-0 z-50 flex flex-col bg-base-100 text-base-content">
         <div class="flex items-center gap-2 p-3 border-b border-base-300 bg-base-200">
@@ -884,22 +938,46 @@ export class E2EEChatView extends LitElement {
           <span class="font-semibold flex-1">Delivery Status</span>
         </div>
         <div class="flex-1 overflow-y-auto p-3">
-          ${Object.entries(ds).map(([actorId, entry]) => html`
-            <div class="flex items-center gap-3 py-2 border-b border-base-200 last:border-0">
-              ${this._renderUsername(actorId, { classes: 'flex-1' })}
-              <span class="badge badge-sm ${entry.status === 'acknowledged' ? 'badge-success' : entry.status === 'keys_broken' ? 'badge-error' : entry.status === 'failed' ? 'badge-warning' : 'badge-ghost'}">
-                ${entry.status === 'keys_broken' ? 'keys broken' : entry.status}
-              </span>
-              ${entry.status === 'failed' || entry.status === 'keys_broken' ? html`
-                <button class="btn btn-xs btn-outline ${entry.status === 'keys_broken' ? 'btn-error' : 'btn-warning'}"
-                  @click=${() => this.handleRetryForRecipient(msg.id, actorId)}>Retry</button>
-              ` : ''}
-            </div>
-          `)}
+          ${Object.entries(ds).map(([actorId, entry]) => {
+            const { emoji, label } = this._deliveryStatusEmoji(entry.status);
+            const statusBadge = html`
+              <span class="badge badge-sm ${entry.status === 'acknowledged' ? 'badge-success' : entry.status === 'keys_broken' ? 'badge-error' : entry.status === 'failed' ? 'badge-warning' : 'badge-ghost'}"
+                title="${label}">${emoji} ${label}</span>`;
+            const actionFooter = entry.status === 'failed' ? html`
+              <button class="btn btn-xs btn-outline btn-warning btn-block mt-1"
+                @click=${() => this.handleRetryForRecipient(msg.id, actorId)}>Retry</button>
+            ` : entry.status === 'keys_broken' ? html`
+              <p class="text-xs opacity-60 mt-1">Their MLS state is out of sync — retrying won't help.</p>
+              <button class="btn btn-xs btn-error btn-block mt-1" @click=${() => this.handleResetEncryption()}>Reset encryption</button>
+            ` : '';
+            const memberData = this._membersData.find(m => m.identity === actorId);
+            if (memberData) {
+              return this._renderMemberCard(memberData, { badge: statusBadge, footer: actionFooter });
+            }
+            // Fallback if members panel hasn't been opened yet
+            return html`
+              <div class="card card-bordered mb-3 bg-base-200">
+                <div class="card-body p-3 gap-2">
+                  <div class="flex items-center gap-2">
+                    ${this._renderAvatar(actorId, { size: 24 })}
+                    <div class="flex-1 min-w-0">
+                      <div class="font-semibold text-sm truncate">${this._getDisplayName(actorId)}</div>
+                      <div class="text-xs opacity-60 truncate">${this.getActorNickname(actorId)}</div>
+                    </div>
+                    ${statusBadge}
+                  </div>
+                  ${actionFooter}
+                </div>
+              </div>`;
+          })}
         </div>
-        ${allFailed ? html`
+        ${anyKeysBroken ? html`
           <div class="p-3 border-t border-base-300">
-            <button class="btn btn-error btn-sm btn-block" @click=${() => this.handleRetry(msg.id)}>Retry for all</button>
+            <button class="btn btn-error btn-sm btn-block" @click=${() => this.handleResetEncryption()}>Reset encryption for group</button>
+          </div>
+        ` : allFailed ? html`
+          <div class="p-3 border-t border-base-300">
+            <button class="btn btn-warning btn-sm btn-block" @click=${() => this.handleRetry(msg.id)}>Retry for all</button>
           </div>
         ` : ''}
       </div>
@@ -922,54 +1000,59 @@ export class E2EEChatView extends LitElement {
           </button>
         </div>
         <div class="flex-1 overflow-y-auto p-3">
+          <form class="flex gap-2 mb-4" @submit=${async (e) => {
+            e.preventDefault();
+            const val = this._addMemberInput.trim();
+            if (!val) return;
+            this._addMemberLoading = true;
+            this._addMemberError = null;
+            try {
+              await this.chatController.addMemberToGroup(groupId, val);
+              this._addMemberInput = '';
+              await this._loadMembersData();
+            } catch (err) {
+              this._addMemberError = err.message || 'Failed to add member';
+            } finally {
+              this._addMemberLoading = false;
+            }
+          }}>
+            <input type="text" class="input input-bordered input-sm flex-1"
+              placeholder="@user@domain"
+              .value=${this._addMemberInput}
+              @input=${e => { this._addMemberInput = e.target.value; this._addMemberError = null; }} />
+            <button type="submit" class="btn btn-primary btn-sm" ?disabled=${this._addMemberLoading}>
+              ${this._addMemberLoading ? html`<span class="loading loading-spinner loading-xs"></span>` : icon('user-plus', { size: 16 })}
+            </button>
+          </form>
+          ${this._addMemberError ? html`<div class="alert alert-error text-xs py-1 px-2 mb-3">${this._addMemberError}</div>` : ''}
           ${this._membersLoading ? html`
             <div class="flex justify-center py-8"><span class="loading loading-spinner"></span></div>
           ` : this._membersData.length === 0 ? html`
             <div class="text-center opacity-60 py-8">No members found</div>
-          ` : this._membersData.map(member => html`
-            <div class="card card-bordered mb-3 ${this._highlightedMember === member.identity ? 'bg-primary/10 border-primary' : 'bg-base-200'}"
-              data-member-id="${member.identity}">
-              <div class="card-body p-3 gap-2">
-                <div class="flex items-center gap-2">
-                  ${this._renderAvatar(member.identity, { size: 24 })}
-                  <div class="flex-1 min-w-0">
-                    <div class="font-semibold text-sm truncate">${this._getDisplayName(member.identity)}</div>
-                    <div class="text-xs opacity-60 truncate">${this.getActorNickname(member.identity)}</div>
-                  </div>
-                  ${member.isOwn ? html`<span class="badge badge-sm badge-primary">You</span>` : ''}
-                </div>
-                ${member.clients.map(client => html`
-                  <div class="flex items-center gap-2 pl-2 py-1 border-l-2 ${client.isCurrentClient ? 'border-primary' : 'border-base-300'}">
-                    <span class="text-lg flex-1" title="Emoji fingerprint">
-                      ${client.fingerprint.map(e => e.emoji).join(' ')}
-                    </span>
-                    ${client.isCurrentClient ? html`
-                      <span class="badge badge-xs badge-primary gap-1">
-                        ${icon('check', { size: 12 })}
-                        this device
-                      </span>
-                    ` : !member.isOwn ? html`
-                      <button class="btn btn-error btn-outline btn-xs"
-                        @click=${() => this._handleRemoveClient(groupId, client.index)}>
-                        Remove device
-                      </button>
-                    ` : ''}
-                  </div>
-                `)}
-                ${member.isOwn ? html`
-                  <button class="btn btn-ghost btn-xs btn-block mt-1" @click=${() => this._openMyDevicesPanel()}>
-                    Manage my devices
-                    ${icon('caret-right')}
-                  </button>
-                ` : html`
-                  <button class="btn btn-error btn-outline btn-xs btn-block mt-1"
-                    @click=${() => this._handleRemoveMember(groupId, member.identity)}>
-                    Remove member
-                  </button>
-                `}
-              </div>
-            </div>
-          `)}
+          ` : this._membersData.map(member => this._renderMemberCard(member, {
+            highlight: this._highlightedMember === member.identity,
+            clientAction: client => client.isCurrentClient ? html`
+              <span class="badge badge-xs badge-primary gap-1">
+                ${icon('check', { size: 12 })}
+                this device
+              </span>
+            ` : !member.isOwn ? html`
+              <button class="btn btn-error btn-outline btn-xs"
+                @click=${() => this._handleRemoveClient(groupId, client.index)}>
+                Remove device
+              </button>
+            ` : '',
+            footer: member.isOwn ? html`
+              <button class="btn btn-ghost btn-xs btn-block mt-1" @click=${() => this._openMyDevicesPanel()}>
+                Manage my devices ${icon('caret-right')}
+              </button>
+            ` : html`
+              <button class="btn btn-error btn-outline btn-xs btn-block mt-1"
+                @click=${() => this._handleRemoveMember(groupId, member.identity)}>
+                Remove member
+              </button>
+            `
+          }))}
           <details class="mt-4 border-t border-base-300 pt-3">
             <summary class="text-sm cursor-pointer select-none">Advanced</summary>
             <div class="mt-2">
@@ -1059,7 +1142,7 @@ export class E2EEChatView extends LitElement {
             ${msg.id ? html`<a class="link link-hover text-xs" @click=${() => this.handleReply(msg.id)}>reply</a>` : ''}
             ${(msg.isLocal || msg.attributedTo === this.currentActorId) ? html`
               <button class="btn btn-ghost btn-xs p-0"
-                @click=${(e) => { e.stopPropagation(); this._deliveryPanel = { msg }; }}>
+                @click=${(e) => { e.stopPropagation(); this._deliveryPanel = { msg }; this._loadMembersData(); }}>
                 ${this._renderDeliveryTicks(msg.deliveryStatus)}
               </button>
             ` : ''}

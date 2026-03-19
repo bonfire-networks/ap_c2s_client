@@ -269,6 +269,23 @@ export class ChatController {
     await this.storage.setGroupField(groupId, 'name', name);
   }
 
+  /**
+   * Re-read group membership from MLS state and persist.
+   * Called after processing an incoming Commit so stored members stay in sync.
+   */
+  async _syncMembersFromMLS(groupId, actor) {
+    try {
+      const fingerprints = await this.mlsService.getGroupFingerprints(actor.id, groupId);
+      const identities = [...new Set(fingerprints.map(fp => fp.identity).filter(Boolean))];
+      if (identities.length > 0) {
+        const state = (await this.storage.loadGroupMeta(groupId)) || {};
+        await this.storage.saveGroupMeta(groupId, { ...state, members: identities });
+      }
+    } catch (e) {
+      console.warn('[_syncMembersFromMLS] Failed:', e);
+    }
+  }
+
   // ── System messages ───────────────────────────────────
 
   async _insertSystemMessage(groupId, text) {
@@ -638,6 +655,8 @@ export class ChatController {
       return this._handleGroupInfo(groupId, parsed, actor);
     } else if (parsed.type === 'PrivateMessage') {
       return this._handlePrivateMessage(groupId, parsed, actor);
+    } else if (parsed.type === 'PublicMessage') {
+      return this._handlePublicMessage(groupId, parsed, actor);
     }
 
     return null;
@@ -760,10 +779,21 @@ export class ChatController {
       const ciphertext = bytesFromInput(parsed.content);
       const decrypted = await this.mlsService.decrypt(actor.id, groupId, ciphertext);
       console.log('[_handlePrivateMessage] Decrypted:', typeof decrypted, decrypted);
+      // null means a handshake message (Commit/Proposal) — epoch was advanced, sync members
+      if (decrypted === null) {
+        await this._syncMembersFromMLS(groupId, actor);
+        return { type: 'membershipChange', groupId };
+      }
       let decryptedContent = typeof decrypted === 'object' ? decrypted : { content: decrypted };
 
       if (parsed.attributedTo) {
         decryptedContent.attributedTo = parsed.attributedTo;
+      }
+
+      // Route encrypted system/control messages before saving as chat messages
+      if (decryptedContent?.type === 'SystemMessage') {
+        await this._insertSystemMessage(groupId, decryptedContent.content);
+        return { type: 'message', groupId };
       }
 
       // Route encrypted receipts before saving as messages
@@ -994,8 +1024,69 @@ export class ChatController {
     const meta = (await this.storage.loadGroupMeta(groupId)) || {};
     const apId = meta.apId || null;
     if (apId && recipients.length > 0) {
-      await sendMLSControl(actor, 'Commit', commitB64, recipients, apId);
+      await sendMLSControl(actor, 'PrivateMessage', commitB64, recipients, apId);
     }
+  }
+
+  /**
+   * Add a new member to an existing group.
+   * Fetches their KeyPackage, creates an MLS Commit, sends Welcome+GroupInfo
+   * to the new member, and distributes the Commit to existing members.
+   *
+   * @param {string} groupId - group identifier
+   * @param {string} recipientMention - @user@domain or actor URI
+   * @returns {string} resolved actor URI of the added member
+   */
+  async addMemberToGroup(groupId, recipientMention) {
+    const actor = await getCurrentActor();
+    const currentDomain = new URL(actor.id).hostname;
+
+    const recipientUri = await resolveActorId(recipientMention, currentDomain);
+    if (!recipientUri) throw new Error(`Could not resolve ${recipientMention}`);
+
+    const kpBytes = await this.fetchLatestKeyPackage(recipientUri);
+    if (!kpBytes) throw new Error(`No KeyPackage found for ${recipientUri}`);
+
+    const { welcome, ratchetTree, commit } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
+
+    const apId = await this.storage.getGroupApId(groupId);
+
+    // Welcome + GroupInfo (ratchet tree) to the new member
+    await this._sendInvite(actor, groupId, recipientUri, welcome, ratchetTree, apId);
+
+    // Commit to all existing members so their epoch advances
+    const existingMembers = (await this.getGroupMembers(groupId)).filter(id => id !== recipientUri);
+    await this._distributeCommit(actor, groupId, commit, existingMembers);
+
+    // Persist updated member list
+    await this.persistMembers(groupId, [recipientUri]);
+
+    // Send encrypted system message to all members (including new one) announcing the addition
+    const nickname = recipientUri.split('/').pop() || recipientUri;
+    const systemText = `${nickname} was added to the group`;
+    this._transmitEncrypted(groupId, { type: 'SystemMessage', content: systemText });
+    await this._insertSystemMessage(groupId, systemText);
+
+    console.log('[addMemberToGroup] Added', recipientUri, 'to group', groupId);
+    return recipientUri;
+  }
+
+  /**
+   * Process an incoming PublicMessage from another group member.
+   * PublicMessages may carry Commits (epoch advance), Proposals (buffered by
+   * OpenMLS until a Commit references them), or signed application data.
+   * The Rust decrypt command handles all subtypes correctly via process_message().
+   */
+  async _handlePublicMessage(groupId, parsed, actor) {
+    try {
+      const msgBytes = bytesFromInput(parsed.content);
+      // decrypt handles: StagedCommitMessage (merges epoch), ProposalMessage (buffered), ApplicationMessage
+      await this.mlsService.decrypt(actor.id, groupId, msgBytes);
+      console.log('[_handlePublicMessage] Processed public message for group', groupId);
+    } catch (e) {
+      console.warn('[_handlePublicMessage] Failed to process public message:', e);
+    }
+    return null;
   }
 
   /**

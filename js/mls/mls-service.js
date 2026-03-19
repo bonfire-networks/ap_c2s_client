@@ -163,10 +163,10 @@ export class MLSService {
    * @param {string} userId - actor ID of the adder
    * @param {string} groupId - group identifier
    * @param {Uint8Array} keyPackageBytes - new member's key package
-   * @returns {{ welcome: Uint8Array, ratchetTree: Uint8Array }}
+   * @returns {{ welcome: Uint8Array, ratchetTree: Uint8Array, commit: string }}
    */
   async addMember(userId, groupId, keyPackageBytes) {
-    const { welcome, ratchetTree } = await this.backend.addMember(userId, groupId, keyPackageBytes);
+    const { welcome, ratchetTree, commit } = await this.backend.addMember(userId, groupId, keyPackageBytes);
 
     // Save updated group metadata with new ratchet tree and welcome
     const existingState = (await this.storage.loadGroupMeta(groupId)) || {};
@@ -177,7 +177,7 @@ export class MLSService {
     });
 
     await this.persistBackendState(userId);
-    return { welcome, ratchetTree };
+    return { welcome, ratchetTree, commit };
   }
 
   // ── Key packages ───────────────────────────────────────

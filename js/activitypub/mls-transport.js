@@ -238,6 +238,7 @@ export function parseMLSActivity(activity) {
   if (types.includes('Welcome')) type = 'Welcome';
   else if (types.includes('GroupInfo')) type = 'GroupInfo';
   else if (types.includes('PrivateMessage')) type = 'PrivateMessage';
+  else if (types.includes('PublicMessage')) type = 'PublicMessage';
   else {
     console.log('[parseMLSActivity] Rejected: unknown MLS type', { types, id: obj.id || activity?.id });
     return null;
