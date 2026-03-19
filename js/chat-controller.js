@@ -135,11 +135,12 @@ export class ChatController {
     const messages = arr
       .filter(m => !hiddenTypes.includes(m.content?.type))
       .map(m => ({
+        ...m.content,
         id: m.id,
         timestamp: m.timestamp,
         isLocal: m.isLocal,
+        deliveryStatus: m.deliveryStatus || null,
         attributedTo: m.content?.attributedTo,
-        ...m.content
       }));
     console.log('[loadMessages] Mapped messages:', messages.map(m => ({ id: m.id, isLocal: m.isLocal, type: m.type, attributedTo: m.attributedTo })));
 
@@ -386,8 +387,12 @@ export class ChatController {
       const messageApId = extractApIdFromResponse(res);
       const serverContext = res?.object?.context || res?.context;
 
-      // Mark as confirmed with server-assigned apId
-      await this.storage.saveMessage(groupId, msgObj, msgId, true, messageApId || undefined);
+      // Initialize per-recipient delivery status (all 'sent') and confirm the message
+      const otherRecipients = recipients.filter(r => r !== actor.id);
+      const deliveryStatus = otherRecipients.length > 0
+        ? Object.fromEntries(otherRecipients.map(r => [r, { status: 'sent' }]))
+        : null;
+      await this.storage.saveMessage(groupId, msgObj, msgId, true, messageApId || undefined, deliveryStatus);
       console.log('[_transmitEncrypted] Confirmed message:', msgId, 'apId:', messageApId, 'in group:', groupId);
 
       // Mark the activity ID or object ID as processed so pollInbox won't reprocess the echo (inbox items may arrive wrapped in a Create with a different ID than the inner object)
@@ -548,8 +553,8 @@ export class ChatController {
         console.log('[pollInbox] Processing item:', itemId, 'type:', item.type || item.object?.type);
         try {
           const result = await this.handleActivity(item);
+          await this.storage.markProcessed(actor.id, itemId);
           if (result) {
-            await this.storage.markProcessed(actor.id, itemId);
             results.push(result);
           }
         } catch (itemErr) {
@@ -574,6 +579,12 @@ export class ChatController {
    * @returns {{ type: string, groupId: string }|null}
    */
   async handleActivity(activity) {
+    // Ignore receipt (type may be "Ignore" or ["PrivateMessage", "Ignore"]) — handle before MLS parsing
+    const activityTypes = Array.isArray(activity?.type) ? activity.type : [activity?.type];
+    if (activityTypes.includes('Ignore')) {
+      return this._handleIgnoreReceipt(activity);
+    }
+
     const parsed = parseMLSActivity(activity);
     if (!parsed) return null;
 
@@ -755,6 +766,23 @@ export class ChatController {
         decryptedContent.attributedTo = parsed.attributedTo;
       }
 
+      // Route encrypted receipts before saving as messages
+      if (decryptedContent?.type === 'Acknowledge') {
+        return this._handleAcknowledgeReceipt(decryptedContent, parsed);
+      }
+      if (decryptedContent?.type === 'Ignore') {
+        // Encrypted Ignore — their outgoing encryption works, only incoming decryption failed
+        const referencedId = decryptedContent.object;
+        if (referencedId) {
+          const msg = await this.storage.getMessage(referencedId) || await this.storage.getMessageByApId(referencedId);
+          if (msg) {
+            await this.storage.updateDeliveryStatus(msg.id, parsed.attributedTo, { status: 'failed' });
+            return { type: 'receipt', groupId: msg.groupId };
+          }
+        }
+        return null;
+      }
+
       // Use inner ap-mls:// id if present, fall back to outer AP id
       const messageId = decryptedContent.id || outerMessageId;
 
@@ -771,6 +799,9 @@ export class ChatController {
       const messageApId = (messageId !== outerMessageId) ? outerMessageId : undefined;
       await this.storage.saveMessage(groupId, decryptedContent, messageId, false, messageApId);
       console.log('[_handlePrivateMessage] Saved message:', messageId, 'apId:', messageApId, 'in group:', groupId);
+
+      // Send encrypted Acknowledge receipt back to the sender (non-blocking)
+      this._sendAcknowledgeReceipt(groupId, messageId, parsed, actor);
 
       // Store apId mapping if not yet set (context URI → ULID)
       const existingApId = await this.storage.getGroupApId(groupId);
@@ -801,6 +832,11 @@ export class ChatController {
     } catch (e) {
       console.error('[Handler] Failed to decrypt message:', e);
       const errStr = typeof e === 'string' ? e : (e.message || String(e));
+      // MLS can't decrypt messages we sent ourselves — skip silently
+      if (errStr.includes('CannotDecryptOwnMessage')) {
+        console.log('[Handler] Skipping own message (CannotDecryptOwnMessage):', outerMessageId);
+        return { type: 'message', groupId, messageId: outerMessageId, from: parsed.attributedTo };
+      }
       const isAeadError = errStr.includes('AeadError') || errStr.includes('UnableToDecrypt');
       const errorText = isAeadError
         ? 'Message encrypted with old/invalid keys'
@@ -810,6 +846,8 @@ export class ChatController {
         encryptedContent: parsed.content,
         attributedTo: parsed.attributedTo
       }, outerMessageId, false);
+      // Send plaintext Ignore receipt so sender knows decryption failed (non-blocking)
+      if (parsed.attributedTo) this._sendIgnoreReceipt(outerMessageId, parsed, actor);
     }
 
     return { type: 'message', groupId, messageId: outerMessageId, from: parsed.attributedTo };
@@ -1016,6 +1054,124 @@ export class ChatController {
 
     await deleteKeyPackage(actor, signatureKeyB64);
     return { cancelled: false };
+  }
+
+  // ── Delivery receipts ──────────────────────────────────
+
+  /**
+   * Encrypt a receipt payload and send it as a PrivateMessage.
+   * `extraFields` are merged into the outer AP activity (e.g. for type arrays or plaintext object).
+   * Fire-and-forget.
+   */
+  _sendEncryptedReceipt(groupId, payload, recipients, contextId, inReplyTo, extraFields = {}) {
+    (async () => {
+      try {
+        const actor = await getCurrentActor();
+        const ciphertext = await this.mlsService.encrypt(actor.id, groupId, payload);
+        const ciphertextB64 = bytesToBase64(new Uint8Array(ciphertext));
+        await sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, { inReplyTo, ...extraFields });
+        console.log('[receipt] Sent', payload.type, 'for:', payload.object);
+      } catch (e) {
+        console.warn('[receipt] Failed to send', payload.type, ':', e.message || e);
+      }
+    })();
+  }
+
+  /** Send an encrypted Acknowledge receipt back to the original sender. */
+  _sendAcknowledgeReceipt(groupId, innerMessageId, parsed, _actor) {
+    const contextId = parsed.context;
+    this._sendEncryptedReceipt(
+      groupId,
+      { type: 'Acknowledge', object: innerMessageId, timestamp: Date.now() },
+      [parsed.attributedTo],
+      contextId,
+      parsed.id
+    );
+  }
+
+  /**
+   * Send an Ignore receipt when decryption fails.
+   * type: ["PrivateMessage", "Ignore"] so the server routes it and clients can identify
+   * it without decrypting. Also carries an encrypted payload for clients that can decrypt.
+   */
+  _sendIgnoreReceipt(outerMessageId, parsed, _actor) {
+    (async () => {
+      try {
+        const groupId = await this.storage.getGroupByField('apId', parsed.context);
+        if (groupId) {
+          this._sendEncryptedReceipt(
+            groupId,
+            { type: 'Ignore', object: outerMessageId, timestamp: Date.now() },
+            Array.isArray(parsed.to) ? parsed.to : [parsed.attributedTo],
+            parsed.context,
+            parsed.id,
+            { type: ['PrivateMessage', 'Ignore'], object: outerMessageId }  // plaintext fallback fields
+          );
+        } else {
+          // No group found — send plaintext-only Ignore
+          const actor = await getCurrentActor();
+          postToOutbox(actor, {
+            type: ['PrivateMessage', 'Ignore'],
+            attributedTo: actor.id,
+            to: Array.isArray(parsed.to) ? parsed.to : [parsed.attributedTo],
+            object: outerMessageId
+          });
+          console.log('[receipt] Sent plaintext Ignore (no group) for:', outerMessageId);
+        }
+      } catch (e) {
+        console.warn('[receipt] Failed to send Ignore:', e.message || e);
+      }
+    })();
+  }
+
+  /** Handle incoming encrypted Acknowledge — update delivery status on the referenced message. */
+  async _handleAcknowledgeReceipt(decryptedContent, parsed) {
+    const referencedId = decryptedContent.object;
+    if (!referencedId) return null;
+    const msg = await this.storage.getMessage(referencedId) || await this.storage.getMessageByApId(referencedId);
+    if (msg) {
+      await this.storage.updateDeliveryStatus(msg.id, parsed.attributedTo, { status: 'acknowledged' });
+      console.log('[receipt] Acknowledged by', parsed.attributedTo, 'for message:', msg.id);
+      return { type: 'receipt', groupId: msg.groupId };
+    }
+    return null;
+  }
+
+  /**
+   * Handle incoming Ignore receipt.
+   * Decrypts the payload when possible (confirms encryption works in the other direction).
+   * Falls back to the plaintext `object` field for message lookup.
+   */
+  async _handleIgnoreReceipt(activity) {
+    const fromActorId = activity.attributedTo || activity.actor;
+    if (!fromActorId) return null;
+
+    let referencedId = activity.object;
+    // Assume keys_broken until we successfully decrypt the encrypted payload
+    let deliveryStatus = 'keys_broken';
+
+    if (activity.content && activity.encoding === 'base64') {
+      try {
+        const actor = await getCurrentActor();
+        const ciphertext = bytesFromInput(activity.content);
+        const groupId = await this.storage.getGroupByField('apId', activity.context);
+        if (groupId) {
+          const decrypted = await this.mlsService.decrypt(actor.id, groupId, ciphertext);
+          const inner = typeof decrypted === 'object' ? decrypted : null;
+          if (inner?.object) referencedId = inner.object;
+          deliveryStatus = 'failed'; // encrypted Ignore — only their incoming decryption failed
+        }
+      } catch {}
+    }
+
+    if (!referencedId) return null;
+    const msg = await this.storage.getMessage(referencedId) || await this.storage.getMessageByApId(referencedId);
+    if (msg) {
+      await this.storage.updateDeliveryStatus(msg.id, fromActorId, { status: deliveryStatus });
+      console.log('[receipt] Ignore from', fromActorId, 'status:', deliveryStatus, 'for message:', msg.id);
+      return { type: 'receipt', groupId: msg.groupId };
+    }
+    return null;
   }
 
   // ── Helpers ────────────────────────────────────────────

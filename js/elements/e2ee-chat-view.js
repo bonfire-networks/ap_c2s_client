@@ -1,4 +1,5 @@
 import { html, css, LitElement } from 'lit'
+import { relativeTime } from '../utils.js'
 import { ChatController, EncryptionLostError } from '../chat-controller.js'
 import { MLSService } from '../mls/mls-service.js'
 import * as storage from '../storage/indexeddb-storage.js'
@@ -116,7 +117,7 @@ export class E2EEChatView extends LitElement {
       transition: opacity 0.15s;
       padding-bottom: 0.25rem;
     }
-    .thread-node:hover > .msg-actions,
+    .thread-node:hover .msg-actions,
     .msg-actions:hover {
       opacity: 1;
     }
@@ -153,7 +154,8 @@ export class E2EEChatView extends LitElement {
       _membersData: { type: Array, state: true },
       _membersLoading: { type: Boolean, state: true },
       _highlightedMember: { type: String, state: true },
-      _actorProfiles: { type: Object, state: true }
+      _actorProfiles: { type: Object, state: true },
+      _deliveryPanel: { type: Object, state: true }
     }
   }
 
@@ -172,6 +174,7 @@ export class E2EEChatView extends LitElement {
     this._membersLoading = false
     this._highlightedMember = null
     this._actorProfiles = new Map()
+    this._deliveryPanel = null
     this._profileLoadPending = new Set()
     this.messages = []
     this.input = ''
@@ -529,6 +532,11 @@ export class E2EEChatView extends LitElement {
     this.loading = false;
   }
 
+  async handleRetryForRecipient(messageId, _actorId) {
+    // Resend to all — recipients who already acknowledged will re-send Acknowledge (idempotent)
+    return this.handleRetry(messageId);
+  }
+
   async handleRetry(messageId) {
     try {
       await this.controller.retrySendMessage(messageId);
@@ -847,6 +855,57 @@ export class E2EEChatView extends LitElement {
     this.shadowRoot.appendChild(panel);
   }
 
+  _renderDeliveryTicks(deliveryStatus) {
+    if (!deliveryStatus) return html`<span title="Sending…">◌</span>`;
+    const entries = Object.values(deliveryStatus);
+    if (entries.length === 0) return html`<span title="Sending…">🔄</span>`;
+    const anyKeysBroken = entries.some(e => e.status === 'keys_broken');
+    const anyFailed = entries.some(e => e.status === 'failed' || e.status === 'keys_broken');
+    const allAcked = entries.every(e => e.status === 'acknowledged');
+    const allSent = entries.every(e => e.status === 'sent');
+    if (anyKeysBroken) return html`<span title="Keys broken">🔴</span>`;
+    if (anyFailed) return html`<span title="Delivery failed">🟡</span>`;
+    if (allAcked) return html`<span title="Received & decrypted">✅</span>`;
+    if (allSent) return html`<span title="Sent">◯</span>`;
+    return html`<span title="Partially received">✅🔴</span>`;
+  }
+
+  _renderDeliveryPanel() {
+    if (!this._deliveryPanel) return '';
+    const { msg } = this._deliveryPanel;
+    const ds = msg.deliveryStatus || {};
+    const allFailed = Object.values(ds).length > 0 && Object.values(ds).every(e => e.status === 'failed');
+    return html`
+      <div class="absolute inset-0 z-50 flex flex-col bg-base-100 text-base-content">
+        <div class="flex items-center gap-2 p-3 border-b border-base-300 bg-base-200">
+          <button class="btn btn-ghost btn-sm btn-square" @click=${() => { this._deliveryPanel = null; }}>
+            ${icon('arrow-left', { size: 20 })}
+          </button>
+          <span class="font-semibold flex-1">Delivery Status</span>
+        </div>
+        <div class="flex-1 overflow-y-auto p-3">
+          ${Object.entries(ds).map(([actorId, entry]) => html`
+            <div class="flex items-center gap-3 py-2 border-b border-base-200 last:border-0">
+              ${this._renderUsername(actorId, { classes: 'flex-1' })}
+              <span class="badge badge-sm ${entry.status === 'acknowledged' ? 'badge-success' : entry.status === 'keys_broken' ? 'badge-error' : entry.status === 'failed' ? 'badge-warning' : 'badge-ghost'}">
+                ${entry.status === 'keys_broken' ? 'keys broken' : entry.status}
+              </span>
+              ${entry.status === 'failed' || entry.status === 'keys_broken' ? html`
+                <button class="btn btn-xs btn-outline ${entry.status === 'keys_broken' ? 'btn-error' : 'btn-warning'}"
+                  @click=${() => this.handleRetryForRecipient(msg.id, actorId)}>Retry</button>
+              ` : ''}
+            </div>
+          `)}
+        </div>
+        ${allFailed ? html`
+          <div class="p-3 border-t border-base-300">
+            <button class="btn btn-error btn-sm btn-block" @click=${() => this.handleRetry(msg.id)}>Retry for all</button>
+          </div>
+        ` : ''}
+      </div>
+    `;
+  }
+
   _renderMembersPanel() {
     if (!this.showMembersPanel) return '';
     const groupId = this.selectedGroupId;
@@ -996,8 +1055,15 @@ export class E2EEChatView extends LitElement {
             ` : ''}
             ${!hasSummary || showContent ? html`<div>${msg && msg.content}</div>` : ''}
           </div>
-          <div class="msg-actions">
-            ${msg.id ? html`<a class="link link-hover" @click=${() => this.handleReply(msg.id)}>reply</a>` : ''}
+          <div class="msg-actions flex items-center gap-2">
+            ${msg.id ? html`<a class="link link-hover text-xs" @click=${() => this.handleReply(msg.id)}>reply</a>` : ''}
+            ${(msg.isLocal || msg.attributedTo === this.currentActorId) ? html`
+              <button class="btn btn-ghost btn-xs p-0"
+                @click=${(e) => { e.stopPropagation(); this._deliveryPanel = { msg }; }}>
+                ${this._renderDeliveryTicks(msg.deliveryStatus)}
+              </button>
+            ` : ''}
+            ${msg.timestamp ? html`<span class="text-xs opacity-40" title=${new Date(msg.timestamp).toLocaleString()}>${relativeTime(msg.timestamp)}</span>` : ''}
           </div>
           ${hasReplies ? html`
             <div class="thread-children">
@@ -1014,6 +1080,7 @@ export class E2EEChatView extends LitElement {
     this.error = '';
     this.creatingNewGroup = false;
     this.showMembersPanel = false;
+    this._deliveryPanel = null;
     this.loadMessages(groupId);
     if (!this._isWide) this.sidebarOpen = false;
   }
@@ -1064,6 +1131,7 @@ export class E2EEChatView extends LitElement {
 
         <div class="drawer-content flex">
           <div class="messages-pane bg-base-100">
+            ${this._renderDeliveryPanel()}
             ${this._renderMembersPanel()}
             ${this.selectedGroupId && !this.creatingNewGroup ? html`
               <div class="px-3 py-2 border-b border-base-300 bg-base-200 flex items-center gap-2">

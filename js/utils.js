@@ -110,3 +110,11 @@ export function base64ToUint8(b64) {
 
 export function groupUri(id = ulid())   { return `mls://g/${id}`; }
 export function messageUri(id = ulid()) { return `mls://m/${id}`; }
+
+export function relativeTime(ts) {
+  const diff = Date.now() - ts;
+  if (diff < 60000) return 'just now';
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+  return new Date(ts).toLocaleDateString();
+}

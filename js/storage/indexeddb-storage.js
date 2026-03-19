@@ -102,11 +102,12 @@ export async function listGroupsWithLastMessage() {
 // Messages
 // ──────────────────────────────────────────────
 
-export async function saveMessage(groupId, content, id = undefined, isLocal = false, apId = undefined) {
+export async function saveMessage(groupId, content, id = undefined, isLocal = false, apId = undefined, deliveryStatus = undefined) {
   const messageId = id || messageUri();
   const timestamp = (content && content.timestamp) || Date.now();
   const rec = { id: messageId, groupId, isLocal, content, timestamp };
   if (apId) rec.apId = apId;
+  if (deliveryStatus) rec.deliveryStatus = deliveryStatus;
   await db.table('messages').put(rec);
   return messageId;
 }
@@ -123,7 +124,14 @@ export async function getMessageByApId(apId) {
 
 export async function listMessages(groupId) {
   const msgs = await db.table('messages').where('groupId').equals(groupId).sortBy('timestamp');
-  return msgs.map(m => ({ id: m.id, groupId: m.groupId, isLocal: m.isLocal, content: m.content, timestamp: m.timestamp }));
+  return msgs.map(m => ({ id: m.id, groupId: m.groupId, isLocal: m.isLocal, content: m.content, timestamp: m.timestamp, deliveryStatus: m.deliveryStatus || null }));
+}
+
+export async function updateDeliveryStatus(messageId, actorId, statusEntry) {
+  const rec = await db.table('messages').get(messageId);
+  if (!rec) return;
+  const current = rec.deliveryStatus || {};
+  await db.table('messages').put({ ...rec, deliveryStatus: { ...current, [actorId]: statusEntry } });
 }
 
 export async function findLastMessageExcludingTypes(groupId, excludedTypes) {
