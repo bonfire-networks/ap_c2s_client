@@ -103,6 +103,10 @@ export async function removeGroupMember(userId, groupId, memberId) {
   });
 }
 
+export async function getGroupMemberIdentities(groupId) {
+  return await invoke('plugin:openmls|get_group_member_identities', { groupId });
+}
+
 export async function exportRatchetTree(userId, groupId) {
   const b64 = await invoke('plugin:openmls|export_ratchet_tree', { userId, groupId });
   return base64ToUint8(b64);

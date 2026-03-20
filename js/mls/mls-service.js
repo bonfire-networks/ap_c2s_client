@@ -283,6 +283,10 @@ export class MLSService {
     return await this.backend.clearAllData(userId);
   }
 
+  async getGroupMemberIdentities(groupId) {
+    return await this.backend.getGroupMemberIdentities(groupId);
+  }
+
   async getGroupFingerprints(userId, groupId) {
     return await this.backend.getGroupFingerprints(userId, groupId);
   }

@@ -1058,7 +1058,7 @@ export class E2EEChatView extends LitElement {
                 ${icon('check', { size: 12 })}
                 this device
               </span>
-            ` : !member.isOwn ? html`
+            ` : (!member.isOwn && member.clients.length > 1) ? html`
               <button class="btn btn-error btn-outline btn-xs"
                 @click=${() => this._handleRemoveClient(groupId, client.index)}>
                 Remove device
