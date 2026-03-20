@@ -277,9 +277,26 @@ export class ChatController {
     try {
       const fingerprints = await this.mlsService.getGroupFingerprints(actor.id, groupId);
       const identities = [...new Set(fingerprints.map(fp => fp.identity).filter(Boolean))];
-      if (identities.length > 0) {
-        const state = (await this.storage.loadGroupMeta(groupId)) || {};
-        await this.storage.saveGroupMeta(groupId, { ...state, members: identities });
+      if (identities.length === 0) return;
+      const state = (await this.storage.loadGroupMeta(groupId)) || {};
+      const previous = new Set(state.members || []);
+      await this.storage.saveGroupMeta(groupId, { ...state, members: identities });
+      // Only insert system messages if we had a known member list to diff against
+      if (previous.size === 0) return;
+      const current = new Set(identities);
+      for (const id of identities) {
+        if (!previous.has(id) && id !== actor.id) {
+          const profile = await this.storage.loadUserState(id);
+          const nickname = profile?.preferredUsername || id.split('/').pop() || id;
+          await this._insertSystemMessage(groupId, `${nickname} was added to the group`);
+        }
+      }
+      for (const id of previous) {
+        if (!current.has(id) && id !== actor.id) {
+          const profile = await this.storage.loadUserState(id);
+          const nickname = profile?.preferredUsername || id.split('/').pop() || id;
+          await this._insertSystemMessage(groupId, `${nickname} was removed from the group`);
+        }
       }
     } catch (e) {
       console.warn('[_syncMembersFromMLS] Failed:', e);
@@ -596,10 +613,11 @@ export class ChatController {
    * @returns {{ type: string, groupId: string }|null}
    */
   async handleActivity(activity) {
-    // Ignore receipt (type may be "Ignore" or ["PrivateMessage", "Ignore"]) — handle before MLS parsing
-    const activityTypes = Array.isArray(activity?.type) ? activity.type : [activity?.type];
-    if (activityTypes.includes('Ignore')) {
-      return this._handleIgnoreReceipt(activity);
+    // Failure receipt (type may be "Failure" or ["PrivateMessage", "Failure"], possibly wrapped in Create)
+    const obj = activity?.object || activity;
+    const objTypes = Array.isArray(obj?.type) ? obj.type : [obj?.type];
+    if (objTypes.includes('Failure')) {
+      return this._handleFailureReceipt(obj);
     }
 
     const parsed = parseMLSActivity(activity);
@@ -790,18 +808,12 @@ export class ChatController {
         decryptedContent.attributedTo = parsed.attributedTo;
       }
 
-      // Route encrypted system/control messages before saving as chat messages
-      if (decryptedContent?.type === 'SystemMessage') {
-        await this._insertSystemMessage(groupId, decryptedContent.content);
-        return { type: 'message', groupId };
-      }
-
       // Route encrypted receipts before saving as messages
       if (decryptedContent?.type === 'Acknowledge') {
         return this._handleAcknowledgeReceipt(decryptedContent, parsed);
       }
-      if (decryptedContent?.type === 'Ignore') {
-        // Encrypted Ignore — their outgoing encryption works, only incoming decryption failed
+      if (decryptedContent?.type === 'Failure') {
+        // Encrypted Failure — their outgoing encryption works, only incoming decryption failed
         const referencedId = decryptedContent.object;
         if (referencedId) {
           const msg = await this.storage.getMessage(referencedId) || await this.storage.getMessageByApId(referencedId);
@@ -876,8 +888,8 @@ export class ChatController {
         encryptedContent: parsed.content,
         attributedTo: parsed.attributedTo
       }, outerMessageId, false);
-      // Send plaintext Ignore receipt so sender knows decryption failed (non-blocking)
-      if (parsed.attributedTo) this._sendIgnoreReceipt(outerMessageId, parsed, actor);
+      // Send plaintext Failure receipt so sender knows decryption failed (non-blocking)
+      if (parsed.attributedTo) this._sendFailureReceipt(outerMessageId, parsed, actor);
     }
 
     return { type: 'message', groupId, messageId: outerMessageId, from: parsed.attributedTo };
@@ -1058,14 +1070,11 @@ export class ChatController {
     const existingMembers = (await this.getGroupMembers(groupId)).filter(id => id !== recipientUri);
     await this._distributeCommit(actor, groupId, commit, existingMembers);
 
-    // Persist updated member list
+    // Persist updated member list — each client inserts a local system message when they process the Commit
     await this.persistMembers(groupId, [recipientUri]);
-
-    // Send encrypted system message to all members (including new one) announcing the addition
-    const nickname = recipientUri.split('/').pop() || recipientUri;
-    const systemText = `${nickname} was added to the group`;
-    this._transmitEncrypted(groupId, { type: 'SystemMessage', content: systemText });
-    await this._insertSystemMessage(groupId, systemText);
+    const profile = await this.storage.loadUserState(recipientUri);
+    const nickname = profile?.preferredUsername || recipientUri.split('/').pop() || recipientUri;
+    await this._insertSystemMessage(groupId, `${nickname} was added to the group`);
 
     console.log('[addMemberToGroup] Added', recipientUri, 'to group', groupId);
     return recipientUri;
@@ -1118,6 +1127,9 @@ export class ChatController {
     const remaining = (await this.getGroupMembers(groupId)).filter(id => id !== actorIdentity);
     await this.persistMembers(groupId, remaining);
     await this._distributeCommit(actor, groupId, result.commit, remaining);
+    const profile = await this.storage.loadUserState(actorIdentity);
+    const nickname = profile?.preferredUsername || actorIdentity.split('/').pop() || actorIdentity;
+    await this._insertSystemMessage(groupId, `${nickname} was removed from the group`);
     return result;
   }
 
@@ -1154,13 +1166,13 @@ export class ChatController {
    * `extraFields` are merged into the outer AP activity (e.g. for type arrays or plaintext object).
    * Fire-and-forget.
    */
-  _sendEncryptedReceipt(groupId, payload, recipients, contextId, inReplyTo, extraFields = {}) {
+  _sendEncryptedReceipt(groupId, payload, recipients, contextId, inReplyTo, overrides = {}) {
     (async () => {
       try {
         const actor = await getCurrentActor();
         const ciphertext = await this.mlsService.encrypt(actor.id, groupId, payload);
         const ciphertextB64 = bytesToBase64(new Uint8Array(ciphertext));
-        await sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, { inReplyTo, ...extraFields });
+        await sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, { inReplyTo, overrides });
         console.log('[receipt] Sent', payload.type, 'for:', payload.object);
       } catch (e) {
         console.warn('[receipt] Failed to send', payload.type, ':', e.message || e);
@@ -1181,36 +1193,36 @@ export class ChatController {
   }
 
   /**
-   * Send an Ignore receipt when decryption fails.
-   * type: ["PrivateMessage", "Ignore"] so the server routes it and clients can identify
+   * Send an Failure receipt when decryption fails.
+   * type: ["PrivateMessage", "Failure"] so the server routes it and clients can identify
    * it without decrypting. Also carries an encrypted payload for clients that can decrypt.
    */
-  _sendIgnoreReceipt(outerMessageId, parsed, _actor) {
+  _sendFailureReceipt(outerMessageId, parsed, _actor) {
     (async () => {
       try {
         const groupId = await this.storage.getGroupByField('apId', parsed.context);
         if (groupId) {
           this._sendEncryptedReceipt(
             groupId,
-            { type: 'Ignore', object: outerMessageId, timestamp: Date.now() },
-            Array.isArray(parsed.to) ? parsed.to : [parsed.attributedTo],
+            { type: 'Failure', object: outerMessageId, timestamp: Date.now() },
+            [parsed.attributedTo],
             parsed.context,
             parsed.id,
-            { type: ['PrivateMessage', 'Ignore'], object: outerMessageId }  // plaintext fallback fields
+            { type: ['PrivateMessage', 'Failure'], target: outerMessageId }  // plaintext fallback fields
           );
         } else {
-          // No group found — send plaintext-only Ignore
+          // No group found — send plaintext-only Failure
           const actor = await getCurrentActor();
-          postToOutbox(actor, {
-            type: ['PrivateMessage', 'Ignore'],
+          await postToOutbox(actor, {
+            type: ['PrivateMessage', 'Failure'],
             attributedTo: actor.id,
-            to: Array.isArray(parsed.to) ? parsed.to : [parsed.attributedTo],
-            object: outerMessageId
+            to: [parsed.attributedTo],
+            target: outerMessageId
           });
-          console.log('[receipt] Sent plaintext Ignore (no group) for:', outerMessageId);
+          console.log('[receipt] Sent plaintext Failure (no group) for:', outerMessageId);
         }
       } catch (e) {
-        console.warn('[receipt] Failed to send Ignore:', e.message || e);
+        console.warn('[receipt] Failed to send Failure:', e.message || e);
       }
     })();
   }
@@ -1229,15 +1241,15 @@ export class ChatController {
   }
 
   /**
-   * Handle incoming Ignore receipt.
-   * Decrypts the payload when possible (confirms encryption works in the other direction).
+   * Handle incoming Failure receipt.
+   * Decrypts the Failure when possible (confirms encryption works in the other direction).
    * Falls back to the plaintext `object` field for message lookup.
    */
-  async _handleIgnoreReceipt(activity) {
+  async _handleFailureReceipt(activity) {
     const fromActorId = activity.attributedTo || activity.actor;
     if (!fromActorId) return null;
 
-    let referencedId = activity.object;
+    let referencedId = activity.target || activity.object;
     // Assume keys_broken until we successfully decrypt the encrypted payload
     let deliveryStatus = 'keys_broken';
 
@@ -1250,7 +1262,7 @@ export class ChatController {
           const decrypted = await this.mlsService.decrypt(actor.id, groupId, ciphertext);
           const inner = typeof decrypted === 'object' ? decrypted : null;
           if (inner?.object) referencedId = inner.object;
-          deliveryStatus = 'failed'; // encrypted Ignore — only their incoming decryption failed
+          deliveryStatus = 'failed'; // encrypted Failure — only their incoming decryption failed
         }
       } catch {}
     }
@@ -1259,7 +1271,7 @@ export class ChatController {
     const msg = await this.storage.getMessage(referencedId) || await this.storage.getMessageByApId(referencedId);
     if (msg) {
       await this.storage.updateDeliveryStatus(msg.id, fromActorId, { status: deliveryStatus });
-      console.log('[receipt] Ignore from', fromActorId, 'status:', deliveryStatus, 'for message:', msg.id);
+      console.log('[receipt] Failure from', fromActorId, 'status:', deliveryStatus, 'for message:', msg.id);
       return { type: 'receipt', groupId: msg.groupId };
     }
     return null;

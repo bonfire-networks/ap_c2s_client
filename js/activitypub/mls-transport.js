@@ -30,7 +30,7 @@ const MLS_CONTEXTS = [
  * @returns {object} response from outbox
  */
 export async function sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, options = {}) {
-  const { isNewThread, inReplyTo } = options;
+  const { isNewThread, inReplyTo, overrides = {} } = options;
 
   let to;
   if (isNewThread) {
@@ -49,6 +49,7 @@ export async function sendEncryptedMessage(actor, ciphertextB64, recipients, con
     mediaType: 'message/mls',
     encoding: 'base64',
     content: ciphertextB64,
+    ...overrides,
   };
   // Only include context/inReplyTo when they're actual AP URIs (not local ULIDs)
   if (contextId) message.context = contextId;

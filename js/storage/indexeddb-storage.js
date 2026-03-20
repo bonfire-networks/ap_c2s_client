@@ -6,33 +6,46 @@
 import { Dexie } from 'dexie';
 import { messageUri } from '../utils.js';
 
-const DB_NAME = 'openmls-db';
+function _openDb(dbName) {
+  const instance = new Dexie(dbName);
+  instance.version(1).stores({
+    groups: 'id',
+    users: 'id',
+    messages: 'id, groupId, timestamp, isLocal',
+    processedActivityIds: '++id, actorId, activityId'
+  });
+  instance.version(2).stores({
+    groups: 'id, apId',
+    users: 'id',
+    messages: 'id, groupId, timestamp, isLocal',
+    processedActivityIds: '++id, actorId, activityId'
+  });
+  instance.version(3).stores({
+    groups: 'id, apId',
+    users: 'id',
+    messages: 'id, groupId, timestamp, isLocal',
+    processedActivityIds: '++id, [actorId+activityId]'
+  });
+  instance.version(4).stores({
+    groups: 'id, apId',
+    users: 'id',
+    messages: 'id, groupId, timestamp, isLocal, apId',
+    processedActivityIds: '++id, [actorId+activityId]'
+  });
+  return instance;
+}
 
-const db = new Dexie(DB_NAME);
-db.version(1).stores({
-  groups: 'id',
-  users: 'id',
-  messages: 'id, groupId, timestamp, isLocal',
-  processedActivityIds: '++id, actorId, activityId'
-});
-db.version(2).stores({
-  groups: 'id, apId',
-  users: 'id',
-  messages: 'id, groupId, timestamp, isLocal',
-  processedActivityIds: '++id, actorId, activityId'
-});
-db.version(3).stores({
-  groups: 'id, apId',
-  users: 'id',
-  messages: 'id, groupId, timestamp, isLocal',
-  processedActivityIds: '++id, [actorId+activityId]'
-});
-db.version(4).stores({
-  groups: 'id, apId',
-  users: 'id',
-  messages: 'id, groupId, timestamp, isLocal, apId',
-  processedActivityIds: '++id, [actorId+activityId]'
-});
+// Per-actor DB instance — initialised by initForActor() before any storage calls
+let db = _openDb('openmls-db'); // fallback so module-level code doesn't crash
+
+/**
+ * Switch to a per-actor database. Must be called before any storage operations.
+ * Uses a sanitised actor ID as part of the DB name so each user gets isolated storage.
+ */
+export function initForActor(actorId) {
+  const safe = actorId.replace(/[^a-zA-Z0-9._-]/g, '_');
+  db = _openDb(`openmls-db-${safe}`);
+}
 
 // ──────────────────────────────────────────────
 // Internal helpers

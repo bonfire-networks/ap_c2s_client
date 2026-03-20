@@ -40,13 +40,16 @@ export class E2EEChatView extends LitElement {
       display: flex;
       flex-direction: column;
       min-width: 0;
+      min-height: 0;
       flex: 1;
-      height: 100%;
       position: relative;
     }
     .drawer-content {
       min-width: 0;
+      min-height: 0;
       flex: 1;
+      display: flex;
+      overflow: hidden;
     }
     .messages-list {
       flex: 1;
@@ -230,6 +233,10 @@ export class E2EEChatView extends LitElement {
       const backend = useTauri
         ? await import('../mls/openmls-tauri/tauri-backend.js')
         : await import('../mls/openmls-wasm/openmls-backend.js');
+      // Isolate storage per actor so switching accounts doesn't leak data
+      const actorId = localStorage.getItem('actor_id');
+      if (actorId) storage.initForActor(actorId);
+
       const mlsService = new MLSService(backend, storage);
       // console.log('[ChatView] MLSService initialized with backend:', mlsService);
       this.controller = new ChatController(mlsService, storage);
@@ -315,6 +322,12 @@ export class E2EEChatView extends LitElement {
             }
           }, 500);
         });
+
+        // When SSE reconnects after a drop, poll inbox to catch any missed messages
+        this._unlistenSseReconnected = await window.__TAURI__.event.listen('sse-reconnected', () => {
+          console.log('[SSE] Reconnected — polling inbox for missed messages');
+          this.pollInbox();
+        });
       }
     } catch (e) {
       this.error = e.message;
@@ -326,6 +339,9 @@ export class E2EEChatView extends LitElement {
     delete window.navigateToGroup;
     if (this._unlistenNewMessage) {
       this._unlistenNewMessage();
+    }
+    if (this._unlistenSseReconnected) {
+      this._unlistenSseReconnected();
     }
     if (this.inboxPollingInterval) {
       clearInterval(this.inboxPollingInterval);
@@ -393,6 +409,9 @@ export class E2EEChatView extends LitElement {
           const affected = results.find(r => r.groupId === this.selectedGroupId);
           if (affected) {
             await this.loadMessages(this.selectedGroupId);
+            if (affected.type === 'membershipChange') {
+              await this._loadMembersData();
+            }
           }
         }
       }
@@ -908,18 +927,22 @@ export class E2EEChatView extends LitElement {
   }
 
   _renderDeliveryTicks(deliveryStatus) {
-    if (!deliveryStatus) return html`<span title="Sending…">◌</span>`;
+    const s = (status) => { const { emoji, label } = this._deliveryStatusEmoji(status); return html`<span title="${label}">${emoji}</span>`; };
+    if (!deliveryStatus) return s();
     const entries = Object.values(deliveryStatus);
-    if (entries.length === 0) return html`<span title="Sending…">🔄</span>`;
+    if (entries.length === 0) return s();
     const anyKeysBroken = entries.some(e => e.status === 'keys_broken');
-    const anyFailed = entries.some(e => e.status === 'failed' || e.status === 'keys_broken');
+    const anyFailed = entries.some(e => e.status === 'failed');
     const allAcked = entries.every(e => e.status === 'acknowledged');
     const allSent = entries.every(e => e.status === 'sent');
-    if (anyKeysBroken) return html`<span title="Keys broken">🔴</span>`;
-    if (anyFailed) return html`<span title="Delivery failed">🟡</span>`;
-    if (allAcked) return html`<span title="Received & decrypted">✅</span>`;
-    if (allSent) return html`<span title="Sent">◯</span>`;
-    return html`<span title="Partially received">✅🔴</span>`;
+    if (anyKeysBroken) return s('keys_broken');
+    if (anyFailed) return s('failed');
+    if (allAcked) return s('acknowledged');
+    if (allSent) return s('sent');
+    // Mixed: some acked, some not yet
+    const { emoji: ackEmoji } = this._deliveryStatusEmoji('acknowledged');
+    const { emoji: sentEmoji, label } = this._deliveryStatusEmoji('sent');
+    return html`<span title="Partially received — ${label}">${ackEmoji}${sentEmoji}</span>`;
   }
 
   _renderDeliveryPanel() {
@@ -947,7 +970,6 @@ export class E2EEChatView extends LitElement {
               <button class="btn btn-xs btn-outline btn-warning btn-block mt-1"
                 @click=${() => this.handleRetryForRecipient(msg.id, actorId)}>Retry</button>
             ` : entry.status === 'keys_broken' ? html`
-              <p class="text-xs opacity-60 mt-1">Their MLS state is out of sync — retrying won't help.</p>
               <button class="btn btn-xs btn-error btn-block mt-1" @click=${() => this.handleResetEncryption()}>Reset encryption</button>
             ` : '';
             const memberData = this._membersData.find(m => m.identity === actorId);
@@ -1007,9 +1029,9 @@ export class E2EEChatView extends LitElement {
             this._addMemberLoading = true;
             this._addMemberError = null;
             try {
-              await this.chatController.addMemberToGroup(groupId, val);
+              await this.controller.addMemberToGroup(groupId, val);
               this._addMemberInput = '';
-              await this._loadMembersData();
+              await Promise.all([this._loadMembersData(), this.loadMessages(groupId)]);
             } catch (err) {
               this._addMemberError = err.message || 'Failed to add member';
             } finally {
