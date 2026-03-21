@@ -287,13 +287,23 @@ export async function isProcessed(actorId, activityId) {
 // Reactions (emoji → [actorId, ...] map on message record)
 // ──────────────────────────────────────────────
 
-export async function addReaction(messageId, actorId, emoji) {
+export async function addReaction(messageId, actorId, emoji, activityId = null) {
   const rec = await db.table('messages').get(messageId);
   if (!rec) return;
   const reactions = rec.reactions || {};
   const actors = reactions[emoji] || [];
   if (actors.includes(actorId)) return; // idempotent
-  await db.table('messages').put({ ...rec, reactions: { ...reactions, [emoji]: [...actors, actorId] } });
+  const updated = { ...rec, reactions: { ...reactions, [emoji]: [...actors, actorId] } };
+  if (activityId) {
+    const ra = rec.reactionActivities || {};
+    updated.reactionActivities = { ...ra, [emoji]: { ...(ra[emoji] || {}), [actorId]: activityId } };
+  }
+  await db.table('messages').put(updated);
+}
+
+export async function getReactionActivityId(messageId, actorId, emoji) {
+  const rec = await db.table('messages').get(messageId);
+  return rec?.reactionActivities?.[emoji]?.[actorId] || null;
 }
 
 export async function removeReaction(messageId, actorId, emoji) {

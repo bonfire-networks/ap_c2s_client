@@ -224,7 +224,7 @@ export class ChatController {
       if (meta.hasUnread) await this.storage.saveGroupMeta(groupId, { ...meta, hasUnread: false });
     }
 
-    // Send Read receipt (caller is responsible for checking opt-in before calling this).
+    // Send Read receipt only if opted in (global or per-group override).
     // Cancel any pending debounced Acknowledge — Read implies Acknowledge.
     const actor = await getCurrentActor();
     const msg = await this.storage.getMessage(messageId);
@@ -233,11 +233,16 @@ export class ChatController {
         clearTimeout(this._pendingAcks.get(messageId));
         this._pendingAcks.delete(messageId);
       }
-      const { recipients, apId } = await this._groupSendContext(groupId, actor);
-      this._sendEncryptedActivity(groupId, {
-        type: 'Read', id: messageUri(),
-        object: { type: 'Note', id: messageId },
-      }, recipients, apId);
+      const groupOverride = await this.storage.getGroupField(groupId, 'readReceiptsOverride', null);
+      const globalEnabled = await this.storage.loadUserSetting(actor.id, 'sendReadReceipts', false);
+      const enabled = groupOverride !== null ? groupOverride : globalEnabled;
+      if (enabled) {
+        const { recipients, apId } = await this._groupSendContext(groupId, actor);
+        this._sendEncryptedActivity(groupId, {
+          type: 'Read', id: messageUri(),
+          object: messageId,
+        }, recipients, apId);
+      }
     }
   }
 
@@ -351,22 +356,15 @@ export class ChatController {
       // Only insert system messages if we had a known member list to diff against
       if (previous.size === 0) return;
       const current = new Set(identities);
-      const removerNickname = removerActorId
-        ? ((await this.storage.loadUserState(removerActorId))?.preferredUsername
-            || removerActorId.split('/').pop()
-            || removerActorId)
-        : null;
+      const removerNickname = removerActorId ? await this._getNickname(removerActorId) : null;
       for (const id of identities) {
         if (!previous.has(id) && id !== actor.id) {
-          const profile = await this.storage.loadUserState(id);
-          const nickname = profile?.preferredUsername || id.split('/').pop() || id;
-          await this._insertSystemMessage(groupId, `${nickname} was added to the group`);
+          await this._insertSystemMessage(groupId, `${await this._getNickname(id)} was added to the group`);
         }
       }
       for (const id of previous) {
         if (!current.has(id) && id !== actor.id) {
-          const profile = await this.storage.loadUserState(id);
-          const nickname = profile?.preferredUsername || id.split('/').pop() || id;
+          const nickname = await this._getNickname(id);
           const isSelfLeave = id === removerActorId;
           const msg = isSelfLeave
             ? `${nickname} left the group`
@@ -960,21 +958,30 @@ export class ChatController {
         return { type: 'delete', groupId };
       }
 
-      // Like
-      if (innerTypes.includes('Like') && decryptedContent.object) {
+      // EmojiReact or Like-with-content
+      const isEmojiReact = innerTypes.includes('EmojiReact') ||
+        (innerTypes.includes('Like') && decryptedContent.content);
+      if (isEmojiReact && decryptedContent.object) {
         const targetId = this._objectId(decryptedContent.object);
         const emoji = decryptedContent.content || '👍';
         const existing = await this._resolveMessage(targetId);
-        if (existing) await this.storage.addReaction(existing.id, parsed.attributedTo, emoji);
+        if (existing) await this.storage.addReaction(existing.id, parsed.attributedTo, emoji, decryptedContent.id || null);
         return { type: 'reaction', groupId };
       }
 
-      // Undo (Like only for now)
+      // Plain Like (no content) = 👍
+      if (innerTypes.includes('Like') && decryptedContent.object) {
+        const existing = await this._resolveMessage(this._objectId(decryptedContent.object));
+        if (existing) await this.storage.addReaction(existing.id, parsed.attributedTo, '👍', decryptedContent.id || null);
+        return { type: 'reaction', groupId };
+      }
+
+      // Undo — target message found via object.object
       if (innerTypes.includes('Undo') && decryptedContent.object) {
         const inner = decryptedContent.object;
-        if (inner?.type === 'Like') {
-          const targetId = this._objectId(decryptedContent.target) || this._objectId(inner);
-          const emoji = decryptedContent.content || '👍';
+        if (inner?.type === 'Like' || inner?.type === 'EmojiReact') {
+          const targetId = this._objectId(inner.object);
+          const emoji = inner.content || '👍';
           const existing = await this._resolveMessage(targetId);
           if (existing) await this.storage.removeReaction(existing.id, parsed.attributedTo, emoji);
         }
@@ -1436,10 +1443,11 @@ export class ChatController {
   async likeMessage(groupId, messageId, emoji = '👍') {
     const actor = await getCurrentActor();
     const { recipients, apId } = await this._groupSendContext(groupId, actor);
-    await this.storage.addReaction(messageId, actor.id, emoji);
+    const activityId = messageUri();
+    await this.storage.addReaction(messageId, actor.id, emoji, activityId);
     this._sendEncryptedActivity(groupId, {
-      type: 'Like', id: messageUri(),
-      object: { type: 'Note', id: messageId },
+      type: 'Like', id: activityId,
+      object: messageId,
       content: emoji,
     }, recipients, apId);
   }
@@ -1447,12 +1455,16 @@ export class ChatController {
   async undoLike(groupId, messageId, emoji = '👍') {
     const actor = await getCurrentActor();
     const { recipients, apId } = await this._groupSendContext(groupId, actor);
+    const reactionActivityId = await this.storage.getReactionActivityId(messageId, actor.id, emoji);
     await this.storage.removeReaction(messageId, actor.id, emoji);
     this._sendEncryptedActivity(groupId, {
       type: 'Undo', id: messageUri(),
-      object: { type: 'Like', id: messageUri() },
-      target: messageId,
-      content: emoji,
+      object: {
+        type: 'Like',
+        id: reactionActivityId || messageUri(),
+        object: messageId,
+        content: emoji,
+      },
     }, recipients, apId);
   }
 
@@ -1463,7 +1475,7 @@ export class ChatController {
     // Cross-group boost: inline the original message content so recipients can read it without access to the source group
     const objectPayload = inlineContent
       ? { ...inlineContent, id: messageId }
-      : { type: 'Note', id: messageId };
+      : messageId;
 
     await this.storage.saveMessage(groupId, {
       type: 'Announce', attributedTo: actor.id,
@@ -1717,6 +1729,12 @@ export class ChatController {
       hasKey, fingerprint,
       error: hasKey ? null : 'No encryption key available'
     };
+  }
+
+  async _getNickname(actorId) {
+    if (!actorId) return 'Someone';
+    const profile = await this.storage.loadUserState(actorId);
+    return this.getActorNickname(actorId, profile);
   }
 
   getActorNickname(actorId, profile) {
