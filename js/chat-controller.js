@@ -869,10 +869,7 @@ export class ChatController {
     await this._replenishKeyPackage(actor);
 
     const inviterUri = parsed.attributedTo;
-    const inviterProfile = inviterUri ? await this.storage.loadUserState(inviterUri) : null;
-    const inviter = inviterProfile?.preferredUsername
-      ? this.getActorNickname(inviterUri, inviterProfile)
-      : inviterUri || 'Someone';
+    const inviter = await this._getNickname(inviterUri);
     if (wasReset) {
       await this._insertSystemMessage(actualGroupId, `Encryption was reset by ${inviter}. You have been re-invited to the group.`);
     } else {
@@ -1285,8 +1282,7 @@ export class ChatController {
 
     // Persist updated member list — each client inserts a local system message when they process the Commit
     await this.persistMembers(groupId, [recipientUri]);
-    const profile = await this.storage.loadUserState(recipientUri);
-    const nickname = profile?.preferredUsername || recipientUri.split('/').pop() || recipientUri;
+    const nickname = await this._getNickname(recipientUri);
     await this._insertSystemMessage(groupId, `${nickname} was added to the group`);
 
     console.log('[addMemberToGroup] Added', recipientUri, 'to group', groupId);
@@ -1346,8 +1342,7 @@ export class ChatController {
     } catch (e) {
       console.warn('[removeGroupMember] Failed to distribute commit:', e);
     }
-    const profile = await this.storage.loadUserState(actorIdentity);
-    const nickname = profile?.preferredUsername || actorIdentity.split('/').pop() || actorIdentity;
+    const nickname = await this._getNickname(actorIdentity);
     await this._insertSystemMessage(groupId, `${nickname} was removed from the group`);
     return result;
   }
