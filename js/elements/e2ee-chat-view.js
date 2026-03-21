@@ -216,11 +216,18 @@ export class E2EEChatView extends LitElement {
       _highlightedMember: { type: String, state: true },
       _actorProfiles: { type: Object, state: true },
       _deliveryPanel: { type: Object, state: true },
+      _reactionPanel: { type: Object, state: true },
+      _sendReadReceipts: { type: Boolean, state: true },
+      _groupReadReceiptsOverride: { type: Object, state: true }, // null | true | false
       _editingId: { type: String, state: true },
       _editingContent: { type: String, state: true },
       _addMemberInput: { type: String, state: true },
       _addMemberLoading: { type: Boolean, state: true },
-      _addMemberError: { type: String, state: true }
+      _addMemberError: { type: String, state: true },
+      _boostPanel: { type: Object, state: true }, // { msg } | null
+      _boostComment: { type: String, state: true },
+      _boostTargetGroupId: { type: String, state: true },
+      _boostCrossGroup: { type: Boolean, state: true },
     }
   }
 
@@ -240,10 +247,17 @@ export class E2EEChatView extends LitElement {
     this._highlightedMember = null
     this._actorProfiles = new Map()
     this._deliveryPanel = null
+    this._reactionPanel = null
+    this._sendReadReceipts = false
+    this._groupReadReceiptsOverride = null
     this._editingId = null
     this._editingContent = ''
     this._addMemberInput = ''
     this._addMemberLoading = false
+    this._boostPanel = null
+    this._boostComment = ''
+    this._boostTargetGroupId = null
+    this._boostCrossGroup = false
     this._addMemberError = null
     this._profileLoadPending = new Set()
     this.messages = []
@@ -307,6 +321,7 @@ export class E2EEChatView extends LitElement {
       const actor = await this.controller.init();
       console.log('[ChatView] Actor initialized:', actor);
       this.currentActorId = actor.id;
+      this._sendReadReceipts = await this.controller.storage.loadUserSetting(actor.id, 'sendReadReceipts', false);
       this._ensureActorProfile(actor.id);
 
       // Set window title with username so multiple instances are distinguishable
@@ -373,6 +388,9 @@ export class E2EEChatView extends LitElement {
       this._pendingReadEntries = new Map(); // msgId → element, for entries seen while unfocused
 
       const markRead = (msgId, groupId) => {
+        // group override (null = use global, true/false = override)
+        const effective = this._groupReadReceiptsOverride !== null ? this._groupReadReceiptsOverride : this._sendReadReceipts;
+        if (!effective) return;
         this.controller.markMessageRead(msgId, groupId).then(() => {
           this.messages = this.messages.map(m => m.id === msgId ? { ...m, isRead: true } : m);
           this.loadGroups();
@@ -860,6 +878,7 @@ export class E2EEChatView extends LitElement {
   async _loadMembersData() {
     if (!this.selectedGroupId || !this.currentActorId) return;
     this._membersLoading = true;
+    this._groupReadReceiptsOverride = await this.controller.storage.getGroupField(this.selectedGroupId, 'readReceiptsOverride', null);
     try {
       const members = await this.controller.getGroupMembersData(this.selectedGroupId);
       members.forEach(m => {
@@ -948,11 +967,23 @@ export class E2EEChatView extends LitElement {
     }
   }
 
+  async _handleDeleteLocalMessage(msg) {
+    if (!confirm('Remove this message from your device only?\n\nThis will not affect other members.')) return;
+    try {
+      await this.controller.storage.deleteMessage(msg.id);
+      await this.loadMessages(this.selectedGroupId);
+    } catch (e) {
+      this.error = 'Failed to remove message: ' + (e.message || e);
+      this.requestUpdate();
+    }
+  }
+
   _openMyDevicesPanel() {
     const panel = document.createElement('my-devices-panel');
     panel.controller = this.controller;
     panel.currentActorId = this.currentActorId;
     panel.addEventListener('close', () => panel.remove());
+    panel.addEventListener('settings-changed', (e) => { this[`_${e.detail.key}`] = e.detail.value; });
     this.shadowRoot.appendChild(panel);
   }
 
@@ -992,12 +1023,31 @@ export class E2EEChatView extends LitElement {
     `;
   }
 
+  _renderReactions(msg) {
+    const entries = Object.entries(msg.reactions || {});
+    if (!entries.length) return '';
+    return html`
+      <div class="flex flex-wrap gap-1 mt-1.5">
+        ${entries.map(([emoji, actors]) => {
+          const isMine = actors.includes(this.currentActorId);
+          const names = actors.map(id => this._getDisplayName(id)).join(', ');
+          return html`<button
+            class="btn btn-xs ${isMine ? 'btn-primary' : 'btn-ghost border border-base-300'} gap-0.5 h-6 min-h-0 px-1.5"
+            title=${names}
+            @click=${(e) => { e.stopPropagation(); this._reactionPanel = { emoji, actors }; this.requestUpdate(); }}>
+            ${emoji}<span class="opacity-70 text-xs">${actors.length}</span>
+          </button>`;
+        })}
+      </div>`;
+  }
+
   _deliveryStatusEmoji(status) {
     switch (status) {
       case 'acknowledged': return { emoji: '✅', label: 'Received & decrypted' };
       case 'failed':       return { emoji: '🟠', label: 'Delivery failed' };
       case 'keys_broken':  return { emoji: '🔴', label: 'Encryption keys out of sync' };
       case 'sent':         return { emoji: '📮', label: 'Sent' };
+      case 'read':         return { emoji: '👁️', label: 'Read' };
       default:             return { emoji: '🛫', label: 'Sending…' };
     }
   }
@@ -1019,6 +1069,94 @@ export class E2EEChatView extends LitElement {
     const { emoji: ackEmoji } = this._deliveryStatusEmoji('acknowledged');
     const { emoji: sentEmoji, label } = this._deliveryStatusEmoji('sent');
     return html`<span title="Partially received — ${label}">${ackEmoji}${sentEmoji}</span>`;
+  }
+
+  _renderReactionPanel() {
+    if (!this._reactionPanel) return '';
+    const { emoji, actors } = this._reactionPanel;
+    return html`
+      <div class="absolute inset-0 z-50 flex flex-col bg-base-100 text-base-content">
+        <div class="flex items-center gap-2 p-3 border-b border-base-300 bg-base-200">
+          <button class="btn btn-ghost btn-sm btn-square" @click=${() => { this._reactionPanel = null; this.requestUpdate(); }}>
+            ${icon('arrow-left', { size: 20 })}
+          </button>
+          <span class="font-semibold flex-1">${emoji} ${actors.length} ${actors.length === 1 ? 'reaction' : 'reactions'}</span>
+        </div>
+        <div class="flex-1 overflow-y-auto p-3 flex flex-col gap-2">
+          ${actors.map(actorId => html`
+            <div class="flex items-center gap-2 cursor-pointer hover:bg-base-200 rounded p-1"
+              @click=${() => { this._reactionPanel = null; this._showMember(actorId); }}>
+              <div class="w-8 rounded-full overflow-hidden flex-shrink-0">${this._renderAvatar(actorId, { size: 32 })}</div>
+              <span class="text-sm">${this._getDisplayName(actorId)}</span>
+            </div>`)}
+        </div>
+      </div>`;
+  }
+
+  _renderSharePanel() {
+    if (!this._boostPanel) return '';
+    const { msg } = this._boostPanel;
+    const isCrossGroup = this._boostCrossGroup;
+    const author = msg.attributedTo;
+    const authorName = author ? this._getDisplayName(author) : '';
+    const close = () => { this._boostPanel = null; };
+    return html`
+      <div class="absolute inset-0 z-50 flex flex-col bg-base-100 text-base-content">
+        <div class="flex items-center gap-2 p-3 border-b border-base-300 bg-base-200">
+          <button class="btn btn-ghost btn-sm btn-square" @click=${close}>
+            ${icon('arrow-left', { size: 20 })}
+          </button>
+          <span class="font-semibold flex-1">Share message</span>
+        </div>
+        <div class="flex-1 overflow-y-auto p-3 flex flex-col gap-3">
+          <div class="rounded border border-base-300 bg-base-200 p-2 text-sm">
+            ${authorName ? html`<div class="text-xs font-medium opacity-60 mb-1">${authorName}</div>` : ''}
+            <div class="opacity-70 line-clamp-3">${msg.content?.content || msg.content || ''}</div>
+          </div>
+          <div class="text-xs opacity-60">
+            This will boost the message in this group so everyone here can see it highlighted.
+          </div>
+          <div>
+            <label class="label label-text text-xs pb-1">Add a comment (optional)</label>
+            <textarea class="textarea textarea-bordered w-full textarea-sm" rows="3"
+              placeholder="Say something…"
+              .value=${this._boostComment}
+              @input=${(e) => { this._boostComment = e.target.value; }}></textarea>
+          </div>
+          <div>
+            <button class="btn btn-ghost btn-sm btn-block justify-start gap-2 border border-base-300"
+              @click=${() => { this._boostCrossGroup = !this._boostCrossGroup; }}>
+              ${icon(isCrossGroup ? 'caret-down' : 'caret-right', { size: 14 })}
+              Share in a different group instead
+            </button>
+            ${isCrossGroup ? html`
+              <div class="mt-2 flex flex-col gap-2">
+                <div class="alert alert-warning text-xs py-2 px-3 flex gap-2 items-start">
+                  ${icon('warning', { size: 16 })}
+                  <span>Make sure you have consent from ${authorName || 'the author'} before sharing their message with another group.</span>
+                </div>
+                <select class="select select-bordered select-sm w-full"
+                  .value=${this._boostTargetGroupId}
+                  @change=${(e) => { this._boostTargetGroupId = e.target.value; }}>
+                  ${this.groups.filter(g => g.id !== this.selectedGroupId).map(g => html`
+                    <option value=${g.id} ?selected=${g.id === this._boostTargetGroupId}>${g.name || (g.members || []).filter(id => id !== this.currentActorId).map(id => this.getActorNickname(id)).filter(Boolean).join(', ') || g.id}</option>`)}
+                </select>
+              </div>
+            ` : ''}
+          </div>
+          <button class="btn btn-primary btn-sm btn-block" @click=${async () => {
+            const sourceGroupId = this.selectedGroupId;
+            const resolvedTarget = isCrossGroup ? this._boostTargetGroupId : sourceGroupId;
+            const comment = this._boostComment;
+            const inlineContent = isCrossGroup ? msg.content : undefined;
+            close();
+            await this.controller.announceMessage(resolvedTarget, msg.id, comment, sourceGroupId, inlineContent);
+            this.loadMessages(sourceGroupId);
+          }}>
+            ${icon('megaphone', { size: 16 })} ${isCrossGroup ? 'Share in other group' : 'Boost in this group'}
+          </button>
+        </div>
+      </div>`;
   }
 
   _renderDeliveryPanel() {
@@ -1092,12 +1230,33 @@ export class E2EEChatView extends LitElement {
           <button class="btn btn-ghost btn-sm btn-square" @click=${() => { this.showMembersPanel = false; this._highlightedMember = null; }}>
             ${icon('arrow-left', { size: 20 })}
           </button>
-          <span class="font-semibold flex-1">Group Members</span>
+          <span class="font-semibold flex-1">Group Settings</span>
           <button class="btn btn-ghost btn-xs" @click=${() => this._loadMembersData()}>
             ${icon('arrows-clockwise')}
           </button>
         </div>
         <div class="flex-1 overflow-y-auto p-3">
+          <div class="mb-4 border-b border-base-300 pb-4">
+            <h3 class="text-sm font-semibold opacity-60 mb-2 uppercase tracking-wide">Privacy</h3>
+            <label class="flex items-center gap-3 cursor-pointer">
+              <div class="flex-1">
+                <div class="text-sm font-medium">Read receipts</div>
+                <div class="text-xs opacity-50">Override global setting for this group</div>
+              </div>
+              <select class="select select-xs select-bordered"
+                .value=${this._groupReadReceiptsOverride === null ? 'default' : String(this._groupReadReceiptsOverride)}
+                @change=${async (e) => {
+                  const val = e.target.value === 'default' ? null : e.target.value === 'true';
+                  this._groupReadReceiptsOverride = val;
+                  await this.controller.storage.setGroupField(groupId, 'readReceiptsOverride', val);
+                }}>
+                <option value="default">Default (${this._sendReadReceipts ? 'on' : 'off'})</option>
+                <option value="true">Always on</option>
+                <option value="false">Always off</option>
+              </select>
+            </label>
+          </div>
+          <h3 class="text-sm font-semibold opacity-60 mb-2 uppercase tracking-wide">Members</h3>
           <form class="flex gap-2 mb-4" @submit=${async (e) => {
             e.preventDefault();
             const val = this._addMemberInput.trim();
@@ -1176,7 +1335,7 @@ export class E2EEChatView extends LitElement {
   // ── Render ─────────────────────────────────────────────
 
   /** Shared chat-bubble shell: avatar + slot for bubble content + optional replies. */
-  _renderChatRow(msg, { bubbleContent, footerContent = null, replies = null, extraClasses = '', alwaysFooter = false } = {}) {
+  _renderChatRow(msg, { bubbleContent, footerContent = null, persistentFooter = null, replies = null, extraClasses = '' } = {}) {
     const color = this._actorColor(msg.attributedTo);
     const isUnread = !msg.isRead;
     const largeGroup = (this.currentGroupMembers?.length || 0) > 5;
@@ -1206,7 +1365,10 @@ export class E2EEChatView extends LitElement {
 
             ${bubbleContent}
 
-            ${footerContent ? html`<div class="chat-footer ${alwaysFooter ? '' : 'hover-visible'} flex items-center gap-2 text-xs mt-0.5">${footerContent}</div>` : ''}
+            ${(persistentFooter || footerContent) ? html`<div class="chat-footer flex items-center gap-2 text-xs mt-0.5">
+              ${persistentFooter}
+              ${footerContent ? html`<span class="hover-visible flex items-center gap-2">${footerContent}</span>` : ''}
+            </div>` : ''}
           </div>
         </div>
 
@@ -1216,6 +1378,8 @@ export class E2EEChatView extends LitElement {
   }
 
   renderMessage(msg, depth = 0) {
+    if (!msg) return '';
+
     if (msg && msg.type === 'system') {
       return html`
         <div class="alert alert-warning text-xs my-1 py-1 px-2 opacity-80">${msg.content}</div>
@@ -1243,15 +1407,69 @@ export class E2EEChatView extends LitElement {
     }
 
     if (msg && msg.type === 'Tombstone') {
+      const isOwnTombstone = msg.isLocal || msg.attributedTo === this.currentActorId;
+      const tombstoneFooter = !isOwnTombstone ? html`
+        <a class="link link-hover text-error" @click=${() => this._handleDeleteLocalMessage(msg)}>delete locally</a>
+      ` : null;
       return this._renderChatRow(msg, {
         bubbleContent: html`<div class="chat-bubble chat-bubble-ghost text-xs italic py-1 px-2 opacity-40">[message deleted]</div>`,
+        footerContent: tombstoneFooter,
         extraClasses: 'opacity-60',
+      });
+    }
+
+    if (msg && msg.type === 'Announce') {
+      const referenced = msg.object && this.messages.find(m => m.id === msg.object || m.content?.id === msg.object);
+      const mlsHref = msg.object ? `mls://m/${msg.object}` : null;
+      const handleMlsClick = mlsHref ? (e) => { e.preventDefault(); window.navigateToGroup?.(mlsHref, mlsHref); } : null;
+      const snippet = referenced
+        ? html`<a class="block border-l-2 border-primary/40 pl-2 mt-1 text-xs opacity-70 hover:opacity-100 truncate cursor-pointer no-underline"
+              href=${mlsHref} @click=${handleMlsClick} title="Jump to original">
+            <span class="font-semibold">${this._getDisplayName(referenced.attributedTo || referenced.content?.attributedTo)}</span>:
+            ${referenced.content?.content || referenced.content || ''}
+          </a>`
+        : mlsHref
+          ? html`<a class="block text-xs opacity-50 mt-1 italic hover:opacity-80 cursor-pointer"
+                href=${mlsHref} @click=${handleMlsClick}>[view original]</a>`
+          : html`<div class="text-xs opacity-50 mt-1 italic">[shared message]</div>`;
+      const hasReplies = msg.replies?.length > 0;
+      const announceCollapsed = this._collapsedThreads.has(msg.id);
+      const replies = hasReplies && !announceCollapsed
+        ? msg.replies.map(reply => this.renderMessage(reply, depth + 1))
+        : null;
+      const isOwnAnnounce = msg.isLocal || msg.attributedTo === this.currentActorId;
+      const announceAlreadyLiked = (msg.reactions?.['👍'] || []).includes(this.currentActorId);
+      const announceLikeCount = (msg.reactions?.['👍'] || []).length;
+      const announcePersistentFooter = (announceCollapsed || announceLikeCount > 0) ? html`
+        ${announceCollapsed ? html`<span class="text-xs opacity-60 cursor-pointer hover:opacity-100" @click=${() => this._toggleCollapse(msg.id)}>+${this._countDescendants(msg)} collapsed</span>` : ''}
+        ${announceLikeCount > 0 ? html`<a class="link link-hover ${announceAlreadyLiked ? 'opacity-100' : 'opacity-60'}" @click=${() => announceAlreadyLiked
+          ? this.controller.undoLike(this.selectedGroupId, msg.id).then(() => this.loadMessages(this.selectedGroupId))
+          : this.controller.likeMessage(this.selectedGroupId, msg.id).then(() => this.loadMessages(this.selectedGroupId))}>👍 ${announceLikeCount}</a>` : ''}
+      ` : null;
+      const announceFooter = html`
+        ${msg.id ? html`<a class="link link-hover" @click=${() => this.handleReply(msg.id)}>reply</a>` : ''}
+        ${announceLikeCount === 0 ? html`<a class="link link-hover" @click=${() => this.controller.likeMessage(this.selectedGroupId, msg.id).then(() => this.loadMessages(this.selectedGroupId))}>👍</a>` : ''}
+        <a class="link link-hover" @click=${() => { const orig = msg.object && this.messages.find(m => m.id === msg.object || m.content?.id === msg.object); this._boostPanel = { msg: orig || msg }; this._boostComment = ''; this._boostTargetGroupId = this.selectedGroupId; this._boostCrossGroup = false; }}>share</a>
+        ${isOwnAnnounce ? html`
+          <a class="link link-hover text-error" @click=${() => this._handleDeleteMessage(msg)}>delete</a>
+        ` : html`
+          <a class="link link-hover text-error" @click=${() => this._handleDeleteLocalMessage(msg)}>delete</a>
+        `}
+      `;
+      return this._renderChatRow(msg, {
+        bubbleContent: html`<div class="chat-bubble text-sm py-2 px-3" style="--bubble-bg:color-mix(in srgb,${this._actorColor(msg.attributedTo)} 15%,var(--color-base-200,#f0f0f0))">
+          <span class="text-xs opacity-60">shared a message</span>${snippet}
+        </div>`,
+        footerContent: announceFooter,
+        persistentFooter: announcePersistentFooter,
+        replies,
       });
     }
 
     if (msg && msg.error) {
       return this._renderChatRow(msg, {
         bubbleContent: html`<div class="chat-bubble chat-bubble-error text-xs py-1 px-2">${msg.error}</div>`,
+        footerContent: html`<a class="link link-hover text-error" @click=${() => this._handleDeleteLocalMessage(msg)}>delete</a>`,
       });
     }
 
@@ -1284,13 +1502,29 @@ export class E2EEChatView extends LitElement {
       </div>
     `;
 
-    const footer = html`
+    const alreadyLiked = (msg.reactions?.['👍'] || []).includes(this.currentActorId);
+    const likeCount = (msg.reactions?.['👍'] || []).length;
+
+    const persistentFooter = (isCollapsed || likeCount > 0) ? html`
       ${isCollapsed ? html`
         <span class="text-xs opacity-60 cursor-pointer hover:opacity-100" @click=${() => this._toggleCollapse(msg.id)}>
-          +${this._countDescendants(msg)} replies collapsed
+          +${this._countDescendants(msg)} collapsed
         </span>
       ` : ''}
+      ${likeCount > 0 ? html`
+        <a class="link link-hover ${alreadyLiked ? 'opacity-100' : 'opacity-60'}" @click=${() => alreadyLiked
+            ? this.controller.undoLike(this.selectedGroupId, msg.id).then(() => this.loadMessages(this.selectedGroupId))
+            : this.controller.likeMessage(this.selectedGroupId, msg.id).then(() => this.loadMessages(this.selectedGroupId))}>
+          👍 ${likeCount}
+        </a>
+      ` : ''}
+    ` : null;
+
+    const footer = html`
       ${msg.id ? html`<a class="link link-hover" @click=${() => this.handleReply(msg.id)}>reply</a>` : ''}
+      ${likeCount === 0 ? html`<a class="link link-hover" @click=${() =>
+          this.controller.likeMessage(this.selectedGroupId, msg.id).then(() => this.loadMessages(this.selectedGroupId))}>👍</a>` : ''}
+      <a class="link link-hover" @click=${() => { this._boostPanel = { msg }; this._boostComment = ''; this._boostTargetGroupId = this.selectedGroupId; this._boostCrossGroup = false; }}>share</a>
       ${isOwnMsg ? html`
         <a class="link link-hover" @click=${() => { this._editingId = msg.id; this._editingContent = msg.content || ''; this.requestUpdate(); }}>edit</a>
         <a class="link link-hover text-error" @click=${() => this._handleDeleteMessage(msg)}>delete</a>
@@ -1298,14 +1532,16 @@ export class E2EEChatView extends LitElement {
           @click=${(e) => { e.stopPropagation(); this._deliveryPanel = { msg }; this._loadMembersData(); }}>
           ${this._renderDeliveryTicks(msg.deliveryStatus)}
         </button>
-      ` : ''}
+      ` : html`
+        <a class="link link-hover text-error" @click=${() => this._handleDeleteLocalMessage(msg)}>delete</a>
+      `}
     `;
 
     const replies = hasReplies && !isCollapsed
       ? msg.replies.map(reply => this.renderMessage(reply, depth + 1))
       : null;
 
-    return this._renderChatRow(msg, { bubbleContent: bubble, footerContent: footer, replies, alwaysFooter: isCollapsed });
+    return this._renderChatRow(msg, { bubbleContent: bubble, footerContent: footer, persistentFooter, replies });
   }
 
   _selectGroup(groupId) {
@@ -1345,8 +1581,8 @@ export class E2EEChatView extends LitElement {
             ` : ''}
             <li><theme-picker></theme-picker></li>
             <li><a @click=${() => this._openMyDevicesPanel()}>
-              ${icon('device-mobile')}
-              My devices
+              ${icon('gear')}
+              Settings
             </a></li>
             <li class="border-t border-base-300 mt-1 pt-1"><a @click=${() => this._menuAction('logout')} class="text-warning">
               ${icon('sign-out')}
@@ -1364,6 +1600,8 @@ export class E2EEChatView extends LitElement {
         <div class="drawer-content flex">
           <div class="messages-pane bg-base-100">
             ${this._renderDeliveryPanel()}
+            ${this._renderReactionPanel()}
+            ${this._renderSharePanel()}
             ${this._renderMembersPanel()}
             ${this.selectedGroupId && !this.creatingNewGroup ? html`
               <div class="px-3 py-2 border-b border-base-300 bg-base-200 flex items-center gap-2">

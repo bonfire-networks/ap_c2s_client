@@ -36,6 +36,8 @@ export class ChatController {
   constructor(mlsService, storage) {
     this.mlsService = mlsService;
     this.storage = storage;
+    // messageId → setTimeout handle; cancelled if Read is sent first
+    this._pendingAcks = new Map();
   }
 
   // ── Initialization ─────────────────────────────────────
@@ -136,7 +138,7 @@ export class ChatController {
     const messages = arr
       .filter(m => !hiddenTypes.includes(m.content?.type))
       .map(m => ({
-        ...m.content,
+        ...(typeof m.content === 'object' && m.content !== null ? m.content : { content: m.content }),
         id: m.id,
         timestamp: m.timestamp,
         isLocal: m.isLocal,
@@ -144,6 +146,7 @@ export class ChatController {
         editedAt: m.editedAt || null,
         isRead: m.isRead ?? m.isLocal ?? false,
         attributedTo: m.content?.attributedTo,
+        reactions: m.reactions || {},
       }));
     console.log('[loadMessages] Mapped messages:', messages.map(m => ({ id: m.id, isLocal: m.isLocal, type: m.type, attributedTo: m.attributedTo })));
 
@@ -220,6 +223,22 @@ export class ChatController {
       const meta = (await this.storage.loadGroupMeta(groupId)) || {};
       if (meta.hasUnread) await this.storage.saveGroupMeta(groupId, { ...meta, hasUnread: false });
     }
+
+    // Send Read receipt (caller is responsible for checking opt-in before calling this).
+    // Cancel any pending debounced Acknowledge — Read implies Acknowledge.
+    const actor = await getCurrentActor();
+    const msg = await this.storage.getMessage(messageId);
+    if (msg && !msg.isLocal) {
+      if (this._pendingAcks.has(messageId)) {
+        clearTimeout(this._pendingAcks.get(messageId));
+        this._pendingAcks.delete(messageId);
+      }
+      const { recipients, apId } = await this._groupSendContext(groupId, actor);
+      this._sendEncryptedActivity(groupId, {
+        type: 'Read', id: messageUri(),
+        object: { type: 'Note', id: messageId },
+      }, recipients, apId);
+    }
   }
 
   async getGroupFingerprints(groupId) {
@@ -237,10 +256,11 @@ export class ChatController {
     const rootMessages = [];
 
     messages.forEach(msg => {
-      messageMap.set(msg.id, { ...msg, replies: [] });
+      if (msg?.id) messageMap.set(msg.id, { ...msg, replies: [] });
     });
 
     messages.forEach(msg => {
+      if (!msg?.id) return;
       const node = messageMap.get(msg.id);
       const parent = msg.inReplyTo ? messageMap.get(msg.inReplyTo) : null;
       if (parent) {
@@ -286,11 +306,7 @@ export class ChatController {
   }
 
   async _getGroupName(groupId) {
-    // Storage's getGroupName is a backward-compatible alias
-    if (this.storage.getGroupName) {
-      return this.storage.getGroupName(groupId);
-    }
-    return null;
+    return this.storage.getGroupField(groupId, 'name', null);
   }
 
   async getGroupMembers(groupId) {
@@ -395,7 +411,7 @@ export class ChatController {
     await this.mlsService.createGroup(actor.id, groupId);
 
     // Re-invite previous members — use AP ID if available
-    let apId = await this.storage.getGroupApId(groupId);
+    let apId = await this.storage.getGroupField(groupId, 'apId', null);
     const reinvited = [];
 
     for (const recipient of otherMembers) {
@@ -477,7 +493,7 @@ export class ChatController {
     const recipients = members.length > 0 ? members : [actor.id];
 
     // Look up AP ID for context — never fall back to local ULID
-    const apId = await this.storage.getGroupApId(groupId);
+    const apId = await this.storage.getGroupField(groupId, 'apId', null);
     console.log('[_transmitEncrypted] apId:', apId, 'groupId:', groupId, 'msgId:', msgId);
 
     // Save as pending with the client-generated ID
@@ -606,7 +622,7 @@ export class ChatController {
     const successfulInvites = [];
     const errors = [];
     // Look up or derive AP ID so Welcome, GroupInfo, and PrivateMessage share the same context
-    let apId = await this.storage.getGroupApId(groupId);
+    let apId = await this.storage.getGroupField(groupId, 'apId', null);
 
     for (const recipient of toUris) {
       try {
@@ -944,6 +960,53 @@ export class ChatController {
         return { type: 'delete', groupId };
       }
 
+      // Like
+      if (innerTypes.includes('Like') && decryptedContent.object) {
+        const targetId = this._objectId(decryptedContent.object);
+        const emoji = decryptedContent.content || '👍';
+        const existing = await this._resolveMessage(targetId);
+        if (existing) await this.storage.addReaction(existing.id, parsed.attributedTo, emoji);
+        return { type: 'reaction', groupId };
+      }
+
+      // Undo (Like only for now)
+      if (innerTypes.includes('Undo') && decryptedContent.object) {
+        const inner = decryptedContent.object;
+        if (inner?.type === 'Like') {
+          const targetId = this._objectId(decryptedContent.target) || this._objectId(inner);
+          const emoji = decryptedContent.content || '👍';
+          const existing = await this._resolveMessage(targetId);
+          if (existing) await this.storage.removeReaction(existing.id, parsed.attributedTo, emoji);
+        }
+        return { type: 'undo', groupId };
+      }
+
+      // Announce — store Announce; if content present, split into reply Note (interop)
+      if (innerTypes.includes('Announce') && decryptedContent.object) {
+        const targetId = this._objectId(decryptedContent.object);
+        const announceId = decryptedContent.id || outerMessageId;
+        await this.storage.saveMessage(groupId, {
+          type: 'Announce', attributedTo: parsed.attributedTo,
+          object: targetId, content: null,
+          timestamp: decryptedContent.published || Date.now(),
+        }, announceId, false, (announceId !== outerMessageId) ? outerMessageId : undefined);
+        if (decryptedContent.content) {
+          await this._saveAnnounceComment(groupId, announceId, parsed.attributedTo, decryptedContent.content, false);
+        }
+        await this.storage.saveGroupMeta(groupId, { ...(await this.storage.loadGroupMeta(groupId) || {}), hasUnread: true });
+        return { type: 'announce', groupId };
+      }
+
+      // Read receipt
+      if (innerTypes.includes('Read') && decryptedContent.object) {
+        const targetId = this._objectId(decryptedContent.object);
+        const existing = await this._resolveMessage(targetId);
+        if (existing) {
+          await this.storage.updateDeliveryStatus(existing.id, parsed.attributedTo, { status: 'read', timestamp: Date.now() });
+        }
+        return { type: 'read', groupId };
+      }
+
       // Use inner ap-mls:// id if present, fall back to outer AP id
       const messageId = decryptedContent.id || outerMessageId;
 
@@ -964,11 +1027,18 @@ export class ChatController {
       // Mark group as having unread messages (cleared when loadMessages is called)
       await this.storage.saveGroupMeta(groupId, { ...(await this.storage.loadGroupMeta(groupId) || {}), hasUnread: true });
 
-      // Send encrypted Acknowledge receipt only for regular DMs (commits decrypt to null)
-      if (decryptedContent != null) this._sendAcknowledgeReceipt(groupId, messageId, parsed, actor);
+      // Send encrypted Acknowledge receipt only for regular content messages, debounced so
+      // a Read receipt sent first will cancel it (Read implies Acknowledge).
+      const receiptTypes = ['Acknowledge', 'Read', 'Like', 'Undo', 'Announce'];
+      const isSystemOrReceipt = decryptedContent == null
+        || decryptedContent.error
+        || receiptTypes.includes(decryptedContent.type);
+      if (!isSystemOrReceipt) {
+        this._scheduleAck(groupId, messageId, parsed, actor);
+      }
 
       // Store apId mapping if not yet set (context URI → ULID)
-      const existingApId = await this.storage.getGroupApId(groupId);
+      const existingApId = await this.storage.getGroupField(groupId, 'apId', null);
       if (!existingApId && isApUri(parsed.context)) {
         await this.storage.setGroupField(groupId, 'apId', parsed.context);
         console.log('[_handlePrivateMessage] Set apId mapping:', groupId, '→', parsed.context);
@@ -1167,7 +1237,7 @@ export class ChatController {
    * Shared by all removal methods.
    */
   async _distributeCommit(actor, groupId, commitB64, recipients) {
-    const apId = await this.storage.getGroupApId(groupId);
+    const apId = await this.storage.getGroupField(groupId, 'apId', null);
     console.log('[_distributeCommit] apId:', apId, 'recipients:', recipients, 'commitB64 length:', commitB64?.length);
     if (apId && recipients.length > 0) {
       await sendMLSControl(actor, 'PrivateMessage', commitB64, recipients, apId);
@@ -1195,7 +1265,7 @@ export class ChatController {
 
     const { welcome, ratchetTree, commit } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
 
-    const apId = await this.storage.getGroupApId(groupId);
+    const apId = await this.storage.getGroupField(groupId, 'apId', null);
 
     // Welcome + GroupInfo (ratchet tree) to the new member
     await this._sendInvite(actor, groupId, recipientUri, welcome, ratchetTree, apId);
@@ -1314,15 +1384,10 @@ export class ChatController {
    */
   async editMessage(groupId, messageId, newContent) {
     const actor = await getCurrentActor();
-    const members = await this.getGroupMembers(groupId);
-    const recipients = members.filter(id => id !== actor.id);
-    const apId = await this.storage.getGroupApId(groupId);
-
+    const { recipients, apId } = await this._groupSendContext(groupId, actor);
     await this.storage.updateMessage(messageId, { content: newContent });
-
     this._sendEncryptedActivity(groupId, {
-      type: 'Update',
-      id: messageUri(),
+      type: 'Update', id: messageUri(),
       object: { id: messageId, type: 'Note', content: newContent },
     }, recipients, apId);
   }
@@ -1335,17 +1400,88 @@ export class ChatController {
    */
   async deleteMessage(groupId, messageId) {
     const actor = await getCurrentActor();
-    const members = await this.getGroupMembers(groupId);
-    const recipients = members.filter(id => id !== actor.id);
-    const apId = await this.storage.getGroupApId(groupId);
-
+    const { recipients, apId } = await this._groupSendContext(groupId, actor);
     await this.storage.tombstoneMessage(messageId);
-
     this._sendEncryptedActivity(groupId, {
-      type: 'Delete',
-      id: messageUri(),
+      type: 'Delete', id: messageUri(),
       object: messageId,
     }, recipients, apId);
+  }
+
+  /** DRY helper: resolve recipients + apId for a group send. */
+  async _groupSendContext(groupId, actor) {
+    const members = await this.getGroupMembers(groupId);
+    const recipients = members.filter(id => id !== actor.id);
+    const apId = await this.storage.getGroupField(groupId, 'apId', null);
+    return { recipients, apId };
+  }
+
+  /** DRY helper: extract id from AP object-or-string. */
+  _objectId(obj) { return typeof obj === 'string' ? obj : obj?.id || null; }
+
+  /** DRY helper: resolve a message by inner id or outer apId. */
+  async _resolveMessage(id) {
+    if (!id) return null;
+    return (await this.storage.getMessage(id)) || (await this.storage.getMessageByApId(id)) || null;
+  }
+
+  /** DRY helper: store the comment Note that accompanies an Announce (send & receive path). */
+  async _saveAnnounceComment(groupId, announceId, attributedTo, content, isLocal, id = messageUri()) {
+    return this.storage.saveMessage(groupId, {
+      type: 'Note', attributedTo,
+      content, inReplyTo: announceId, timestamp: Date.now(),
+    }, id, isLocal, undefined);
+  }
+
+  async likeMessage(groupId, messageId, emoji = '👍') {
+    const actor = await getCurrentActor();
+    const { recipients, apId } = await this._groupSendContext(groupId, actor);
+    await this.storage.addReaction(messageId, actor.id, emoji);
+    this._sendEncryptedActivity(groupId, {
+      type: 'Like', id: messageUri(),
+      object: { type: 'Note', id: messageId },
+      content: emoji,
+    }, recipients, apId);
+  }
+
+  async undoLike(groupId, messageId, emoji = '👍') {
+    const actor = await getCurrentActor();
+    const { recipients, apId } = await this._groupSendContext(groupId, actor);
+    await this.storage.removeReaction(messageId, actor.id, emoji);
+    this._sendEncryptedActivity(groupId, {
+      type: 'Undo', id: messageUri(),
+      object: { type: 'Like', id: messageUri() },
+      target: messageId,
+      content: emoji,
+    }, recipients, apId);
+  }
+
+  async announceMessage(groupId, messageId, comment = '', _sourceGroupId = null, inlineContent = undefined) {
+    const actor = await getCurrentActor();
+    const { recipients, apId } = await this._groupSendContext(groupId, actor);
+    const announceId = messageUri();
+    // Cross-group boost: inline the original message content so recipients can read it without access to the source group
+    const objectPayload = inlineContent
+      ? { ...inlineContent, id: messageId }
+      : { type: 'Note', id: messageId };
+
+    await this.storage.saveMessage(groupId, {
+      type: 'Announce', attributedTo: actor.id,
+      object: messageId, content: null, timestamp: Date.now(),
+    }, announceId, true, undefined);
+    this._sendEncryptedActivity(groupId, {
+      type: 'Announce', id: announceId,
+      object: objectPayload,
+    }, recipients, apId);
+
+    if (comment.trim()) {
+      const noteId = messageUri();
+      await this._saveAnnounceComment(groupId, announceId, actor.id, comment, true, noteId);
+      this._sendEncryptedActivity(groupId, {
+        type: 'Note', id: noteId, content: comment, inReplyTo: announceId,
+      }, recipients, apId);
+    }
+    return announceId;
   }
 
   /**
@@ -1394,16 +1530,20 @@ export class ChatController {
     })();
   }
 
-  /** Send an encrypted Acknowledge receipt back to the original sender. */
-  _sendAcknowledgeReceipt(groupId, innerMessageId, parsed, _actor) {
-    const contextId = parsed.context;
-    this._sendEncryptedActivity(
-      groupId,
-      { type: 'Acknowledge', object: innerMessageId, timestamp: Date.now() },
-      [parsed.attributedTo],
-      contextId,
-      parsed.id
-    );
+  /** Debounced Acknowledge — cancelled if a Read receipt is sent first. */
+  _scheduleAck(groupId, innerMessageId, parsed, _actor) {
+    if (this._pendingAcks.has(innerMessageId)) return; // already scheduled
+    const handle = setTimeout(() => {
+      this._pendingAcks.delete(innerMessageId);
+      this._sendEncryptedActivity(
+        groupId,
+        { type: 'Acknowledge', object: innerMessageId, timestamp: Date.now() },
+        [parsed.attributedTo],
+        parsed.context,
+        parsed.id
+      );
+    }, 3000);
+    this._pendingAcks.set(innerMessageId, handle);
   }
 
   /**

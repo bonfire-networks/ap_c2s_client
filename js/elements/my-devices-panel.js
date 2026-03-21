@@ -29,7 +29,8 @@ export class MyDevicesPanel extends LitElement {
       currentActorId: { type: String },
       _devices: { type: Array, state: true },
       _loading: { type: Boolean, state: true },
-      _error: { type: String, state: true }
+      _error: { type: String, state: true },
+      _sendReadReceipts: { type: Boolean, state: true },
     }
   }
 
@@ -40,12 +41,23 @@ export class MyDevicesPanel extends LitElement {
     this._devices = []
     this._loading = false
     this._error = ''
+    this._sendReadReceipts = false
   }
 
   connectedCallback() {
     super.connectedCallback()
     adoptDaisyUI(this)
     this._loadDevices()
+    this._loadSettings()
+  }
+
+  async _loadSettings() {
+    if (!this.controller || !this.currentActorId) return
+    this._sendReadReceipts = await this.controller.storage.loadUserSetting(this.currentActorId, 'sendReadReceipts', false)
+  }
+
+  _emitSetting(key, value) {
+    this.dispatchEvent(new CustomEvent('settings-changed', { detail: { key, value }, bubbles: true }))
   }
 
   async _loadDevices() {
@@ -141,13 +153,29 @@ export class MyDevicesPanel extends LitElement {
         <button class="btn btn-ghost btn-sm btn-square" @click=${() => this._close()}>
           ${icon('arrow-left', { size: 20 })}
         </button>
-        <span class="font-semibold flex-1">My Devices</span>
+        <span class="font-semibold flex-1">Settings</span>
         <button class="btn btn-ghost btn-xs" @click=${() => this._loadDevices()}>
           ${icon('arrows-clockwise')}
         </button>
       </div>
       <div class="flex-1 overflow-y-auto p-3">
         ${this._error ? html`<div class="alert alert-error mb-3 text-sm">${this._error}</div>` : ''}
+        <div class="mb-4 border-b border-base-300 pb-4">
+          <h3 class="text-sm font-semibold opacity-60 mb-2 uppercase tracking-wide">Privacy</h3>
+          <label class="flex items-center gap-3 cursor-pointer">
+            <div class="flex-1">
+              <div class="text-sm font-medium">Send read receipts</div>
+              <div class="text-xs opacity-50">Let others know when you've read their messages</div>
+            </div>
+            <input type="checkbox" class="toggle toggle-sm toggle-primary" .checked=${this._sendReadReceipts}
+              @change=${async (e) => {
+                this._sendReadReceipts = e.target.checked
+                await this.controller.storage.saveUserSetting(this.currentActorId, 'sendReadReceipts', e.target.checked)
+                this._emitSetting('sendReadReceipts', e.target.checked)
+              }}>
+          </label>
+        </div>
+        <h3 class="text-sm font-semibold opacity-60 mb-2 uppercase tracking-wide">My Devices</h3>
         ${this._loading ? html`
           <div class="flex justify-center py-8"><span class="loading loading-spinner"></span></div>
         ` : this._devices.length === 0 ? html`

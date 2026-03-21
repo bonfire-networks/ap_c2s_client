@@ -89,6 +89,11 @@ export async function setGroupField(id, field, value) {
   }
 }
 
+export async function getGroupField(id, field, defaultValue = null) {
+  const rec = await db.table('groups').get(id);
+  return rec?.[field] ?? defaultValue;
+}
+
 export async function getGroupByField(field, value) {
   const rec = await db.table('groups').where(field).equals(value).first();
   return rec ? rec.id : null;
@@ -142,7 +147,7 @@ export async function getMessageByApId(apId) {
 
 export async function listMessages(groupId) {
   const msgs = await db.table('messages').where('groupId').equals(groupId).sortBy('timestamp');
-  return msgs.map(m => ({ id: m.id, groupId: m.groupId, isLocal: m.isLocal, isRead: m.isRead ?? m.isLocal ?? false, content: m.content, timestamp: m.timestamp, deliveryStatus: m.deliveryStatus || null, editedAt: m.editedAt || null }));
+  return msgs.map(m => ({ id: m.id, groupId: m.groupId, isLocal: m.isLocal, isRead: m.isRead ?? m.isLocal ?? false, content: m.content, timestamp: m.timestamp, deliveryStatus: m.deliveryStatus || null, editedAt: m.editedAt || null, reactions: m.reactions || {} }));
 }
 
 export async function updateDeliveryStatus(messageId, actorId, statusEntry) {
@@ -279,6 +284,43 @@ export async function isProcessed(actorId, activityId) {
 }
 
 // ──────────────────────────────────────────────
+// Reactions (emoji → [actorId, ...] map on message record)
+// ──────────────────────────────────────────────
+
+export async function addReaction(messageId, actorId, emoji) {
+  const rec = await db.table('messages').get(messageId);
+  if (!rec) return;
+  const reactions = rec.reactions || {};
+  const actors = reactions[emoji] || [];
+  if (actors.includes(actorId)) return; // idempotent
+  await db.table('messages').put({ ...rec, reactions: { ...reactions, [emoji]: [...actors, actorId] } });
+}
+
+export async function removeReaction(messageId, actorId, emoji) {
+  const rec = await db.table('messages').get(messageId);
+  if (!rec) return;
+  const reactions = rec.reactions || {};
+  const actors = (reactions[emoji] || []).filter(id => id !== actorId);
+  const updated = { ...reactions };
+  if (actors.length === 0) delete updated[emoji];
+  else updated[emoji] = actors;
+  await db.table('messages').put({ ...rec, reactions: updated });
+}
+
+// ──────────────────────────────────────────────
+// Read-receipt opt-in setting (per actor, stored in user state)
+// ──────────────────────────────────────────────
+
+// Generic per-user setting helpers
+export async function saveUserSetting(actorId, key, value) {
+  return saveUserField(actorId, key, value);
+}
+export async function loadUserSetting(actorId, key, defaultValue = null) {
+  const state = await loadUserState(actorId);
+  return state?.[key] ?? defaultValue;
+}
+
+// ──────────────────────────────────────────────
 // Bulk operations
 // ──────────────────────────────────────────────
 
@@ -302,50 +344,6 @@ export const clearAllData = clearAll;
 export const saveProcessedActivityId = markProcessed;
 export const isProcessedActivityId = isProcessed;
 
-export async function setGroupApId(mlsGroupId, apId) {
-  return setGroupField(mlsGroupId, 'apId', apId);
-}
-export async function getGroupIdByApId(apId) {
-  return getGroupByField('apId', apId);
-}
-export async function getGroupApId(mlsGroupId) {
-  const rec = await db.table('groups').get(mlsGroupId);
-  return rec && rec.apId ? rec.apId : null;
-}
-export async function setGroupName(mlsGroupId, name) {
-  return setGroupField(mlsGroupId, 'name', name);
-}
-export async function getGroupName(mlsGroupId) {
-  const rec = await db.table('groups').get(mlsGroupId);
-  return rec && rec.name ? rec.name : null;
-}
-
-export function saveUserKeyPackageDraft(actorId, keyPackage) {
-  return saveUserField(actorId, 'keyPackage', keyPackage);
-}
-export async function saveUserKeyPackagePublished(actorId, keyPackage) {
-  await _updateUserState(actorId, (state = {}) => ({ ...state, keyPackage, publishedDate: Date.now() }));
-}
-export async function loadUserKeyPackage(userId) {
-  const state = await loadUserState(userId);
-  return state ? state.keyPackage : null;
-}
-export function setKeyPackagePublishedDate(userId, timestamp = Date.now()) {
-  return saveUserField(userId, 'publishedDate', timestamp);
-}
-export async function saveIdentityPublicKey(userId, publicKeyBytes) {
-  return saveUserField(userId, 'identityPublicKey', Array.from(publicKeyBytes));
-}
-export async function loadIdentityPublicKey(userId) {
-  const state = await loadUserState(userId);
-  return state && state.identityPublicKey ? new Uint8Array(state.identityPublicKey) : null;
-}
-export async function saveProviderStorage(userId, storageArr) {
-  return saveBackendState(userId, storageArr);
-}
-export async function loadProviderStorage(userId) {
-  return loadBackendState(userId);
-}
 
 // Generic aliases used by openmlsUser.js
 export async function saveState(store, id, state) {
