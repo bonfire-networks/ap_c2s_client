@@ -90,6 +90,20 @@
  */
 // deleteMessage(id)
 
+/**
+ * Update a message's content fields (for edits). Sets editedAt timestamp.
+ * @param {string} id
+ * @param {Object} updatedFields - fields to merge into existing content
+ */
+// updateMessage(id, updatedFields)
+
+/**
+ * Tombstone a message: wipe content but preserve record for reply threading.
+ * Keeps type:'Tombstone', id, inReplyTo, attributedTo. Sets deletedAt timestamp.
+ * @param {string} id
+ */
+// tombstoneMessage(id)
+
 // ──────────────────────────────────────────────
 // MLS backend state (opaque bytes)
 // ──────────────────────────────────────────────

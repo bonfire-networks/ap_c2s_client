@@ -118,11 +118,16 @@ export async function listGroupsWithLastMessage() {
 export async function saveMessage(groupId, content, id = undefined, isLocal = false, apId = undefined, deliveryStatus = undefined) {
   const messageId = id || messageUri();
   const timestamp = (content && content.timestamp) || Date.now();
-  const rec = { id: messageId, groupId, isLocal, content, timestamp };
+  const rec = { id: messageId, groupId, isLocal, content, timestamp, isRead: isLocal };
   if (apId) rec.apId = apId;
   if (deliveryStatus) rec.deliveryStatus = deliveryStatus;
   await db.table('messages').put(rec);
   return messageId;
+}
+
+export async function markMessageRead(id) {
+  const rec = await db.table('messages').get(id);
+  if (rec && !rec.isRead) await db.table('messages').put({ ...rec, isRead: true });
 }
 
 export async function getMessage(id) {
@@ -137,7 +142,7 @@ export async function getMessageByApId(apId) {
 
 export async function listMessages(groupId) {
   const msgs = await db.table('messages').where('groupId').equals(groupId).sortBy('timestamp');
-  return msgs.map(m => ({ id: m.id, groupId: m.groupId, isLocal: m.isLocal, content: m.content, timestamp: m.timestamp, deliveryStatus: m.deliveryStatus || null }));
+  return msgs.map(m => ({ id: m.id, groupId: m.groupId, isLocal: m.isLocal, isRead: m.isRead ?? m.isLocal ?? false, content: m.content, timestamp: m.timestamp, deliveryStatus: m.deliveryStatus || null, editedAt: m.editedAt || null }));
 }
 
 export async function updateDeliveryStatus(messageId, actorId, statusEntry) {
@@ -163,6 +168,31 @@ export async function findLastMessageExcludingTypes(groupId, excludedTypes) {
     content: displayableMsg.content,
     timestamp: displayableMsg.timestamp
   } : null;
+}
+
+export async function updateMessage(id, updatedFields) {
+  const existing = await db.table('messages').get(id);
+  if (!existing) return;
+  await db.table('messages').put({
+    ...existing,
+    content: { ...existing.content, ...updatedFields },
+    editedAt: Date.now(),
+  });
+}
+
+export async function tombstoneMessage(id) {
+  const existing = await db.table('messages').get(id);
+  if (!existing) return;
+  await db.table('messages').put({
+    ...existing,
+    content: {
+      type: 'Tombstone',
+      id: existing.content?.id,
+      inReplyTo: existing.content?.inReplyTo,
+      attributedTo: existing.content?.attributedTo,
+    },
+    deletedAt: Date.now(),
+  });
 }
 
 export async function deleteMessage(id) {

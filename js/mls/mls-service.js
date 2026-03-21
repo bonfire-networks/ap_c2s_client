@@ -287,6 +287,12 @@ export class MLSService {
     return await this.backend.getGroupMemberIdentities(groupId);
   }
 
+  async leaveGroup(userId, groupId) {
+    const result = await this.backend.leaveGroup(userId, groupId);
+    if (!result?.cancelled) await this._persistAfterGroupOp(userId, groupId);
+    return result;
+  }
+
   async getGroupFingerprints(userId, groupId) {
     return await this.backend.getGroupFingerprints(userId, groupId);
   }
