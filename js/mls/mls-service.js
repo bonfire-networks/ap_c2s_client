@@ -129,13 +129,46 @@ export class MLSService {
    * @param {string} plaintext - message to encrypt
    * @returns {Uint8Array} ciphertext
    */
-  async encrypt(userId, groupId, plaintext) {
-    const ciphertext = await this.backend.encrypt(userId, groupId, plaintext);
-
-    // Persist backend state + update group metadata (ratchet tree)
+  /**
+   * Encrypt plaintext. Returns a pendingId string — ciphertext stays in Rust until sendMessage.
+   * Persists ratchet tree metadata after encryption (ratchet advances).
+   */
+  async encrypt(userId, groupId, plaintext, attachmentIds = []) {
+    const pendingId = await this.backend.encrypt(userId, groupId, plaintext, attachmentIds);
     await this._persistAfterGroupOp(userId, groupId);
+    return pendingId;
+  }
 
-    return ciphertext;
+  /**
+   * Send a pending encrypted message. JS passes the full AP body JSON (with pendingId as
+   * the `content` value); Rust substitutes the real ciphertext and POSTs.
+   */
+  async sendMessage(pendingId, outboxUrl, accessToken, body) {
+    return this.backend.sendMessage(pendingId, outboxUrl, accessToken, body);
+  }
+
+  /** Discard a pending encrypted message (send failed, user cancelled). */
+  async discardMessage(pendingId) {
+    if (this.backend.discardMessage) {
+      return this.backend.discardMessage(pendingId);
+    }
+  }
+
+  /**
+   * Decompress a .gz attachment into the app-sandboxed tmp dir and return the path.
+   */
+  async serveAttachment(path) {
+    if (this.backend.serveAttachment) {
+      return this.backend.serveAttachment(path);
+    }
+    return null;
+  }
+
+  /**
+   * Show a native save dialog and move the decompressed file to the user-chosen destination.
+   */
+  async saveAttachmentAs(tmpPath, suggestedName) {
+    return this.backend.saveAttachmentAs?.(tmpPath, suggestedName);
   }
 
   /**

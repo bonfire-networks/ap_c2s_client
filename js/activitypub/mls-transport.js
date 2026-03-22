@@ -18,51 +18,16 @@ const MLS_CONTEXTS = [
 ];
 
 /**
- * Send an encrypted message as a PrivateMessage activity.
+ * Send a pre-built PrivateMessage body to the actor's outbox.
+ * NOTE: sending is now done in Rust via mlsService.sendMessage — this is kept for reference/fallback.
+ * Build the body with buildPrivateMessageBody (in chat-controller.js).
  *
  * @param {object} actor - current actor
- * @param {string} ciphertextB64 - base64-encoded ciphertext
- * @param {string[]} recipients - recipient actor URIs
- * @param {string} contextId - AP thread/group context ID
- * @param {object} [options]
- * @param {boolean} [options.isNewThread] - whether this creates a new thread
- * @param {string} [options.inReplyTo] - ID to reply to (defaults to contextId)
+ * @param {object} body - result of buildPrivateMessageBody
  * @returns {object} response from outbox
  */
-export async function sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, options = {}) {
-  const { isNewThread, inReplyTo, overrides = {} } = options;
-
-  let to;
-  if (isNewThread) {
-    to = recipients;
-  } else {
-    const otherRecipients = recipients.filter(r => r !== actor.id);
-    to = otherRecipients.length > 0 ? otherRecipients : recipients;
-  }
-
-  const message = {
-    '@context': MLS_CONTEXTS,
-    type: 'PrivateMessage',
-    attributedTo: actor.id,
-    to,
-    summary: 'This is an encrypted message. Please read it using a compatible MLS-capable app.',
-    mediaType: 'message/mls',
-    encoding: 'base64',
-    content: ciphertextB64,
-    ...overrides,
-  };
-  // Only include context/inReplyTo when they're actual AP URIs (not local ULIDs)
-  if (contextId) message.context = contextId;
-  if (inReplyTo) message.inReplyTo = inReplyTo;
-  else if (contextId) message.inReplyTo = contextId;
-
-  console.log('[sendEncryptedMessage] Sending:', JSON.stringify({
-    type: message.type, to: message.to, attributedTo: message.attributedTo,
-    context: message.context, inReplyTo: message.inReplyTo, isNewThread,
-    hasContent: !!message.content, recipientCount: recipients.length
-  }, null, 2));
-
-  const res = await postToOutbox(actor, message);
+export async function sendEncryptedMessage(actor, body) {
+  const res = await postToOutbox(actor, body);
   if (res && (res.ok === false || res.status >= 400)) {
     throw new Error('Failed to send encrypted message: ' + (res.status || 'unknown status'));
   }

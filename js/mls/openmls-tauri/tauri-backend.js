@@ -59,10 +59,77 @@ export async function joinGroup(userId, groupId, welcomeBytes, ratchetTreeBytes)
   return result.groupId;
 }
 
-export async function encrypt(userId, groupId, plaintext) {
+/** Encrypt plaintext. Returns a pendingId string — ciphertext stays in Rust. */
+export async function encrypt(userId, groupId, plaintext, attachmentIds = []) {
   const msg = typeof plaintext === 'string' ? plaintext : JSON.stringify(plaintext);
-  const b64 = await invoke('plugin:openmls|encrypt', { userId, groupId, plaintext: msg });
-  return base64ToUint8(b64);
+  return invoke('plugin:openmls|encrypt', {
+    userId, groupId, plaintext: msg,
+    attachmentIds: attachmentIds.length ? attachmentIds : null,
+  });  // returns "__prepared_encrypted_msg:UUID__" string
+}
+
+/**
+ * Send a pending encrypted message. JS passes the full AP body JSON (with pendingId as
+ * the `content` value); Rust substitutes the real ciphertext and POSTs to outboxUrl.
+ */
+export async function sendMessage(pendingId, outboxUrl, accessToken, body) {
+  return invoke('plugin:openmls|send_message', {
+    pendingId, outboxUrl, accessToken,
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
+}
+
+/** Discard a pending encrypted message (send failed, user cancelled). */
+export async function discardMessage(pendingId) {
+  return invoke('plugin:openmls|discard_message', { pendingId });
+}
+
+/**
+ * Decompress a .gz attachment into the app-sandboxed tmp dir and return the path.
+ * JS uses convertFileSrc(path) for inline display of images/video/audio/PDF.
+ */
+export async function serveAttachment(path) {
+  return invoke('plugin:openmls|serve_attachment', { path });
+}
+
+/**
+ * Show a native save dialog and move the decompressed file to the user-chosen destination.
+ * For document attachments that should not be auto-opened.
+ */
+export async function saveAttachmentAs(tmpPath, suggestedName) {
+  return invoke('plugin:openmls|save_attachment_as', { tmpPath, suggestedName });
+}
+
+// ── Attachments ─────────────────────────────────────────────────────
+
+/** Send WebP bytes (images only) to Rust for gzip-compression and storage. */
+export async function prepareAttachmentBytes(attachmentId, bytes) {
+  await invoke('plugin:openmls|prepare_attachment_bytes', {
+    attachmentId,
+    bytes: Array.from(bytes),
+  });
+}
+
+/** Tell Rust to read a non-image file from disk and gzip-compress it. */
+export async function prepareAttachmentFile(attachmentId, path) {
+  await invoke('plugin:openmls|prepare_attachment_file', { attachmentId, path });
+}
+
+/** Remove an attachment: clears pending state and/or deletes the .gz from disk.
+ *  Pass `attachmentId` for pending attachments, `localPath` for already-sent ones, or both. */
+export async function removeAttachment({ attachmentId = null, localPath = null } = {}) {
+  await invoke('plugin:openmls|remove_attachment', { attachmentId, localPath });
+}
+
+/** Register callbacks for Rust-emitted attachment events. Returns unlisten functions. */
+export async function onAttachmentReady(callback) {
+  const { listen } = window.__TAURI__.event;
+  return listen('attachment-ready', e => callback(e.payload));
+}
+
+export async function onAttachmentFailed(callback) {
+  const { listen } = window.__TAURI__.event;
+  return listen('attachment-failed', e => callback(e.payload));
 }
 
 export async function decrypt(userId, groupId, ciphertext) {

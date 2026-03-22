@@ -11,9 +11,60 @@
  */
 
 import { bytesToBase64, bytesFromInput, groupUri, messageUri } from './utils.js';
-import { getCurrentActor, getActor, getActorId, apFetch } from './activitypub/auth.js';
+import { getCurrentActor, getActor, getActorId, apFetch, ensureFreshToken } from './activitypub/auth.js';
 import { postToOutbox, fetchActorKeyPackage, resolveActorId, extractApIdFromResponse } from './activitypub/client.js';
-import { sendEncryptedMessage, sendMLSControl, publishKeyPackage, deleteKeyPackage, parseMLSActivity } from './activitypub/mls-transport.js';
+import { sendMLSControl, publishKeyPackage, deleteKeyPackage, parseMLSActivity } from './activitypub/mls-transport.js';
+
+const MLS_CONTEXTS = [
+  'https://www.w3.org/ns/activitystreams',
+  'https://purl.archive.org/socialweb/mls'
+];
+
+/** Build the AP PrivateMessage body. `content` is a pendingId — Rust substitutes before sending. */
+function buildPrivateMessageBody(actor, content, recipients, contextId, options = {}) {
+  const { isNewThread, inReplyTo, overrides = {} } = options;
+  const otherRecipients = recipients.filter(r => r !== actor.id);
+  const to = isNewThread || otherRecipients.length === 0 ? recipients : otherRecipients;
+  return {
+    '@context': MLS_CONTEXTS,
+    type: 'PrivateMessage',
+    attributedTo: actor.id,
+    to,
+    summary: 'This is an encrypted message. Please read it using a compatible MLS-capable app.',
+    mediaType: 'message/mls',
+    encoding: 'base64',
+    content,
+    context: contextId || undefined,
+    inReplyTo: inReplyTo || contextId || undefined,
+    ...overrides,
+  };
+}
+
+/** Collect all _localPath values from an AP object tree (top-level + attachment array). */
+function _collectLocalPaths(obj) {
+  const paths = [];
+  if (!obj) return paths;
+  if (obj._localPath) paths.push(obj._localPath);
+  if (Array.isArray(obj.attachment)) {
+    for (const att of obj.attachment) {
+      if (att._localPath) paths.push(att._localPath);
+    }
+  }
+  return paths;
+}
+
+/** Collect all _attachmentId values from an AP object tree (top-level + attachment array). */
+function _collectAttachmentIds(obj) {
+  const ids = [];
+  if (!obj) return ids;
+  if (obj._attachmentId) ids.push(obj._attachmentId);
+  if (Array.isArray(obj.attachment)) {
+    for (const att of obj.attachment) {
+      if (att._attachmentId) ids.push(att._attachmentId);
+    }
+  }
+  return ids;
+}
 
 /** Check if a value looks like an AP URI (not a local ULID or null). */
 function isApUri(value) {
@@ -482,27 +533,39 @@ export class ChatController {
     const msgId = messageUri();
     const contentWithId = { ...msgObj, id: msgId };
 
-    // Encrypt (inner AS object now carries its own ap-mls:// id)
-    const ciphertext = await this.mlsService.encrypt(actor.id, groupId, contentWithId);
-    const ciphertextB64 = bytesToBase64(new Uint8Array(ciphertext));
+    // Collect attachment IDs from the content tree, then strip internal-only fields
+    const attachmentIds = _collectAttachmentIds(contentWithId);
+    const INTERNAL_FIELDS = new Set(['_attachmentId', '_localPath', '_thumbDataUrl']);
+    const cleanContent = attachmentIds.length
+      ? JSON.parse(JSON.stringify(contentWithId, (k, v) => INTERNAL_FIELDS.has(k) ? undefined : v))
+      : contentWithId;
 
-    // Get recipients
+    // Encrypt — Rust substitutes __pending_attachment_id:ID__ placeholders, stores ciphertext, returns pendingId
+    const pendingId = await this.mlsService.encrypt(actor.id, groupId, cleanContent, attachmentIds);
+
+    // Get recipients and AP context ID
     const members = await this.getGroupMembers(groupId);
     const recipients = members.length > 0 ? members : [actor.id];
-
-    // Look up AP ID for context — never fall back to local ULID
     const apId = await this.storage.getGroupField(groupId, 'apId', null);
     console.log('[_transmitEncrypted] apId:', apId, 'groupId:', groupId, 'msgId:', msgId);
 
-    // Save as pending with the client-generated ID
+    // Build AP body with pendingId as content placeholder — Rust substitutes before sending
+    const apBody = buildPrivateMessageBody(actor, pendingId, recipients, apId || null, {
+      isNewThread,
+      inReplyTo: inReplyTo || apId || null,
+    });
+
+    // Save as pending optimistically with the client-generated ID
     await this.storage.saveMessage(groupId, { ...msgObj, status: 'sending' }, msgId, true);
 
     try {
-      // Transmit — pass null context/inReplyTo for new threads (server assigns them)
-      const res = await sendEncryptedMessage(actor, ciphertextB64, recipients, apId || null, {
-        isNewThread,
-        inReplyTo: inReplyTo || apId || null
-      });
+      await ensureFreshToken();
+      const accessToken = localStorage.getItem('access_token');
+      const res = await this.mlsService.sendMessage(pendingId, actor.outbox, accessToken, apBody);
+
+      if (!res?.ok) {
+        throw new Error('Failed to send encrypted message: ' + (res?.error || res?.status || 'unknown'));
+      }
 
       // Extract server-assigned AP IDs from response
       const messageApId = extractApIdFromResponse(res);
@@ -516,7 +579,7 @@ export class ChatController {
       await this.storage.saveMessage(groupId, msgObj, msgId, true, messageApId || undefined, deliveryStatus);
       console.log('[_transmitEncrypted] Confirmed message:', msgId, 'apId:', messageApId, 'in group:', groupId);
 
-      // Mark the activity ID or object ID as processed so pollInbox won't reprocess the echo (inbox items may arrive wrapped in a Create with a different ID than the inner object)
+      // Mark the activity ID or object ID as processed so pollInbox won't reprocess the echo
       const activityApId = res?.id;
       if (activityApId) {
         await this.storage.markProcessed(actor.id, activityApId);
@@ -532,7 +595,7 @@ export class ChatController {
 
       return msgId;
     } catch (e) {
-      // Update the message to failed state
+      await this.mlsService.discardMessage(pendingId);
       const errStr = typeof e === 'string' ? e : (e.message || String(e));
       console.error('[_transmitEncrypted] Failed to send, saving as failed:', errStr);
       await this.storage.saveMessage(groupId, { ...msgObj, status: 'failed', error: errStr }, msgId, true);
@@ -541,12 +604,13 @@ export class ChatController {
   }
 
   /** Build a Note AP object from raw user input fields. */
-  async _buildNoteObject({ name, summary, content, inReplyTo } = {}) {
+  async _buildNoteObject({ name, summary, content, inReplyTo, attachments } = {}) {
     const actor = await getCurrentActor();
     const obj = { type: 'Note', content: content.trim(), attributedTo: actor.id };
     if (name?.trim()) obj.name = name.trim();
     if (summary?.trim()) obj.summary = summary.trim();
     if (inReplyTo) obj.inReplyTo = inReplyTo;
+    if (attachments?.length) obj.attachment = attachments;
     return obj;
   }
 
@@ -555,12 +619,23 @@ export class ChatController {
    * Returns `{ groupId, messageApId?, errors? }`.
    *
    * @param {string|null} groupId - existing group, or null to create a new one
-   * @param {{ name?, summary?, content, inReplyTo? }} fields - message content
+   * @param {{ name?, summary?, content, inReplyTo?, attachments? }} fields - message content
    * @param {string[]} [recipients] - webfinger mentions or URIs (new group only)
    */
-  async sendMessage(groupId, { name, summary, content, inReplyTo } = {}, recipients = []) {
+  async sendMessage(groupId, { name, summary, content, inReplyTo, attachments } = {}, recipients = []) {
     const actor = await getCurrentActor();
-    const msgObj = await this._buildNoteObject({ name, summary, content, inReplyTo });
+
+    // Single media file with no text → top-level typed object (Image/Audio/Video)
+    // Multiple files or files+text → Note with attachment array
+    let msgObj;
+    if (!content?.trim() && attachments?.length === 1) {
+      const att = attachments[0];
+      msgObj = { ...att, attributedTo: actor.id };
+      if (summary?.trim()) msgObj.summary = summary.trim();
+      if (inReplyTo) msgObj.inReplyTo = inReplyTo;
+    } else {
+      msgObj = await this._buildNoteObject({ name, summary, content, inReplyTo, attachments });
+    }
 
     if (recipients.length > 0) {
       // New group flow
@@ -934,10 +1009,15 @@ export class ChatController {
       const innerTypes = Array.isArray(decryptedContent.type) ? decryptedContent.type : [decryptedContent.type];
       if (innerTypes.includes('Update') && decryptedContent.object) {
         const obj = decryptedContent.object;
-        const targetId = typeof obj === 'string' ? obj : obj.id;
+        const targetId = typeof obj === 'string' ? obj : obj?.id;
+        if (!targetId) return { type: 'update', groupId };
         const existing = await this.storage.getMessage(targetId) || await this.storage.getMessageByApId(targetId);
         if (existing && existing.content?.attributedTo === parsed.attributedTo) {
-          await this.storage.updateMessage(targetId, { content: obj.content });
+          // Merge updated object over existing content, preserving local-only fields (_localPath, _thumbDataUrl)
+          const updatedContent = typeof obj === 'string'
+            ? existing.content
+            : { ...existing.content, ...obj };
+          await this.storage.saveMessage(groupId, updatedContent, targetId, existing.isLocal, existing.apId, existing.deliveryStatus, existing.timestamp);
           await this.storage.saveGroupMeta(groupId, { ...(await this.storage.loadGroupMeta(groupId) || {}), hasUnread: true });
         }
         return { type: 'update', groupId };
@@ -1197,6 +1277,10 @@ export class ChatController {
   async archiveThread(groupId) {
     const actor = await getCurrentActor();
     await this.mlsService.deleteGroup(actor.id, groupId);
+    // Collect and delete local attachment files before wiping messages
+    const msgs = await this.storage.listMessages(groupId);
+    const paths = msgs.flatMap(m => _collectLocalPaths(m.content || m));
+    this._deleteAttachmentFiles(paths);
     await this.storage.deleteGroupMessages(groupId);
     await this.storage.deleteGroupMeta(groupId);
   }
@@ -1384,14 +1468,21 @@ export class ChatController {
    * @param {string} messageId - inner ap-mls:// message ID
    * @param {string} newContent
    */
-  async editMessage(groupId, messageId, newContent) {
+  /** Send an encrypted Update activity. Saves `updatedContent` to storage and broadcasts to peers. */
+  async updateMessageObject(groupId, messageId, updatedContent, storedTimestamp) {
     const actor = await getCurrentActor();
     const { recipients, apId } = await this._groupSendContext(groupId, actor);
-    await this.storage.updateMessage(messageId, { content: newContent });
+    await this.storage.saveMessage(groupId, updatedContent, messageId, true, undefined, undefined, storedTimestamp);
     this._sendEncryptedActivity(groupId, {
       type: 'Update', id: messageUri(),
-      object: { id: messageId, type: 'Note', content: newContent },
+      object: updatedContent,
     }, recipients, apId);
+  }
+
+  async editMessage(groupId, messageId, newContent) {
+    const stored = await this.storage.getMessage(messageId);
+    const updatedContent = { ...(stored?.content || {}), content: newContent };
+    return this.updateMessageObject(groupId, messageId, updatedContent, stored?.timestamp);
   }
 
   /**
@@ -1403,11 +1494,20 @@ export class ChatController {
   async deleteMessage(groupId, messageId) {
     const actor = await getCurrentActor();
     const { recipients, apId } = await this._groupSendContext(groupId, actor);
+    const msg = await this.storage.getMessage(messageId);
+    if (msg) this._deleteAttachmentFiles(_collectLocalPaths(msg.content || msg));
     await this.storage.tombstoneMessage(messageId);
     this._sendEncryptedActivity(groupId, {
       type: 'Delete', id: messageUri(),
       object: messageId,
     }, recipients, apId);
+  }
+
+  /** Fire-and-forget: delete local .gz attachment files. */
+  _deleteAttachmentFiles(localPaths) {
+    for (const p of localPaths) {
+      this.mlsService.backend.removeAttachment?.({ localPath: p }).catch(() => {});
+    }
   }
 
   /** DRY helper: resolve recipients + apId for a group send. */
@@ -1527,9 +1627,12 @@ export class ChatController {
     (async () => {
       try {
         const actor = await getCurrentActor();
-        const ciphertext = await this.mlsService.encrypt(actor.id, groupId, payload);
-        const ciphertextB64 = bytesToBase64(new Uint8Array(ciphertext));
-        await sendEncryptedMessage(actor, ciphertextB64, recipients, contextId, { inReplyTo, overrides });
+        const pendingId = await this.mlsService.encrypt(actor.id, groupId, payload);
+        const apBody = buildPrivateMessageBody(actor, pendingId, recipients, contextId, { inReplyTo, overrides });
+        await ensureFreshToken();
+        const accessToken = localStorage.getItem('access_token');
+        const res = await this.mlsService.sendMessage(pendingId, actor.outbox, accessToken, apBody);
+        if (!res?.ok) await this.mlsService.discardMessage(pendingId);
         console.log('[receipt] Sent', payload.type, 'for:', payload.object);
       } catch (e) {
         console.warn('[receipt] Failed to send', payload.type, ':', e.message || e);

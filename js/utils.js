@@ -111,6 +111,10 @@ export function base64ToUint8(b64) {
 export function groupUri(id = ulid())   { return `mls://g/${id}`; }
 export function messageUri(id = ulid()) { return `mls://m/${id}`; }
 
+export function formatFileSize(bytes) {
+  return bytes ? (bytes / 1024).toFixed(1) + ' KB' : '';
+}
+
 export function relativeTime(ts) {
   const diff = Date.now() - ts;
   if (diff < 60000) return 'just now';

@@ -120,9 +120,9 @@ export async function listGroupsWithLastMessage() {
 // Messages
 // ──────────────────────────────────────────────
 
-export async function saveMessage(groupId, content, id = undefined, isLocal = false, apId = undefined, deliveryStatus = undefined) {
+export async function saveMessage(groupId, content, id = undefined, isLocal = false, apId = undefined, deliveryStatus = undefined, explicitTimestamp = undefined) {
   const messageId = id || messageUri();
-  const timestamp = (content && content.timestamp) || Date.now();
+  const timestamp = explicitTimestamp || (content && content.timestamp) || Date.now();
   const rec = { id: messageId, groupId, isLocal, content, timestamp, isRead: isLocal };
   if (apId) rec.apId = apId;
   if (deliveryStatus) rec.deliveryStatus = deliveryStatus;

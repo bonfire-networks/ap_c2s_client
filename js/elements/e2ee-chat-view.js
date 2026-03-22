@@ -1,5 +1,5 @@
 import { html, css, LitElement } from 'lit'
-import { relativeTime } from '../utils.js'
+import { relativeTime, formatFileSize } from '../utils.js'
 import { ChatController, EncryptionLostError } from '../chat-controller.js'
 import { MLSService } from '../mls/mls-service.js'
 import * as storage from '../storage/indexeddb-storage.js'
@@ -7,6 +7,33 @@ import { logout } from '../activitypub/auth.js'
 import { adoptDaisyUI, icon } from './shared-styles.js'
 import './theme-picker.js'
 import './my-devices-panel.js'
+
+// Grouped mime type definitions — source of truth for both _guessMime and file picker filters
+const MIME_GROUPS = {
+  Images:    { 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'gif': 'image/gif', 'webp': 'image/webp', 'bmp': 'image/bmp', 'heic': 'image/heic', 'avif': 'image/avif', 'svg': 'image/svg+xml' },
+  Video:     { 'mp4': 'video/mp4', 'mov': 'video/quicktime', 'webm': 'video/webm', 'mkv': 'video/x-matroska', 'avi': 'video/x-msvideo', 'm4v': 'video/mp4' },
+  Audio:     { 'mp3': 'audio/mpeg', 'ogg': 'audio/ogg', 'wav': 'audio/wav', 'flac': 'audio/flac', 'aiff': 'audio/aiff', 'aif': 'audio/aiff', 'm4a': 'audio/mp4', 'opus': 'audio/opus', 'aac': 'audio/aac' },
+  Documents: { 'pdf': 'application/pdf', 'epub': 'application/epub+zip', 'doc': 'application/msword', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'xls': 'application/vnd.ms-excel', 'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'ppt': 'application/vnd.ms-powerpoint', 'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation', 'odt': 'application/vnd.oasis.opendocument.text', 'ods': 'application/vnd.oasis.opendocument.spreadsheet', 'odp': 'application/vnd.oasis.opendocument.presentation', 'txt': 'text/plain', 'md': 'text/markdown', 'csv': 'text/csv', 'json': 'application/json' },
+  Archives:  { 'zip': 'application/zip', 'gz': 'application/gzip', '7z': 'application/x-7z-compressed', 'rar': 'application/vnd.rar', 'tar': 'application/x-tar', 'bz2': 'application/x-bzip2', 'xz': 'application/x-xz' },
+};
+const _MIME_FLAT = Object.assign({}, ...Object.values(MIME_GROUPS));
+function _guessMime(ext) { return _MIME_FLAT[ext] || 'application/octet-stream'; }
+
+// File picker filters: one per group + "All supported" merging all known extensions
+const FILE_PICKER_FILTERS = [
+  { name: 'Common file types', extensions: Object.keys(_MIME_FLAT) },
+  ...Object.entries(MIME_GROUPS).map(([name, map]) => ({ name, extensions: Object.keys(map) })),
+  { name: 'All files', extensions: ['*'] },
+];
+
+// Extensions blocked from sending (executables, scripts, etc.)
+const BLOCKED_EXTENSIONS = new Set([
+  'exe','msi','bat','cmd','com','ps1','sh','bash','zsh','fish',
+  'app','dmg','pkg','deb','rpm',
+  'js','ts','jsx','tsx','py','rb','pl','php','lua','r',
+  'dll','so','dylib','sys','ko',
+  'vbs','wsf','hta','scr','pif',
+]);
 
 export class E2EEChatView extends LitElement {
   static styles = css`
@@ -231,6 +258,10 @@ export class E2EEChatView extends LitElement {
       _boostCrossGroup: { type: Boolean, state: true },
       _emojiPickerMsgId: { type: String, state: true },
       _reactionsPanel: { type: Object, state: true }, // { msg } | null
+      _pendingAttachments: { type: Array, state: true },
+      _attachmentError: { type: String, state: true },
+      _attachmentLoading: { type: Boolean, state: true },
+      _lightbox: { type: Object, state: true },
     }
   }
 
@@ -265,6 +296,11 @@ export class E2EEChatView extends LitElement {
     this._reactionsPanel = null
     this._addMemberError = null
     this._profileLoadPending = new Set()
+    this._pendingAttachments = []
+    this._attachmentError = ''
+    this._attachmentLoading = false
+    this._mediaUrlCache = new Map() // localPath → { src, tempPath }
+    this._lightbox = null // { src, type, name } — shown in overlay when set
     this.messages = []
     this.input = ''
     this.name = ''
@@ -337,6 +373,7 @@ export class E2EEChatView extends LitElement {
         window.__TAURI__.window.getCurrentWindow().setTitle(`Secure Chat - ${nickname}`);
       }
 
+      this._initAttachmentEvents();
       await this.loadGroups();
       this.pollInbox();
 
@@ -539,8 +576,247 @@ export class E2EEChatView extends LitElement {
     this.creatingNewGroup = true;
   }
 
+  // ──────────────────────────────────────────────
+  // Attachments — file picking + Rust-side processing
+  // ──────────────────────────────────────────────
+
+  /** Register Rust attachment event listeners. Called once from connectedCallback. */
+  async _initAttachmentEvents() {
+    const backend = this.controller?.mlsService?.backend;
+    if (!backend?.onAttachmentReady) return;
+    this._unlistenAttachmentReady = await backend.onAttachmentReady(({ id, size, compressedSize, localPath }) => {
+      this._pendingAttachments = this._pendingAttachments.map(a =>
+        a.id === id ? { ...a, status: 'ready', size, compressedSize, localPath } : a);
+    });
+    this._unlistenAttachmentFailed = await backend.onAttachmentFailed(({ id, error }) => {
+      this._pendingAttachments = this._pendingAttachments.map(a =>
+        a.id === id ? { ...a, status: 'failed', error } : a);
+    });
+  }
+
+  /** Open the native OS file picker via tauri-plugin-dialog. */
+  async _openFilePicker() {
+    const { open } = window.__TAURI__?.dialog || {};
+    if (!open) { console.warn('[attachments] tauri-plugin-dialog not available'); return; }
+    const result = await open({ multiple: true, filters: FILE_PICKER_FILTERS });
+    if (!result) return;
+    const paths = Array.isArray(result) ? result : [result];
+    for (const filePath of paths) {
+      this._addAttachment(filePath); // fire-and-forget; Rust emits events when ready
+    }
+  }
+
+  /** Start processing one file. For images (except GIF): Canvas→WebP→Rust bytes. For others: Rust reads from disk. */
+  async _addAttachment(filePath) {
+    const id = crypto.randomUUID();
+    const fileName = filePath.split(/[/\\]/).pop();
+    const ext = (fileName.split('.').pop() || '').toLowerCase();
+    if (BLOCKED_EXTENSIONS.has(ext)) {
+      this._attachmentError = `File type .${ext} is not allowed`;
+      return;
+    }
+    const isAnimated = ext === 'gif'; // preserve animation — skip WebP conversion
+    const isRasterImage = ['jpg','jpeg','png','webp','bmp','heic'].includes(ext);
+    const isImage = isRasterImage || isAnimated;
+    const mediaType = isRasterImage ? 'image/webp' : _guessMime(ext);
+    const apType = isImage ? 'Image' : (mediaType.startsWith('audio/') ? 'Audio' : mediaType.startsWith('video/') ? 'Video' : 'Document');
+
+    // Show the entry immediately with 'processing' status
+    // Preview: use convertFileSrc to show original file while WebP is being prepared
+    const { convertFileSrc } = window.__TAURI__?.core || {};
+    const rawPreviewUrl = convertFileSrc ? convertFileSrc(filePath) : null;
+
+    this._pendingAttachments = [...this._pendingAttachments, {
+      id, name: isRasterImage ? fileName.replace(/\.[^.]+$/, '.webp') : fileName,
+      apType, mediaType, size: 0,
+      previewUrl: isImage ? rawPreviewUrl : null, // show original while converting
+      status: 'processing', filePath,
+      _attachmentId: id,
+    }];
+
+    const backend = this.controller.mlsService.backend;
+
+    if (isRasterImage) {
+      try {
+        // Fetch original image, compress to WebP via Canvas, pass bytes to Rust once
+        const res = await fetch(rawPreviewUrl || filePath);
+        const blob = await res.blob();
+        if (blob.size > 20 * 1024 * 1024) {
+          this._pendingAttachments = this._pendingAttachments.map(a =>
+            a.id === id ? { ...a, status: 'failed', error: 'Image too large (max 20 MB)' } : a);
+          return;
+        }
+        // Generate thumbnail immediately from raw blob — fastest possible preview
+        const thumbDataUrl = await this._generateThumbnail(blob);
+        this._pendingAttachments = this._pendingAttachments.map(a =>
+          a.id === id ? { ...a, previewUrl: thumbDataUrl, thumbDataUrl, _rawPreviewUrl: rawPreviewUrl } : a);
+        const webpBlob = await this._compressToWebP(blob);
+        this._pendingAttachments = this._pendingAttachments.map(a =>
+          a.id === id ? { ...a, size: webpBlob.size } : a);
+        // Pass WebP bytes to Rust (one-time transfer; Rust emits attachment-ready when done)
+        const bytes = new Uint8Array(await webpBlob.arrayBuffer());
+        await backend.prepareAttachmentBytes(id, bytes);
+      } catch (e) {
+        this._pendingAttachments = this._pendingAttachments.map(a =>
+          a.id === id ? { ...a, status: 'failed', error: e.message } : a);
+      }
+    } else {
+      // GIFs, audio, video, documents: Rust reads from disk directly; emits attachment-ready/failed
+      await backend.prepareAttachmentFile(id, filePath);
+    }
+  }
+
+  /** Remove a pending attachment and clean up Rust state. */
+  async _removeAttachment(id) {
+    const att = this._pendingAttachments.find(a => a.id === id);
+    if (att?.previewUrl?.startsWith('blob:')) {
+      URL.revokeObjectURL(att.previewUrl); // only revoke blob URLs, not data: or convertFileSrc URLs
+    }
+    await this.controller.mlsService.backend.removeAttachment?.({ attachmentId: id }).catch(() => {});
+    this._pendingAttachments = this._pendingAttachments.filter(a => a.id !== id);
+  }
+
+  /** Canvas compress a Blob to WebP (max 2048px). */
+  async _compressToWebP(blob, maxDim = 2048, quality = 0.85) {
+    const bitmap = await createImageBitmap(blob);
+    const canvas = document.createElement('canvas');
+    const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const webpBlob = await new Promise(res => canvas.toBlob(res, 'image/webp', quality));
+    if (!webpBlob) throw new Error('WebP conversion failed');
+    return webpBlob;
+  }
+
+  /** Generate a WebP thumbnail capped at the chat bubble max display size (192px). Returns a data URL. */
+  async _generateThumbnail(source) {
+    const bitmap = await createImageBitmap(source);
+    const canvas = document.createElement('canvas');
+    const scale = Math.min(1, 192 / Math.max(bitmap.width, bitmap.height));
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/webp', 0.7);
+  }
+
+  /** Resolve a received AP media object. Returns { src, tempPath } or null while loading.
+   *  src: asset:// URL usable in <img>/<audio>/<video>/<a href>.
+   *  tempPath: raw filesystem path, used for saveAttachmentAs on document types. */
+  _mediaObjectUrl(obj) {
+    if (obj?._localPath) {
+      const cacheKey = obj._localPath;
+      if (this._mediaUrlCache.has(cacheKey)) return this._mediaUrlCache.get(cacheKey);
+      const backend = this.controller?.mlsService?.backend;
+      if (backend?.serveAttachment) {
+        backend.serveAttachment(obj._localPath).then(tempPath => {
+          const { convertFileSrc } = window.__TAURI__?.core || {};
+          const src = convertFileSrc ? convertFileSrc(tempPath) : `file://${tempPath}`;
+          this._mediaUrlCache.set(cacheKey, { src, tempPath });
+          this.requestUpdate();
+        }).catch(e => console.error('[chat] serveAttachment failed:', e));
+      }
+      return null;
+    }
+    if (!obj?.content) return null;
+    const dataUrl = `data:${obj.mediaType};base64,${obj.content}`;
+    return { src: dataUrl, tempPath: null };
+  }
+
+  /** Render a received AP media object (Image/Audio/Video/Document). */
+  /** Shared file chip: icon + name + secondary line. Pass `href` for a link, `onClick` for a button action. */
+  _renderFileChip({ name, size, previewUrl, secondary, href, onClick, onRemove } = {}) {
+    const inner = html`
+      ${previewUrl
+        ? html`<img src=${previewUrl} class="w-10 h-10 object-cover rounded">`
+        : icon('paperclip', { size: 14 })}
+      <div class="flex flex-col min-w-0">
+        <span class="max-w-[8rem] truncate">${name || 'file'}</span>
+        ${secondary ?? (size ? html`<span class="opacity-50">${formatFileSize(size)}</span>` : '')}
+      </div>`;
+    return html`
+      <div class="relative flex items-center gap-1 rounded px-2 py-1 text-xs bg-base-300">
+        ${href
+          ? html`<a href=${href} target="_blank" class="flex items-center gap-1 hover:underline">${inner}</a>`
+          : html`<button type="button" class="flex items-center gap-1 hover:opacity-80" @click=${onClick}>${inner}</button>`}
+        ${onRemove ? html`<button type="button" class="btn btn-ghost btn-xs btn-square p-0 ml-1"
+          @click=${onRemove}>✕</button>` : ''}
+      </div>`;
+  }
+
+  _renderMediaObject(obj, { msg, isOwn, isTopLevel = false } = {}) {
+    if (!obj?.content && !obj?._localPath && !obj?._thumbDataUrl) return '';
+    const urls = this._mediaObjectUrl(obj);
+    const { src, tempPath } = urls || {};
+    // Images with a cached thumbnail can render immediately without waiting for serveAttachment
+    if (!urls && !obj._thumbDataUrl) return html`<div class="text-xs opacity-50 italic mt-1">Loading…</div>`;
+    const onDelete = obj._localPath && msg
+      ? () => this._handleDeleteStoredAttachment(obj, msg, isOwn && !isTopLevel)
+      : null;
+    const openLightbox = src ? () => { this._lightbox = { src, type: obj.type, name: obj.name }; } : null;
+    if (obj.type === 'Image') {
+      const thumbSrc = obj._thumbDataUrl || src;
+      const onLoad = !obj._thumbDataUrl ? async (e) => {
+        try {
+          const dataUrl = await this._generateThumbnail(e.target);
+          obj._thumbDataUrl = dataUrl;
+          if (msg) {
+            const stored = await this.controller.storage.getMessage(msg.id);
+            if (stored) await this.controller.storage.saveMessage(
+              msg.groupId || this.selectedGroupId, stored.content || stored,
+              msg.id, msg.isLocal, undefined, undefined, stored.timestamp);
+          }
+          this.requestUpdate();
+        } catch (_) {}
+      } : null;
+      return html`
+        <div class="relative inline-block mt-1 max-w-[12rem]">
+          <button type="button" class="block cursor-zoom-in" @click=${openLightbox || null}>
+            <img src=${thumbSrc} class="max-w-full max-h-48 w-auto rounded-lg block object-contain"
+              @load=${onLoad || null} alt=${obj.name || ''} loading="lazy">
+          </button>
+          ${onDelete ? html`<button class="absolute top-1 right-1 btn btn-xs btn-error btn-circle opacity-70 hover:opacity-100"
+            @click=${onDelete}>✕</button>` : ''}
+        </div>`;
+    }
+    // Audio/Video: inline player; click chip opens lightbox for larger view
+    if (obj.type === 'Audio' || obj.type === 'Video') {
+      const tag = obj.type === 'Audio' ? 'audio' : 'video';
+      return html`<${tag} controls src=${src} class="mt-1 ${obj.type === 'Video' ? 'max-w-xs rounded-lg' : 'w-full max-w-xs'} block"></${tag}>`;
+    }
+    // Documents: "Save…" button triggers native save dialog via Rust; PDF also openable in lightbox
+    const isPdf = /\.pdf$/i.test(obj.name || '');
+    const onOpen = isPdf && src ? openLightbox : null;
+    const onSave = tempPath
+      ? () => this.controller?.mlsService?.saveAttachmentAs?.(tempPath, obj.name || 'file')
+      : null;
+    return this._renderFileChip({ name: obj.name, size: obj.size, onClick: onOpen || onSave, onRemove: onDelete });
+  }
+
+  _renderAttachmentPreview() {
+    if (!this._pendingAttachments.length) return '';
+    return html`
+      <div class="flex flex-wrap gap-2 px-1 pb-1">
+        ${this._pendingAttachments.map(att => {
+          const secondary = att.status === 'processing'
+            ? html`<span class="loading loading-dots loading-xs"></span>`
+            : att.status === 'failed'
+              ? html`<span class="text-error text-xs truncate max-w-[8rem]">${att.error}</span>`
+              : null; // null → default size line in _renderFileChip
+          return this._renderFileChip({
+            name: att.name, size: att.size,
+            previewUrl: att.previewUrl,
+            secondary,
+            onRemove: () => this._removeAttachment(att.id),
+          });
+        })}
+      </div>
+    `;
+  }
+
   async sendMessage() {
-    if (!this.input.trim() || (!this.selectedGroupId && !this.creatingNewGroup)) return;
+    if (!this.input.trim() && !this._pendingAttachments.length) return;
+    if (!this.selectedGroupId && !this.creatingNewGroup) return;
     if (this._recipientInput.trim()) await this._addRecipient();
 
     const recipients = this._resolvedRecipients.filter(r => r.resolved).map(r => r.actorUri);
@@ -552,18 +828,33 @@ export class E2EEChatView extends LitElement {
     this.error = '';
     this.loading = true;
 
-    // Capture input state before clearing
+    // Only send ready attachments; convert pending entries to AP attachment objects
+    const readyAttachments = this._pendingAttachments.filter(a => a.status === 'ready');
+    const attachments = readyAttachments.map(a => ({
+      type: a.apType,
+      name: a.name,
+      mediaType: a.mediaType,
+      encoding: 'gzip',
+      content: `__pending_attachment_id:${a.id}__`,      // Rust substitutes with base64(gzip(bytes)) at encrypt time
+      size: a.size,                     // uncompressed size — valid AP field, shown in UI
+      _attachmentId: a.id,              // collected by chat-controller to pass to mlsService.encrypt
+      _localPath: a.localPath,          // stored with message so sender can view locally via serve_attachment
+      _thumbDataUrl: a.thumbDataUrl,    // thumbnail data URL stored in IndexedDB with message
+    }));
     const fields = {
       name: this.name.trim(),
       summary: this.summary.trim(),
       content: this.input.trim(),
       inReplyTo: this.replyToId || undefined,
+      attachments: attachments.length ? attachments : undefined,
     };
 
     // Clear input immediately for responsiveness
     this.input = '';
     this.name = '';
     this.summary = '';
+    this._pendingAttachments = [];
+    this._attachmentError = '';
     this._resolvedRecipients = [];
     this._recipientInput = '';
     this.replyToId = null;
@@ -967,7 +1258,8 @@ export class E2EEChatView extends LitElement {
   }
 
   async _handleDeleteMessage(msg) {
-    if (!confirm('Delete this message for everyone?')) return;
+    const ask = window.__TAURI__?.dialog?.ask || ((msg) => Promise.resolve(confirm(msg)));
+    if (!await ask('Delete this message for everyone?', { title: 'Delete message', kind: 'warning' })) return;
     try {
       await this.controller.deleteMessage(this.selectedGroupId, msg.id);
       await this.loadMessages(this.selectedGroupId);
@@ -977,8 +1269,40 @@ export class E2EEChatView extends LitElement {
     }
   }
 
+  /** Delete a stored attachment (array item) locally or for everyone via encrypted Update. */
+  async _handleDeleteStoredAttachment(att, msg, isOwn) {
+    const ask = window.__TAURI__?.dialog?.ask || ((m) => Promise.resolve(confirm(m)));
+    if (!await ask('Remove this attachment from your device?', { title: 'Delete attachment', kind: 'warning' })) return;
+    const forEveryone = isOwn && await ask('Also delete for everyone?', { title: 'Delete for everyone', kind: 'warning' });
+    try {
+      await this.controller.mlsService.backend.removeAttachment?.({ localPath: att._localPath }).catch(() => {});
+      const stored = await this.controller.storage.getMessage(msg.id);
+      if (stored) {
+        const content = stored.content || stored;
+        if (forEveryone) {
+          // Remove attachment from array; send encrypted Update so peers remove it too
+          content.attachment = (content.attachment || []).filter(a => a._localPath !== att._localPath);
+          await this.controller.updateMessageObject(this.selectedGroupId, msg.id, content, stored.timestamp);
+        } else {
+          // Local only: clear _localPath/content so file is no longer referenced
+          const clearLocal = (obj) => {
+            if (obj?._localPath === att._localPath) { delete obj._localPath; delete obj.content; }
+          };
+          clearLocal(content);
+          (content.attachment || []).forEach(clearLocal);
+          await this.controller.storage.saveMessage(this.selectedGroupId, content, msg.id, msg.isLocal, undefined, undefined, stored.timestamp);
+        }
+      }
+      await this.loadMessages(this.selectedGroupId);
+    } catch (e) {
+      this.error = 'Failed to delete attachment: ' + (e.message || e);
+      this.requestUpdate();
+    }
+  }
+
   async _handleDeleteLocalMessage(msg) {
-    if (!confirm('Remove this message from your device only?\n\nThis will not affect other members.')) return;
+    const ask = window.__TAURI__?.dialog?.ask || ((msg) => Promise.resolve(confirm(msg)));
+    if (!await ask('Remove this message from your device only? This will not affect other members.', { title: 'Remove message', kind: 'warning' })) return;
     try {
       await this.controller.storage.deleteMessage(msg.id);
       await this.loadMessages(this.selectedGroupId);
@@ -1516,6 +1840,7 @@ export class E2EEChatView extends LitElement {
     const hasReplies = msg.replies && msg.replies.length > 0;
     const isOwnMsg = msg.isLocal || msg.attributedTo === this.currentActorId;
     const isEditing = this._editingId === msg.id;
+    const isMediaType = ['Image', 'Audio', 'Video', 'Document'].includes(msg.type);
 
     const bubble = html`
       <div class="chat-bubble text-sm py-2 px-3" style="--bubble-bg:color-mix(in srgb,${color} 15%,var(--color-base-200,#f0f0f0))">
@@ -1533,7 +1858,10 @@ export class E2EEChatView extends LitElement {
             <button class="btn btn-primary btn-xs" @click=${() => this._saveEdit(msg)}>Save</button>
             <button class="btn btn-ghost btn-xs" @click=${() => { this._editingId = null; this.requestUpdate(); }}>Cancel</button>
           </div>
-        ` : (!hasSummary || showContent ? html`<span>${msg.content}</span>` : '')}
+        ` : html`
+          ${isMediaType ? this._renderMediaObject(msg, { msg, isOwn: isOwnMsg, isTopLevel: true }) : (!hasSummary || showContent ? html`<span>${msg.content}</span>` : '')}
+          ${(msg.attachment?.length) ? html`<div class="flex flex-wrap gap-2 mt-1">${msg.attachment.map(att => this._renderMediaObject(att, { msg, isOwn: isOwnMsg }))}</div>` : ''}
+        `}
       </div>
     `;
 
@@ -1753,7 +2081,10 @@ export class E2EEChatView extends LitElement {
                 ${this.showCW ? html`
                   <input class="input input-bordered input-sm w-full" type="text" .value=${this.summary} @input=${e => this.summary = e.target.value} placeholder="CW / Summary" />
                 ` : ''}
-                <div class="flex gap-2 items-end">
+                ${this._renderAttachmentPreview()}
+                <div class="flex gap-2 items-end"
+                  @dragover=${e => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
+                  @drop=${e => { e.preventDefault(); const paths = e.dataTransfer.files; if (paths.length) Array.from(paths).forEach(f => this._addAttachment(f.path || f.name)); }}>
                   <div class="flex flex-col gap-1 flex-1">
                     <textarea class="textarea textarea-bordered w-full"
                       .value=${this.input}
@@ -1763,11 +2094,17 @@ export class E2EEChatView extends LitElement {
                     ></textarea>
                   </div>
                   <div class="flex flex-col gap-1">
+                    <button class="btn btn-ghost btn-xs btn-square" type="button"
+                      @click=${() => this._openFilePicker()}
+                      title="Attach file" aria-label="Attach file">
+                      ${icon('paperclip')}
+                    </button>
                     <button class="btn btn-ghost btn-xs btn-square ${this.showCW ? 'btn-active' : ''}" type="button"
                       @click=${() => { this.showCW = !this.showCW; }} title="Content warning / Summary" aria-label="Toggle CW">
                       ${icon('warning')}
                     </button>
-                    <button class="btn btn-primary btn-sm btn-square" type="submit" title="Send" aria-label="Send message">
+                    <button class="btn btn-primary btn-sm btn-square" type="submit" title="Send" aria-label="Send message"
+                      ?disabled=${this._pendingAttachments.some(a => a.status === 'processing')}>
                       ${icon('paper-plane-right', { size: 20 })}
                     </button>
                   </div>
@@ -1807,7 +2144,31 @@ export class E2EEChatView extends LitElement {
           </div>
         </div>
       </div>
+      ${this._renderLightbox()}
     `;
+  }
+
+  _renderLightbox() {
+    if (!this._lightbox) return '';
+    const { src, type, name } = this._lightbox;
+    const close = () => { this._lightbox = null; };
+    let media;
+    if (type === 'Audio')
+      media = html`<audio controls src=${src} class="w-full max-w-lg"></audio>`;
+    else if (type === 'Video')
+      media = html`<video controls src=${src} class="max-w-full max-h-[80vh] rounded-lg"></video>`;
+    else if (type === 'Document' || (name && /\.pdf$/i.test(name)))
+      media = html`<iframe src=${src} class="w-[80vw] h-[80vh] rounded-lg bg-white"></iframe>`;
+    else
+      media = html`<img src=${src} class="max-w-full max-h-[85vh] rounded-lg object-contain" alt=${name || ''}>`;
+    return html`
+      <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/80"
+        @click=${close}>
+        <div @click=${e => e.stopPropagation()}>
+          ${media}
+        </div>
+        <button class="absolute top-4 right-4 btn btn-circle btn-sm" @click=${close}>✕</button>
+      </div>`;
   }
 }
 
