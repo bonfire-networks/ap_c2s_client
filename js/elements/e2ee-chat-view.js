@@ -262,6 +262,7 @@ export class E2EEChatView extends LitElement {
       _attachmentError: { type: String, state: true },
       _attachmentLoading: { type: Boolean, state: true },
       _lightbox: { type: Object, state: true },
+      _attachmentsReady: { type: Boolean, state: true },
     }
   }
 
@@ -300,6 +301,7 @@ export class E2EEChatView extends LitElement {
     this._attachmentError = ''
     this._attachmentLoading = false
     this._mediaUrlCache = new Map() // localPath → { src, tempPath }
+    this._audioActivated = new Set() // localPaths where user clicked play
     this._lightbox = null // { src, type, name } — shown in overlay when set
     this.messages = []
     this.input = ''
@@ -352,9 +354,38 @@ export class E2EEChatView extends LitElement {
       const backend = useTauri
         ? await import('../mls/openmls-tauri/tauri-backend.js')
         : await import('../mls/openmls-wasm/openmls-backend.js');
-      // Isolate storage per actor so switching accounts doesn't leak data
-      const actorId = localStorage.getItem('actor_id');
-      if (actorId) storage.initForActor(actorId);
+      // Debug: skip storage if flagged by the recovery dialog (via file flag or sessionStorage)
+      const skipFromSession = sessionStorage.getItem('skipStorage');
+      const skipFromRust = window.__TAURI__?.core?.invoke
+        ? await window.__TAURI__.core.invoke('check_skip_storage').catch(() => null)
+        : null;
+      const skipStorage = skipFromRust || skipFromSession;
+      if (skipStorage) {
+        sessionStorage.removeItem('skipStorage');
+        console.warn('[ChatView] Storage noop:', skipStorage);
+        if (skipStorage === 'previews') {
+          this._skipPreviews = true; // serve files but skip thumbnail generation
+        } else {
+          storage.setNoop(skipStorage);
+        }
+      } else {
+        // Isolate storage per actor so switching accounts doesn't leak dataat
+        const actorId = localStorage.getItem('actor_id');
+        if (actorId) storage.initForActor(actorId);
+      }
+
+      // Verify the DB is readable before proceeding — catches corruption from interrupted writes
+      try {
+        if (!skipStorage) await storage.verifyDb();
+      } catch (dbErr) {
+        const msg = `Local chat database is corrupted and cannot be opened.\n\n${dbErr}\n\nYour account and encryption keys are not affected.`;
+        if (window.__TAURI__?.core?.invoke) {
+          await window.__TAURI__.core.invoke('show_crash_dialog', { message: msg });
+        } else {
+          alert(msg);
+        }
+        return; // stop init — dialog handled reload/clear
+      }
 
       const mlsService = new MLSService(backend, storage);
       // console.log('[ChatView] MLSService initialized with backend:', mlsService);
@@ -372,6 +403,9 @@ export class E2EEChatView extends LitElement {
       if (window.__TAURI__) {
         window.__TAURI__.window.getCurrentWindow().setTitle(`Secure Chat - ${nickname}`);
       }
+
+      // Signal successful init so the crash dialog dedup flag is reset
+      window.__TAURI__?.core?.invoke?.('signal_app_ready').catch(() => {});
 
       this._initAttachmentEvents();
       await this.loadGroups();
@@ -420,15 +454,26 @@ export class E2EEChatView extends LitElement {
           console.log('[SSE] Reconnected — polling inbox for missed messages');
           this.pollInbox();
         });
+
+        // Drain in-flight DB writes before the window closes to prevent corruption
+        this._unlistenCloseRequested = await window.__TAURI__.event.listen('tauri://close-requested', async () => {
+          await storage.drainWrites();
+          const appWindow = window.__TAURI__.window.getCurrentWindow();
+          await appWindow.destroy();
+        });
       }
     } catch (e) {
       this.error = e.message;
+      // Re-throw so the global handler in tauri-init.js shows the recovery overlay
+      throw e;
     }
   }
 
   updated() {
+    console.log('[updated] start');
     // Observe unread message elements and mark them read when they scroll into view
     if (!this._readObserver) {
+      console.log('[updated] initializing observers');
       this._pendingReadEntries = new Map(); // msgId → element, for entries seen while unfocused
 
       const markRead = (msgId, groupId) => {
@@ -449,10 +494,72 @@ export class E2EEChatView extends LitElement {
       this._onWindowFocus = flushPending;
       window.addEventListener('focus', this._onWindowFocus);
 
+      this._thumbObjMap = new Map(); // localPath → { obj, msg, groupId }
+      this._serveInFlight = 0; // concurrency counter for serveAttachment calls
+      const MAX_SERVE_CONCURRENT = 2;
+
       this._readObserver = new IntersectionObserver(entries => {
         for (const entry of entries) {
           if (!entry.isIntersecting) continue;
           const el = entry.target;
+
+          // Thumbnail generation
+          if (el.dataset.needsThumb) {
+            this._readObserver.unobserve(el);
+            const key = el.dataset.needsThumb;
+            const item = this._thumbObjMap.get(key);
+            if (item) {
+              const { obj, msg, groupId } = item;
+              // In previews debug mode: skip serveAttachment entirely (just show spinner)
+              if (this._skipPreviews) continue;
+              // Throttle concurrent decompression — re-observe if at limit and retry later
+              if (this._serveInFlight >= MAX_SERVE_CONCURRENT) {
+                setTimeout(() => this._readObserver.observe(el), 500);
+                continue;
+              }
+              this._serveInFlight++;
+              this._mediaObjectUrl(obj, { eager: true });
+              // Poll until src is ready, then load via <img> element and draw to canvas —
+              // avoids fetch(blob) which loads the full file into JS memory and freezes WebKit
+              const waitForSrc = () => {
+                const urls = this._mediaUrlCache.get(key);
+                if (!urls) { setTimeout(waitForSrc, 100); return; }
+                const imgEl = new Image();
+                imgEl.onload = () => {
+                  this._generateThumbnail(imgEl)
+                    .then(dataUrl => {
+                      obj._thumbDataUrl = dataUrl;
+                      this._thumbObjMap.delete(key);
+                      if (msg) {
+                        this.controller.storage.getMessage(msg.id).then(stored => {
+                          if (stored) this.controller.storage.saveMessage(
+                            groupId || this.selectedGroupId, stored.content || stored,
+                            msg.id, msg.isLocal, undefined, undefined, stored.timestamp);
+                        });
+                      }
+                      this.requestUpdate();
+                    }).catch(e => {
+                      console.warn('[chat] thumbnail generation failed, skipping:', e);
+                      obj._thumbFailed = true;
+                      this._thumbObjMap.delete(key);
+                      this.requestUpdate();
+                    }).finally(() => { this._serveInFlight = Math.max(0, this._serveInFlight - 1); });
+                };
+                imgEl.onerror = () => {
+                  console.warn('[chat] image load failed, skipping:', urls.src);
+                  obj._thumbFailed = true;
+                  this._thumbObjMap.delete(key);
+                  this._serveInFlight = Math.max(0, this._serveInFlight - 1);
+                  this.requestUpdate();
+                };
+                imgEl.src = urls.src;
+              };
+              waitForSrc();
+            }
+            continue;
+          }
+
+          // Read receipt
           const { msgId, groupId } = el.dataset;
           if (!msgId || !groupId || !this.controller) continue;
           if (document.hasFocus()) {
@@ -464,7 +571,25 @@ export class E2EEChatView extends LitElement {
         }
       }, { threshold: 0.5 });
     }
-    this.shadowRoot.querySelectorAll('[data-unread]').forEach(el => this._readObserver.observe(el));
+    const unread = this.shadowRoot.querySelectorAll('[data-unread]');
+    const thumbs = this.shadowRoot.querySelectorAll('[data-needs-thumb]');
+    console.log(`[updated] observing ${unread.length} unread, ${thumbs.length} needs-thumb`);
+    unread.forEach(el => this._readObserver.observe(el));
+    thumbs.forEach(el => this._readObserver.observe(el));
+    // Defer attachment rendering and img src assignment to avoid WebKit synchronously blocking the DOM commit
+    requestAnimationFrame(() => {
+      this.shadowRoot.querySelectorAll('img[data-lazy-src]').forEach(img => {
+        img.src = img.dataset.lazySrc;
+      });
+      this.shadowRoot.querySelectorAll('audio[data-autoplay]').forEach(el => {
+        el.removeAttribute('data-autoplay');
+        el.play().catch(() => {});
+      });
+      if (!this._attachmentsReady) {
+        this._attachmentsReady = true;
+      }
+    });
+    console.log('[updated] done');
   }
 
   disconnectedCallback() {
@@ -472,12 +597,16 @@ export class E2EEChatView extends LitElement {
     if (this._closeEmojiPicker) { document.removeEventListener('click', this._closeEmojiPicker); this._closeEmojiPicker = null; }
     if (this._onWindowFocus) { window.removeEventListener('focus', this._onWindowFocus); this._onWindowFocus = null; }
     if (this._readObserver) { this._readObserver.disconnect(); this._readObserver = null; }
+    if (this._thumbObjMap) { this._thumbObjMap.clear(); this._thumbObjMap = null; }
     delete window.navigateToGroup;
     if (this._unlistenNewMessage) {
       this._unlistenNewMessage();
     }
     if (this._unlistenSseReconnected) {
       this._unlistenSseReconnected();
+    }
+    if (this._unlistenCloseRequested) {
+      this._unlistenCloseRequested();
     }
     if (this.inboxPollingInterval) {
       clearInterval(this.inboxPollingInterval);
@@ -492,10 +621,14 @@ export class E2EEChatView extends LitElement {
   async loadGroups() {
     this.loading = true;
     try {
+      console.log('[loadGroups] calling loadGroupList');
       this.groups = await this.controller.loadGroupList();
+      console.log('[loadGroups] got', this.groups.length, 'groups');
       if (this.groups.length > 0 && !this.selectedGroupId) {
         this.selectedGroupId = this.groups[0].id;
+        console.log('[loadGroups] calling loadMessages for first group', this.selectedGroupId);
         await this.loadMessages(this.selectedGroupId);
+        console.log('[loadGroups] loadMessages done');
       }
     } catch (e) {
       this.error = e.message;
@@ -514,21 +647,29 @@ export class E2EEChatView extends LitElement {
     this.groupEncryptionLost = false;
     try {
       const result = await this.controller.loadMessages(groupId);
+      console.log(`[loadMessages] assigning ${result.messages.length} msgs to state`);
+      this._attachmentsReady = false;
       this.messages = result.messages;
+      console.log('[loadMessages] state assigned, waiting for updateComplete');
       this.currentGroupMembers = result.members;
       this.currentThreadName = result.threadName;
       this.threadNameIsAutoGenerated = result.threadNameIsAutoGenerated;
       this.userLeft = result.userLeft || false;
       this.groupEncryptionLost = !result.encryptionAvailable && !result.userLeft;
       // Load fingerprint colors eagerly so bubble colors are consistent for all clients
+      console.log('[loadMessages] calling _loadFingerprintColors');
       this._loadFingerprintColors();
+      console.log('[loadMessages] done');
     } catch (e) {
       this.error = e.message;
     }
     this.loading = false;
 
     if (wasAtBottom) {
+      console.log('[loadMessages] awaiting updateComplete for scroll');
+      setTimeout(() => console.log('[loadMessages] 500ms timeout fired (event loop alive)'), 500);
       await this.updateComplete;
+      console.log('[loadMessages] updateComplete resolved, scheduling scroll');
       requestAnimationFrame(() => this._scrollToBottom(false));
     }
   }
@@ -641,9 +782,9 @@ export class E2EEChatView extends LitElement {
         // Fetch original image, compress to WebP via Canvas, pass bytes to Rust once
         const res = await fetch(rawPreviewUrl || filePath);
         const blob = await res.blob();
-        if (blob.size > 20 * 1024 * 1024) {
+        if (blob.size > 50 * 1024 * 1024) { 
           this._pendingAttachments = this._pendingAttachments.map(a =>
-            a.id === id ? { ...a, status: 'failed', error: 'Image too large (max 20 MB)' } : a);
+            a.id === id ? { ...a, status: 'failed', error: 'Image too large (max 50 MB)' } : a);
           return;
         }
         // Generate thumbnail immediately from raw blob — fastest possible preview
@@ -662,7 +803,10 @@ export class E2EEChatView extends LitElement {
       }
     } else {
       // GIFs, audio, video, documents: Rust reads from disk directly; emits attachment-ready/failed
-      await backend.prepareAttachmentFile(id, filePath);
+      backend.prepareAttachmentFile(id, filePath).catch(e => {
+        this._pendingAttachments = this._pendingAttachments.map(a =>
+          a.id === id ? { ...a, status: 'failed', error: e?.message || String(e) } : a);
+      });
     }
   }
 
@@ -676,43 +820,52 @@ export class E2EEChatView extends LitElement {
     this._pendingAttachments = this._pendingAttachments.filter(a => a.id !== id);
   }
 
-  /** Canvas compress a Blob to WebP (max 2048px). */
-  async _compressToWebP(blob, maxDim = 2048, quality = 0.85) {
-    const bitmap = await createImageBitmap(blob);
-    const canvas = document.createElement('canvas');
+  /**
+   * Resize an image source (Blob or ImageBitmap) to WebP, constraining the longer
+   * dimension to maxDim while preserving aspect ratio (no cropping).
+   * Returns a Blob when asDataUrl=false, or a data URL string when asDataUrl=true.
+   */
+  async _resizeToWebP(source, { maxDim = 2048, quality = 0.85, asDataUrl = false } = {}) {
+    const bitmap = source instanceof ImageBitmap ? source : await createImageBitmap(source);
     const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
-    canvas.width = Math.round(bitmap.width * scale);
-    canvas.height = Math.round(bitmap.height * scale);
-    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    const webpBlob = await new Promise(res => canvas.toBlob(res, 'image/webp', quality));
-    if (!webpBlob) throw new Error('WebP conversion failed');
-    return webpBlob;
+    const w = Math.round(bitmap.width * scale);
+    const h = Math.round(bitmap.height * scale);
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    // Use 9-arg form to explicitly draw full source — prevents any accidental cropping
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, 0, 0, w, h);
+    if (asDataUrl) return canvas.toDataURL('image/webp', quality);
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/webp', quality));
+    if (!blob) throw new Error('WebP conversion failed');
+    return blob;
   }
 
-  /** Generate a WebP thumbnail capped at the chat bubble max display size (192px). Returns a data URL. */
+  /** Compress a Blob to WebP (max 2048px). Returns a Blob. */
+  async _compressToWebP(blob, maxDim = 2048, quality = 0.85) {
+    return this._resizeToWebP(blob, { maxDim, quality, asDataUrl: false });
+  }
+
+  /** Generate a WebP thumbnail capped at 192px. Returns a data URL. */
   async _generateThumbnail(source) {
-    const bitmap = await createImageBitmap(source);
-    const canvas = document.createElement('canvas');
-    const scale = Math.min(1, 192 / Math.max(bitmap.width, bitmap.height));
-    canvas.width = Math.round(bitmap.width * scale);
-    canvas.height = Math.round(bitmap.height * scale);
-    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    return canvas.toDataURL('image/webp', 0.7);
+    return this._resizeToWebP(source, { maxDim: 192, quality: 0.85, asDataUrl: true });
   }
 
   /** Resolve a received AP media object. Returns { src, tempPath } or null while loading.
    *  src: asset:// URL usable in <img>/<audio>/<video>/<a href>.
    *  tempPath: raw filesystem path, used for saveAttachmentAs on document types. */
-  _mediaObjectUrl(obj) {
+  _mediaObjectUrl(obj, { eager = false, autoOpen = false } = {}) {
     if (obj?._localPath) {
       const cacheKey = obj._localPath;
       if (this._mediaUrlCache.has(cacheKey)) return this._mediaUrlCache.get(cacheKey);
+      if (!eager) return null; // defer decompression until explicitly requested
       const backend = this.controller?.mlsService?.backend;
       if (backend?.serveAttachment) {
         backend.serveAttachment(obj._localPath).then(tempPath => {
           const { convertFileSrc } = window.__TAURI__?.core || {};
           const src = convertFileSrc ? convertFileSrc(tempPath) : `file://${tempPath}`;
           this._mediaUrlCache.set(cacheKey, { src, tempPath });
+          if (autoOpen) this._lightbox = { src, type: obj.type, name: obj.name };
           this.requestUpdate();
         }).catch(e => console.error('[chat] serveAttachment failed:', e));
       }
@@ -728,7 +881,7 @@ export class E2EEChatView extends LitElement {
   _renderFileChip({ name, size, previewUrl, secondary, href, onClick, onRemove } = {}) {
     const inner = html`
       ${previewUrl
-        ? html`<img src=${previewUrl} class="w-10 h-10 object-cover rounded">`
+        ? html`<img src=${previewUrl} loading="lazy" decoding="async" class="w-10 h-10 object-cover rounded">`
         : icon('paperclip', { size: 14 })}
       <div class="flex flex-col min-w-0">
         <span class="max-w-[8rem] truncate">${name || 'file'}</span>
@@ -745,52 +898,103 @@ export class E2EEChatView extends LitElement {
   }
 
   _renderMediaObject(obj, { msg, isOwn, isTopLevel = false } = {}) {
+    console.log(`[renderMediaObject] type=${obj?.type} _localPath=${!!obj?._localPath} _thumbDataUrl=${!!obj?._thumbDataUrl} content=${obj?.content ? (obj.content.length + 'b') : 'none'}`);
     if (!obj?.content && !obj?._localPath && !obj?._thumbDataUrl) return '';
-    const urls = this._mediaObjectUrl(obj);
+    // Only look up cached src — never trigger serveAttachment during render
+    const urls = this._mediaObjectUrl(obj, { eager: false });
     const { src, tempPath } = urls || {};
-    // Images with a cached thumbnail can render immediately without waiting for serveAttachment
-    if (!urls && !obj._thumbDataUrl) return html`<div class="text-xs opacity-50 italic mt-1">Loading…</div>`;
     const onDelete = obj._localPath && msg
       ? () => this._handleDeleteStoredAttachment(obj, msg, isOwn && !isTopLevel)
       : null;
     const openLightbox = src ? () => { this._lightbox = { src, type: obj.type, name: obj.name }; } : null;
     if (obj.type === 'Image') {
-      const thumbSrc = obj._thumbDataUrl || src;
-      const onLoad = !obj._thumbDataUrl ? async (e) => {
-        try {
-          const dataUrl = await this._generateThumbnail(e.target);
-          obj._thumbDataUrl = dataUrl;
-          if (msg) {
-            const stored = await this.controller.storage.getMessage(msg.id);
-            if (stored) await this.controller.storage.saveMessage(
-              msg.groupId || this.selectedGroupId, stored.content || stored,
-              msg.id, msg.isLocal, undefined, undefined, stored.timestamp);
-          }
-          this.requestUpdate();
-        } catch (_) {}
-      } : null;
+      console.log(`[renderMediaObject] Image: thumbDataUrl=${!!obj._thumbDataUrl} thumbFailed=${!!obj._thumbFailed} localPath=${obj._localPath}`);
+      const isGif = /\.gif$/i.test(obj.name || '') || obj.mediaType === 'image/gif';
+      const GIF_INLINE_LIMIT = 2 * 1024 * 1024; // 2 MB
+      if (isGif && (obj.size || 0) < GIF_INLINE_LIMIT) {
+        if (src) {
+          return html`
+            <div class="relative inline-block mt-1 max-w-xs">
+              <img src=${src} loading="lazy" class="max-w-full max-h-64 w-auto rounded-lg block cursor-zoom-in" @click=${openLightbox} alt=${obj.name || ''}>
+              ${onDelete ? html`<button class="absolute top-1 right-1 btn btn-xs btn-error btn-circle opacity-70 hover:opacity-100"
+                @click=${onDelete}>✕</button>` : ''}
+            </div>`;
+        }
+        // Not served yet — placeholder that triggers serve on click
+        if (obj._localPath && this._thumbObjMap) {
+          this._thumbObjMap.set(obj._localPath, { obj, msg, groupId: msg?.groupId || this.selectedGroupId });
+        }
+        return html`
+          <div class="relative inline-block mt-1">
+            <div data-needs-thumb=${obj._localPath || ''} class="w-32 h-24 rounded-lg bg-base-300 flex items-center justify-center cursor-pointer"
+              @click=${() => this._mediaObjectUrl(obj, { eager: true })}>
+              <span class="loading loading-spinner loading-sm opacity-40"></span>
+            </div>
+            ${onDelete ? html`<button class="absolute top-1 right-1 btn btn-xs btn-error btn-circle opacity-70 hover:opacity-100"
+              @click=${onDelete}>✕</button>` : ''}
+          </div>`;
+      }
+      if (obj._thumbDataUrl) {
+        // Thumbnail cached — show it immediately; full image only in lightbox
+        return html`
+          <div class="relative inline-block mt-1 max-w-[12rem]">
+            <button type="button" class="block cursor-zoom-in" @click=${openLightbox || (() => this._mediaObjectUrl(obj, { eager: true, autoOpen: true }))}>
+              <img data-lazy-src=${obj._thumbDataUrl} loading="lazy" decoding="async" class="max-w-full max-h-48 w-auto rounded-lg block object-contain" alt=${obj.name || ''}>
+            </button>
+            ${onDelete ? html`<button class="absolute top-1 right-1 btn btn-xs btn-error btn-circle opacity-70 hover:opacity-100"
+              @click=${onDelete}>✕</button>` : ''}
+          </div>`;
+      }
+      // Failed — show broken image chip instead of infinite spinner
+      if (obj._thumbFailed) {
+        return this._renderFileChip({ name: obj.name, size: obj.size, onClick: null, onRemove: onDelete });
+      }
+      // No thumbnail yet — show placeholder; IntersectionObserver will trigger serve+generate when visible
+      if (obj._localPath && this._thumbObjMap) {
+        this._thumbObjMap.set(obj._localPath, { obj, msg, groupId: msg?.groupId || this.selectedGroupId });
+      }
       return html`
-        <div class="relative inline-block mt-1 max-w-[12rem]">
-          <button type="button" class="block cursor-zoom-in" @click=${openLightbox || null}>
-            <img src=${thumbSrc} class="max-w-full max-h-48 w-auto rounded-lg block object-contain"
-              @load=${onLoad || null} alt=${obj.name || ''} loading="lazy">
-          </button>
+        <div class="relative inline-block mt-1">
+          <div data-needs-thumb=${obj._localPath || ''} class="w-32 h-24 rounded-lg bg-base-300 flex items-center justify-center cursor-pointer"
+            @click=${openLightbox || (() => this._mediaObjectUrl(obj, { eager: true, autoOpen: true }))}>
+            <span class="loading loading-spinner loading-sm opacity-40"></span>
+          </div>
           ${onDelete ? html`<button class="absolute top-1 right-1 btn btn-xs btn-error btn-circle opacity-70 hover:opacity-100"
             @click=${onDelete}>✕</button>` : ''}
         </div>`;
     }
-    // Audio/Video: inline player; click chip opens lightbox for larger view
-    if (obj.type === 'Audio' || obj.type === 'Video') {
-      const tag = obj.type === 'Audio' ? 'audio' : 'video';
-      return html`<${tag} controls src=${src} class="mt-1 ${obj.type === 'Video' ? 'max-w-xs rounded-lg' : 'w-full max-w-xs'} block"></${tag}>`;
+    // Audio/Video: show a chip until src is ready, then show the player
+    if (obj.type === 'Audio') {
+      const key = obj._localPath || obj.content;
+      const activated = this._audioActivated.has(key);
+      if (activated && src)
+        return html`<audio controls src=${src} data-autoplay class="mt-1 w-full max-w-xs block"></audio>`;
+      if (activated)
+        return html`<span class="loading loading-spinner loading-xs mt-1 opacity-50"></span>`;
+      return html`<button type="button" class="btn btn-sm btn-circle btn-ghost mt-1" title=${obj.name || 'Play audio'}
+        @click=${() => { this._audioActivated.add(key); this._mediaObjectUrl(obj, { eager: true }); this.requestUpdate(); }}>
+        ${icon('play', { size: 16 })}
+      </button>`;
     }
-    // Documents: "Save…" button triggers native save dialog via Rust; PDF also openable in lightbox
+    if (obj.type === 'Video') {
+      if (!src) {
+        return html`<button type="button" class="btn btn-sm btn-ghost gap-1 mt-1"
+          @click=${() => { this._mediaObjectUrl(obj, { eager: true, autoOpen: true }); }}>
+          ${icon('film', { size: 14 })} ${obj.name || 'Video'}
+        </button>`;
+      }
+      return html`<video controls preload="metadata" src=${src} class="mt-1 max-w-xs rounded-lg block"></video>`;
+    }
+    // Documents: decompress on click, then save/open
     const isPdf = /\.pdf$/i.test(obj.name || '');
     const onOpen = isPdf && src ? openLightbox : null;
     const onSave = tempPath
       ? () => this.controller?.mlsService?.saveAttachmentAs?.(tempPath, obj.name || 'file')
       : null;
-    return this._renderFileChip({ name: obj.name, size: obj.size, onClick: onOpen || onSave, onRemove: onDelete });
+    const onServeAndSave = !src && obj._localPath
+      ? () => { this._mediaObjectUrl(obj, { eager: true, autoOpen: isPdf }); }
+      : null;
+    return this._renderFileChip({ name: obj.name, size: obj.size, onClick: onOpen || onSave || onServeAndSave, onRemove: onDelete });
   }
 
   _renderAttachmentPreview() {
@@ -830,6 +1034,7 @@ export class E2EEChatView extends LitElement {
 
     // Only send ready attachments; convert pending entries to AP attachment objects
     const readyAttachments = this._pendingAttachments.filter(a => a.status === 'ready');
+
     const attachments = readyAttachments.map(a => ({
       type: a.apType,
       name: a.name,
@@ -860,6 +1065,21 @@ export class E2EEChatView extends LitElement {
     this.replyToId = null;
     this.replyToSnippet = '';
     this.creatingNewGroup = false;
+
+    // Optimistically show the message while sending
+    const optimisticMsg = {
+      id: `optimistic-${Date.now()}`,
+      type: attachments.length ? (attachments[0].type || 'Note') : 'Note',
+      content: fields.content,
+      summary: fields.summary || undefined,
+      attributedTo: this.currentActorId,
+      timestamp: new Date().toISOString(),
+      isLocal: true,
+      status: 'sending',
+      attachment: attachments.length ? attachments : undefined,
+      groupId: this.selectedGroupId,
+    };
+    this.messages = [...this.messages, optimisticMsg];
 
     try {
       const { groupId, errors } = await this.controller.sendMessage(
@@ -1045,7 +1265,7 @@ export class E2EEChatView extends LitElement {
     const url = this._getAvatarUrl(actorId);
     const px = `${size / 16}rem`;
     if (url) {
-      return html`<img src="${url}" class="rounded-full object-cover" style="width:${px};height:${px}" alt="" />`;
+      return html`<img data-lazy-src="${url}" loading="lazy" decoding="async" class="rounded-full object-cover" style="width:${px};height:${px}" alt="" />`;
     }
     const initial = (this._getDisplayName(actorId) || '?')[0];
     return html`<div class="rounded-full bg-base-300 flex items-center justify-center" style="width:${px};height:${px};font-size:${size * 0.55 / 16}rem">${initial}</div>`;
@@ -1731,6 +1951,11 @@ export class E2EEChatView extends LitElement {
 
   renderMessage(msg, depth = 0) {
     if (!msg) return '';
+    this._renderMsgCallCount = (this._renderMsgCallCount || 0) + 1;
+    if (this._renderMsgCallCount > 500) {
+      console.error('[renderMessage] call limit exceeded — possible infinite loop, id=', msg?.id);
+      return html`<div class="alert alert-error text-xs py-1 px-2 my-1">Render loop detected</div>`;
+    }
 
     if (msg && msg.type === 'system') {
       return html`
@@ -1750,12 +1975,8 @@ export class E2EEChatView extends LitElement {
       `;
     }
 
-    if (msg && msg.status === 'sending') {
-      return html`
-        <div class="my-1 py-1 px-2 opacity-50 text-sm italic">
-          ${msg.content}<span class="loading loading-dots loading-xs ml-1"></span>
-        </div>
-      `;
+    if (msg && msg.status === 'sending' && !msg._sendingOverride) {
+      return this.renderMessage({ ...msg, _sendingOverride: true });
     }
 
     if (msg && msg.type === 'Tombstone') {
@@ -1832,6 +2053,7 @@ export class E2EEChatView extends LitElement {
       });
     }
 
+    console.log(`[renderMessage] Note/default: id=${msg.id} contentLen=${msg.content?.length||0} attLen=${msg.attachment?.length||0} repliesLen=${msg.replies?.length||0}`);
     const color = this._actorColor(msg.attributedTo);
     const hasSummary = msg && msg.summary;
     const msgIndex = this.messages.findIndex(m => m.id === msg.id);
@@ -1859,8 +2081,8 @@ export class E2EEChatView extends LitElement {
             <button class="btn btn-ghost btn-xs" @click=${() => { this._editingId = null; this.requestUpdate(); }}>Cancel</button>
           </div>
         ` : html`
-          ${isMediaType ? this._renderMediaObject(msg, { msg, isOwn: isOwnMsg, isTopLevel: true }) : (!hasSummary || showContent ? html`<span>${msg.content}</span>` : '')}
-          ${(msg.attachment?.length) ? html`<div class="flex flex-wrap gap-2 mt-1">${msg.attachment.map(att => this._renderMediaObject(att, { msg, isOwn: isOwnMsg }))}</div>` : ''}
+          ${isMediaType ? (this._attachmentsReady ? this._renderMediaObject(msg, { msg, isOwn: isOwnMsg, isTopLevel: true }) : html`<div class="w-32 h-24 rounded-lg bg-base-300"></div>`) : (!hasSummary || showContent ? html`<span>${msg.content}</span>` : '')}
+          ${(!isMediaType && msg.attachment?.length && this._attachmentsReady) ? html`<div class="flex flex-wrap gap-2 mt-1">${msg.attachment.map(att => this._renderMediaObject(att, { msg, isOwn: isOwnMsg }))}</div>` : ''}
         `}
       </div>
     `;
@@ -1896,7 +2118,9 @@ export class E2EEChatView extends LitElement {
         <a class="link link-hover text-error" @click=${() => this._handleDeleteMessage(msg)}>delete</a>
         <button class="btn btn-ghost btn-xs p-0 h-auto min-h-0"
           @click=${(e) => { e.stopPropagation(); this._deliveryPanel = { msg }; this._loadMembersData(); }}>
-          ${this._renderDeliveryTicks(msg.deliveryStatus)}
+          ${msg._sendingOverride
+            ? html`<span class="loading loading-dots loading-xs opacity-50"></span>`
+            : this._renderDeliveryTicks(msg.deliveryStatus)}
         </button>
       ` : html`
         <a class="link link-hover text-error" @click=${() => this._handleDeleteLocalMessage(msg)}>delete</a>
@@ -1920,6 +2144,8 @@ export class E2EEChatView extends LitElement {
   }
 
   render() {
+    console.log(`[render] start, ${this.messages?.length ?? 0} msgs`);
+    this._renderMsgCallCount = 0;
     const creatingNewGroup = this.creatingNewGroup;
     return html`
       <header class="flex items-center gap-1 relative z-40 p-2">
@@ -1990,7 +2216,7 @@ export class E2EEChatView extends LitElement {
               </div>
             ` : ''}
             <div class="messages-list">
-              ${this.controller ? this.controller.buildThreadTree(this.messages).map(msg => html`<div class="thread-root">${this.renderMessage(msg, 0)}</div>`) : ''}
+              ${this.controller ? (() => { const tree = this.controller.buildThreadTree(this.messages); console.log(`[render] buildThreadTree done: ${tree.length} roots`); return tree.map((msg) => { try { return html`<div class="thread-root">${this.renderMessage(msg, 0)}</div>`; } catch(e) { console.error(`[render] error rendering msg ${msg?.id}:`, e); return html`<div class="thread-root"><div class="alert alert-error text-xs py-1 px-2 my-1">Error rendering message: ${e.message}</div></div>`; } }); })() : ''}
             </div>
             ${this.selectedGroupId && this.userLeft ? html`
               <div class="p-4 text-center text-sm opacity-60">You are no longer a member of this group.</div>
@@ -2104,7 +2330,7 @@ export class E2EEChatView extends LitElement {
                       ${icon('warning')}
                     </button>
                     <button class="btn btn-primary btn-sm btn-square" type="submit" title="Send" aria-label="Send message"
-                      ?disabled=${this._pendingAttachments.some(a => a.status === 'processing')}>
+                      ?disabled=${this.loading || this._pendingAttachments.some(a => a.status === 'processing' || a.status === 'failed')}>
                       ${icon('paper-plane-right', { size: 20 })}
                     </button>
                   </div>
@@ -2145,7 +2371,7 @@ export class E2EEChatView extends LitElement {
         </div>
       </div>
       ${this._renderLightbox()}
-    `;
+    ${console.log('[render] template fully built') || ''}`;
   }
 
   _renderLightbox() {

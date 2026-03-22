@@ -8,6 +8,27 @@ import { messageUri } from '../utils.js';
 
 function _openDb(dbName) {
   const instance = new Dexie(dbName);
+  // Track all mutating operations so drainWrites() can wait for them before quit
+  instance.use({
+    stack: 'dbcore',
+    name: 'write-tracker',
+    create(downlevel) {
+      return {
+        ...downlevel,
+        table(tableName) {
+          const tbl = downlevel.table(tableName);
+          return {
+            ...tbl,
+            mutate(req) {
+              const p = tbl.mutate(req);
+              trackWrite(p);
+              return p;
+            },
+          };
+        },
+      };
+    },
+  });
   instance.version(1).stores({
     groups: 'id',
     users: 'id',
@@ -38,6 +59,23 @@ function _openDb(dbName) {
 // Per-actor DB instance — initialised by initForActor() before any storage calls
 let db = _openDb('openmls-db'); // fallback so module-level code doesn't crash
 
+// ── Write-drain support ────────────────────────────────────────────────────
+// Track in-flight write promises so we can wait for them before app quit.
+let _pendingWrites = new Set();
+
+/** Wrap a write promise so it is tracked for drainWrites(). */
+export function trackWrite(promise) {
+  _pendingWrites.add(promise);
+  promise.finally(() => _pendingWrites.delete(promise));
+  return promise;
+}
+
+/** Wait for all in-flight writes to settle (used before app quit). */
+export async function drainWrites() {
+  if (_pendingWrites.size === 0) return;
+  await Promise.allSettled([..._pendingWrites]);
+}
+
 /**
  * Switch to a per-actor database. Must be called before any storage operations.
  * Uses a sanitised actor ID as part of the DB name so each user gets isolated storage.
@@ -45,6 +83,76 @@ let db = _openDb('openmls-db'); // fallback so module-level code doesn't crash
 export function initForActor(actorId) {
   const safe = actorId.replace(/[^a-zA-Z0-9._-]/g, '_');
   db = _openDb(`openmls-db-${safe}`);
+}
+
+/**
+ * Replace storage functions with no-ops for diagnostic reloads.
+ * scope: 'all' — noop everything (default)
+ *        'messages' — groups load normally, messages return empty
+ */
+export function setNoop(scope = 'all') {
+  if (scope === 'attachments') {
+    // Strip localPath from all attachment objects so serve_attachment is never called.
+    const _realListMessages = listMessages;
+    listMessages = async (groupId) => {
+      const msgs = await _realListMessages(groupId);
+      return msgs.map(m => {
+        if (!m.content) return m;
+        const c = m.content;
+        const stripLocalPath = a => ({ ...a, _localPath: undefined });
+        return {
+          ...m,
+          content: {
+            ...c,
+            // Strip from top-level (e.g. Image message that IS the attachment)
+            _localPath: undefined,
+            // Strip from attachment array
+            attachment: c.attachment?.map(stripLocalPath)
+          }
+        };
+      });
+    };
+    console.warn('[storage] noop: attachment localPaths stripped, messages active');
+    return;
+  }
+  if (scope === 'messages') {
+    // Override only message-related functions; groups still load from real DB
+    listMessages = async () => [];
+    saveMessage = async () => {};
+    updateDeliveryStatus = async () => {};
+    updateMessage = async () => {};
+    tombstoneMessage = async () => {};
+    deleteMessage = async () => {};
+    deleteGroupMessages = async () => {};
+    console.warn('[storage] noop: messages disabled, groups still active');
+    return;
+  }
+  // 'all': replace the DB entirely
+  db = {
+    open: async () => {},
+    table: () => ({
+      count: async () => 0,
+      get: async () => undefined,
+      put: async () => {},
+      delete: async () => {},
+      toArray: async () => [],
+      where: () => ({ equals: () => ({ toArray: async () => [], first: async () => undefined }) }),
+    }),
+  };
+  console.warn('[storage] noop: all storage disabled');
+}
+
+/**
+ * Probe the DB to verify it opens and is readable.
+ * Throws if the database is corrupted or inaccessible.
+ * Call this after initForActor() to detect problems early.
+ */
+export async function verifyDb() {
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('Database timed out — may be locked or corrupted')), 5000)
+  );
+  await Promise.race([db.open(), timeout]);
+  await Promise.race([db.table('groups').count(), timeout]);
 }
 
 // ──────────────────────────────────────────────
