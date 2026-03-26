@@ -138,11 +138,15 @@ export async function decrypt(userId, groupId, ciphertext) {
 
   if (result === null) return null;
 
+  // result is now { text, senderIdentity, senderSignatureKey }
+  const { text, senderIdentity, senderSignatureKey } = result;
+  let parsed;
   try {
-    return JSON.parse(result);
+    parsed = JSON.parse(text);
   } catch {
-    return result;
+    parsed = text;
   }
+  return { content: parsed, senderIdentity, senderSignatureKey };
 }
 
 export async function addMember(userId, groupId, keyPackageBytes) {

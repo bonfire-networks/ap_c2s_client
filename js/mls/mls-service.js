@@ -180,6 +180,11 @@ export class MLSService {
    * @param {Uint8Array} ciphertext - encrypted message
    * @returns {string|object|null} decrypted content
    */
+  async getOwnSignatureKey(userId) {
+    const fp = await this.backend.getOwnFingerprint(userId);
+    return fp?.signatureKey || null;
+  }
+
   async decrypt(userId, groupId, ciphertext) {
     const result = await this.backend.decrypt(userId, groupId, ciphertext);
 

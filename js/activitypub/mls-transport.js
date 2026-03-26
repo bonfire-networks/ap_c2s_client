@@ -212,6 +212,7 @@ export function parseMLSActivity(activity) {
 
   return {
     type,
+    originalTypes: types, // full original type array — preserved for receipt detection in catch blocks
     content: obj.content,
     context: contextId,
     encoding: obj.encoding,
