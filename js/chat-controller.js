@@ -13,7 +13,7 @@
 import { bytesToBase64, bytesFromInput, groupUri, messageUri } from './utils.js';
 import { getCurrentActor, getActor, getActorId, apFetch, ensureFreshToken } from './activitypub/auth.js';
 import { postToOutbox, fetchActorKeyPackage, resolveActorId, extractApIdFromResponse } from './activitypub/client.js';
-import { sendMLSControl, publishKeyPackage, deleteKeyPackage, parseMLSActivity } from './activitypub/mls-transport.js';
+import { sendMLSControl, publishKeyPackage, deleteKeyPackage, sendKeyPackageProposal, parseMLSActivity } from './activitypub/mls-transport.js';
 
 // AP object types that represent regular user content — the only types that should generate receipts
 const CONTENT_TYPES = ['Create', 'Note', 'Article', 'Document', 'Page', 'Image', 'Video', 'Audio', 'Event', 'Question'];
@@ -136,9 +136,9 @@ export class ChatController {
 
     await this.mlsService.init(actor.id);
     console.log('[ChatController] MLSService initialized for actor:', actor.id);
-    await this.ensurePublishedKeyPackage(actor);
+    const kpResult = await this.ensurePublishedKeyPackage(actor);
 
-    return actor;
+    return { actor, kpResult };
   }
 
   // ── Group management ───────────────────────────────────
@@ -448,11 +448,21 @@ export class ChatController {
       if (identities.length === 0) return;
       const state = (await this.storage.loadGroupMeta(groupId)) || {};
       const previous = new Set(state.members || []);
-      await this.storage.saveGroupMeta(groupId, { ...state, members: identities });
+      // sigKeys: array of { signatureKey, identity } for device-level diffing
+      const previousDevices = new Map((state.sigKeys || []).map(d => [d.signatureKey, d.identity]));
+      const currentDevices = new Map(
+        fingerprints.filter(fp => fp.signatureKey && fp.identity).map(fp => [fp.signatureKey, fp.identity])
+      );
+      await this.storage.saveGroupMeta(groupId, {
+        ...state, members: identities,
+        sigKeys: [...currentDevices.entries()].map(([signatureKey, identity]) => ({ signatureKey, identity }))
+      });
       // Only insert system messages if we had a known member list to diff against
       if (previous.size === 0) return;
       const current = new Set(identities);
       const removerNickname = removerActorId ? await this._getNickname(removerActorId) : null;
+
+      // Member-level diff
       for (const id of identities) {
         if (!previous.has(id) && id !== actor.id) {
           await this._insertSystemMessage(groupId, `${await this._getNickname(id)} was added to the group`);
@@ -470,6 +480,27 @@ export class ChatController {
           await this._insertSystemMessage(groupId, msg);
         }
       }
+
+      // Device-level diff — only for members already in the group (not new joiners)
+      if (previousDevices.size > 0) {
+        for (const fp of fingerprints) {
+          if (!fp.signatureKey || !fp.identity) continue;
+          if (!previousDevices.has(fp.signatureKey) && current.has(fp.identity) && previous.has(fp.identity)) {
+            const emoji = fp.fingerprint?.map(e => e.emoji).join(' ') || '';
+            const isSelf = fp.identity === actor.id;
+            const subject = isSelf ? 'You are' : `${await this._getNickname(fp.identity)} is`;
+            await this._insertSystemMessage(groupId, `${subject} now receiving messages with a new device: ${emoji}`);
+          }
+        }
+        for (const [sigKey, identity] of previousDevices) {
+          if (!currentDevices.has(sigKey) && current.has(identity) && previous.has(identity)) {
+            const isSelf = identity === actor.id;
+            const subject = isSelf ? 'One of your devices' : `A device of ${await this._getNickname(identity)}`;
+            await this._insertSystemMessage(groupId, `${subject} was removed from the group`);
+          }
+        }
+      }
+
       // Check if we ourselves were removed
       if (previous.has(actor.id) && !current.has(actor.id)) {
         await this._insertSystemMessage(groupId, `${removerNickname || 'Someone'} removed you from this group.`);
@@ -830,6 +861,19 @@ export class ChatController {
     const objTypes = Array.isArray(obj?.type) ? obj.type : [obj?.type];
     if (objTypes.includes('Failure')) {
       return this._handleFailureReceipt(obj);
+    }
+
+    // Co-device KeyPackage proposal: NewDeviceB sends Create { object: KeyPackage } to own actor inbox
+    if (activity.type === 'Create' && activity.object?.type === 'KeyPackage') {
+      const actor = await getCurrentActor();
+      if (activity.object?.attributedTo === actor.id) {
+        return this._handleKeyPackageProposal(activity.object, actor);
+      }
+    }
+
+    // Add { object: KeyPackage } from actor's keyPackages collection — verify mlsSignature before caching
+    if (activity.type === 'Add' && activity.object?.type === 'KeyPackage') {
+      return this._handleKeyPackageAdd(activity);
     }
 
     const parsed = parseMLSActivity(activity);
@@ -1272,9 +1316,22 @@ export class ChatController {
     const { keyPackageHex, publishedDate } = await this.mlsService.getKeyPackageInfo(actor.id);
 
     if (!keyPackageHex) {
-      // Create and publish new key package
+      // new key package
       const { keyPackageHex: newHex } = await this.mlsService.createKeyPackage(actor.id);
       const kpBytes = bytesFromInput(newHex);
+
+      // If co-devices exist (live in MLS groups, or server has a KP from a different device),
+      // send as proposal for approval rather than publishing publicly
+      const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id);
+      const liveCoDeviceKeys = await this._getLiveCoDeviceKeys(actor);
+      const serverHasOtherDevice = await this._actorHasOtherDevices(actor, ownSigKey);
+      if (liveCoDeviceKeys.length > 0 || serverHasOtherDevice) {
+        await sendKeyPackageProposal(actor, kpBytes);
+        console.log('[KeyPackage] Sent proposal to own inbox for co-device approval');
+        const ownFp = await this.mlsService.getOwnFingerprint(actor.id);
+        return { type: 'newDevicePending', fingerprint: ownFp?.fingerprint };
+      }
+
       const published = await publishKeyPackage(actor, kpBytes);
       if (published) {
         await this.mlsService.markKeyPackagePublished(actor.id, newHex);
@@ -1289,9 +1346,10 @@ export class ChatController {
       return;
     }
 
-    // Has key package but not published — publish it
+    // Has key package but not published — self-sign and publish (replenishment)
     const kpBytes = bytesFromInput(keyPackageHex);
-    const published = await publishKeyPackage(actor, kpBytes);
+    const mlsSignature = await this._signKeyPackage(actor.id, keyPackageHex);
+    const published = await publishKeyPackage(actor, kpBytes, mlsSignature);
     if (published) {
       await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
       localStorage.removeItem('actor');
@@ -1430,6 +1488,202 @@ export class ChatController {
 
     console.log('[addMemberToGroup] Added', recipientUri, 'to group', groupId);
     return recipientUri;
+  }
+
+  /**
+   * Handle an Add { object: KeyPackage } activity arriving in the inbox.
+   * Verifies the mlsSignature (if present and if we know the actor's devices) before
+   * accepting the KP into the local cache. Unknown/unverifiable KPs are logged and dropped.
+   *
+   * Two valid signer cases (per spec proposal):
+   *   (a) A known co-device of the actor signed it (new device endorsement)
+   *   (b) The KP's own SignaturePublicKey signed it (self-signed replenishment)
+   */
+  async _handleKeyPackageAdd(activity) {
+    const kpObj = activity.object;
+    const kpB64 = kpObj?.content;
+    const actorUri = kpObj?.attributedTo || activity.actor;
+    if (!kpB64 || !actorUri) return;
+
+    const sig = activity.mlsSignature;
+    if (!sig?.signerKey || !sig?.signature) {
+      console.warn('[_handleKeyPackageAdd] No mlsSignature on Add from', actorUri, '— rejecting');
+      return;
+    }
+
+    // Valid signers: any live MLS device for this actor, plus the KP's own key (self-signed replenishment)
+    const liveDeviceKeys = await this._getLiveDeviceKeysForActor(actorUri);
+
+    let kpSignatureKey = null;
+    try {
+      const fp = await this.mlsService.getKeyPackageFingerprint(kpB64);
+      kpSignatureKey = fp?.signatureKey || null;
+    } catch (e) {
+      console.warn('[_handleKeyPackageAdd] Could not parse KP fingerprint:', e);
+    }
+
+    const validSigners = [...liveDeviceKeys, kpSignatureKey].filter(Boolean);
+
+    if (!validSigners.includes(sig.signerKey)) {
+      console.warn('[_handleKeyPackageAdd] mlsSignature signerKey not recognised for', actorUri, '— rejecting KP');
+      return;
+    }
+
+    const valid = await this.mlsService.verifySignature(sig.signerKey, kpB64, sig.signature);
+    if (!valid) {
+      console.warn('[_handleKeyPackageAdd] mlsSignature verification failed for', actorUri, '— rejecting KP');
+      return;
+    }
+
+    console.log('[_handleKeyPackageAdd] KP verified for', actorUri, 'signed by', sig.signerKey);
+    await this.storage.saveUserField(actorUri, 'keyPackage', kpB64);
+
+    // If this is our own KP being endorsed (no groups case), signal the pending dialog to close
+    const actor = await getCurrentActor();
+    if (actorUri === actor.id) {
+      const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id);
+      if (kpSignatureKey === ownSigKey) return { type: 'newDeviceApproved' };
+    }
+  }
+
+  /**
+   * Handle an incoming KeyPackage proposal from a co-device (same actor, different device).
+   * Checks live MLS group membership to determine if this is a known device (replenishment — ignore)
+   * or a new device needing user approval.
+   */
+  async _handleKeyPackageProposal(kpObject, actor) {
+    const kpB64 = kpObject.content;
+    if (!kpB64) return null;
+
+    let fingerprintResult;
+    try {
+      fingerprintResult = await this.mlsService.getKeyPackageFingerprint(kpB64);
+    } catch (e) {
+      console.warn('[_handleKeyPackageProposal] Could not get fingerprint (invalid KP?):', e);
+      return null;
+    }
+    const { fingerprint, signatureKey } = fingerprintResult;
+
+    // If this is our own device's proposal coming back, show pending verification status
+    const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id);
+    if (signatureKey === ownSigKey) {
+      console.log('[_handleKeyPackageProposal] Own device proposal received — showing pending status');
+      const ownFp = await this.mlsService.getOwnFingerprint(actor.id);
+      return { type: 'newDevicePending', fingerprint: ownFp?.fingerprint };
+    }
+
+    // A key is "known" only if it is currently a live member of a shared MLS group —
+    // MLS is the canonical source of truth; a decommissioned device will not appear here
+    const liveCoDeviceKeys = await this._getLiveCoDeviceKeys(actor);
+    if (liveCoDeviceKeys.includes(signatureKey)) {
+      console.log('[_handleKeyPackageProposal] Known live co-device, ignoring (replenishment):', signatureKey);
+      return null;
+    }
+
+    console.log('[_handleKeyPackageProposal] New co-device key detected, requesting user approval');
+    return { type: 'newDeviceRequest', fingerprint, kpB64, signatureKey };
+  }
+
+  /**
+   * Return the MLS SignaturePublicKeys of all co-devices (same actor identity, different device)
+   * that are currently live members of at least one shared group.
+   * Uses MLS group state as the canonical source — decommissioned devices are automatically absent.
+   */
+  async _getLiveCoDeviceKeys(actor) {
+    const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id);
+    const keys = new Set();
+    for (const { signatureKey } of await this._getLiveDeviceKeysForActor(actor.id)) {
+      if (signatureKey !== ownSigKey) keys.add(signatureKey);
+    }
+    return [...keys];
+  }
+
+  /**
+   * Check whether the actor's server-side profile contains a KeyPackage from a different device.
+   * Used on a fresh device or after a full reset (clear_all_data) when there are no local groups yet, so the server profile is the only signal that another device exists and needs to approve this one.
+   */
+  async _actorHasOtherDevices(actor, ownSigKey) {
+    const kps = actor.keyPackages;
+    if (!kps) return false;
+    const kpList = Array.isArray(kps) ? kps : (kps.items || []);
+    for (const kp of kpList) {
+      const content = typeof kp === 'string' ? null : kp?.content;
+      if (!content) continue;
+      try {
+        const fp = await this.mlsService.getKeyPackageFingerprint(content);
+        if (fp?.signatureKey && fp.signatureKey !== ownSigKey) return true;
+      } catch (e) { /* unparseable KP — skip */ }
+    }
+    return false;
+  }
+
+  /**
+   * Return all MLS SignaturePublicKeys currently attributed to a given actor URI
+   * across all loaded groups — i.e. every live device leaf for that identity.
+   */
+  async _getLiveDeviceKeysForActor(actorUri) {
+    const actor = await getCurrentActor();
+    const groups = await this.storage.listGroupsWithLastMessage();
+    const keys = new Set();
+    for (const { groupId } of groups) {
+      try {
+        const members = await this.mlsService.getGroupFingerprints(actor.id, groupId);
+        for (const m of members || []) {
+          if (m.identity === actorUri) keys.add(m.signatureKey);
+        }
+      } catch (e) {
+        // Group not loaded yet or no longer valid — skip
+      }
+    }
+    return [...keys];
+  }
+
+  /**
+   * Sign a KeyPackage's base64 content with the user's MLS SignaturePrivateKey.
+   * Returns { signerKey, signature } suitable for the mlsSignature field on an Add activity,
+   * or null if the backend doesn't support signing (e.g. WASM stub).
+   */
+  async _signKeyPackage(userId, kpB64) {
+    try {
+      const result = await this.mlsService.signData(userId, kpB64);
+      return result || null;
+    } catch (e) {
+      console.warn('[_signKeyPackage] Signing not available:', e);
+      return null;
+    }
+  }
+
+  /**
+   * Approve a co-device KeyPackage: publish it to the public keyPackages collection
+   * and add the device to all current groups.
+   *
+   * @param {string} kpB64 - base64-encoded KeyPackage
+   */
+  async approveNewDevice(kpB64) {
+    const actor = await getCurrentActor();
+    const kpBytes = bytesFromInput(kpB64);
+
+    // Sign the KP content with ExistingDeviceA's MLS key — this is the endorsement
+    const mlsSignature = await this._signKeyPackage(actor.id, kpB64);
+
+    // Publish to public keyPackages collection (endorsed by ExistingDeviceA's MLS signature)
+    await publishKeyPackage(actor, kpBytes, mlsSignature);
+
+    // Add to all existing groups
+    const groups = await this.storage.listGroupsWithLastMessage();
+    for (const { groupId } of groups) {
+      try {
+        const { welcome, ratchetTree, commit } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
+        const apId = await this.storage.getGroupField(groupId, 'apId', null);
+        await this._sendInvite(actor, groupId, actor.id, welcome, ratchetTree, apId);
+        const existingMembers = (await this.getGroupMembers(groupId)).filter(id => id !== actor.id);
+        await this._distributeCommit(actor, groupId, commit, existingMembers);
+      } catch (e) {
+        console.warn('[approveNewDevice] Could not add co-device to group', groupId, e);
+      }
+    }
+
+    console.log('[approveNewDevice] Co-device approved and added to', groups.length, 'groups');
   }
 
   /**

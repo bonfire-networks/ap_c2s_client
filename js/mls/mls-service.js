@@ -351,6 +351,29 @@ export class MLSService {
     return await this.backend.getKeyPackageFingerprint(keyPackageB64);
   }
 
+  /**
+   * Sign arbitrary data with the user's MLS SignaturePrivateKey.
+   * @param {string} userId
+   * @param {string} dataB64 - base64-encoded bytes to sign
+   * @returns {{ signature: string, signerKey: string }}
+   */
+  async signData(userId, dataB64) {
+    if (!this.backend.signData) return null;
+    return await this.backend.signData(userId, dataB64);
+  }
+
+  /**
+   * Verify an MLS signature.
+   * @param {string} signerKeyB64 - base64 SignaturePublicKey
+   * @param {string} dataB64 - base64 signed payload
+   * @param {string} signatureB64 - base64 signature
+   * @returns {boolean}
+   */
+  async verifySignature(signerKeyB64, dataB64, signatureB64) {
+    if (!this.backend.verifySignature) return false;
+    return await this.backend.verifySignature(signerKeyB64, dataB64, signatureB64);
+  }
+
   // ── Group ID extraction ──────────────────────────────────
 
   /**

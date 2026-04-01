@@ -134,7 +134,7 @@ export class MyDevicesPanel extends LitElement {
     try {
       const cleared = await this.controller.clearAllData()
       if (cleared) {
-        window.location.reload()
+        window.dispatchEvent(new CustomEvent('auth-error', { detail: { reason: 'Device data cleared — please log in again' } }))
       }
     } catch (e) {
       this._error = 'Failed to clear data: ' + (e.message || e)

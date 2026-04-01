@@ -75,7 +75,7 @@ export async function sendMLSControl(actor, type, contentB64, recipients, contex
  * @param {Uint8Array} keyPackageBytes - raw key package bytes
  * @returns {boolean} true if published successfully
  */
-export async function publishKeyPackage(actor, keyPackageBytes) {
+export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = null) {
   const kpB64 = bytesToBase64(keyPackageBytes);
 
   const keyPackageObj = {
@@ -98,13 +98,15 @@ export async function publishKeyPackage(actor, keyPackageBytes) {
 
   let res;
   if (target) {
-    res = await postToOutbox(actor, {
+    const addActivity = {
       type: 'Add',
       actor: actor.id,
       to: 'as:Public',
       object: keyPackageObj,
       target
-    });
+    };
+    if (mlsSignature) addActivity.mlsSignature = mlsSignature;
+    res = await postToOutbox(actor, addActivity);
   } else {
     res = await postToOutbox(actor, {
       type: 'Update',
@@ -119,6 +121,40 @@ export async function publishKeyPackage(actor, keyPackageBytes) {
   }
 
   return res && res.ok;
+}
+
+/**
+ * Send a KeyPackage proposal to own actor inbox for approval by an existing device.
+ *
+ * NewDeviceB calls this to notify ExistingDeviceA about its KeyPackage.
+ * The KP is sent privately (to own actor only) and NOT added to the public
+ * keyPackages collection until ExistingDeviceA endorses it.
+ *
+ * @param {object} actor - current actor
+ * @param {Uint8Array} keyPackageBytes - raw key package bytes
+ * @returns {object} response from outbox
+ */
+export async function sendKeyPackageProposal(actor, keyPackageBytes) {
+  const kpB64 = bytesToBase64(keyPackageBytes);
+
+  const res = await postToOutbox(actor, {
+    '@context': MLS_CONTEXTS,
+    type: 'Create',
+    actor: actor.id,
+    to: [actor.id],
+    object: {
+      type: 'KeyPackage',
+      attributedTo: actor.id,
+      mediaType: 'message/mls',
+      encoding: 'base64',
+      content: kpB64,
+    }
+  });
+
+  if (res && (res.ok === false || res.status >= 400)) {
+    throw new Error('Failed to send KeyPackage proposal: ' + (res.status || 'unknown status'));
+  }
+  return res;
 }
 
 /**

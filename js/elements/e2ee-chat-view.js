@@ -394,8 +394,9 @@ export class E2EEChatView extends LitElement {
       this.controller = new ChatController(mlsService, storage);
       console.log('[ChatView] ChatController initialized:', this.controller);
 
-      const actor = await this.controller.init();
+      const { actor, kpResult } = await this.controller.init();
       console.log('[ChatView] Actor initialized:', actor);
+      if (kpResult?.type === 'newDevicePending') this._showNewDeviceApproval(kpResult);
       this.currentActorId = actor.id;
       this._sendReadReceipts = await this.controller.storage.loadUserSetting(actor.id, 'sendReadReceipts', false);
       this._ensureActorProfile(actor.id);
@@ -680,6 +681,16 @@ export class E2EEChatView extends LitElement {
     try {
       const results = await this.controller.pollInbox();
       if (results.length > 0) {
+        // Handle new device requests before reloading (non-MLS result, no groupId)
+        for (const r of results) {
+          if (r.type === 'newDeviceRequest' || r.type === 'newDevicePending') {
+            this._showNewDeviceApproval(r);
+          } else if (r.type === 'newDeviceApproved' || r.type === 'welcome' || r.type === 'groupinfo') {
+            // Approved (no-groups case) or joined a group — close pending dialog
+            this.shadowRoot.querySelector('#nd-pending-dialog')?.remove();
+          }
+        }
+
         // Reload groups and current messages if something changed
         await this.loadGroups();
         if (this.selectedGroupId) {
@@ -697,6 +708,60 @@ export class E2EEChatView extends LitElement {
       console.error('[Inbox] Error:', e);
       return [];
     }
+  }
+
+  _showNewDeviceApproval({ fingerprint, kpB64 }) {
+    const isPending = !kpB64;
+    if (isPending && this.shadowRoot.querySelector('#nd-pending-dialog')) return; // already showing
+    const emojiStr = Array.isArray(fingerprint) ? fingerprint.map(e => e.emoji).join(' ') : (fingerprint || '');
+    const dialog = document.createElement('dialog');
+    if (isPending) dialog.id = 'nd-pending-dialog';
+    dialog.className = 'modal modal-open';
+    dialog.innerHTML = `
+      <div class="modal-box max-w-sm">
+        <h3 class="font-bold text-lg mb-2">${isPending ? 'Waiting for approval' : 'New device wants to join your account'}</h3>
+        <p class="text-sm opacity-70 mb-4">
+          ${isPending
+            ? 'Show this fingerprint to your other device and ask it to approve:'
+            : 'Verify that the fingerprint shown on your new device matches exactly:'}
+        </p>
+        <div class="text-3xl text-center tracking-widest py-3 px-4 bg-base-200 rounded-lg mb-4 select-all">
+          ${emojiStr}
+        </div>
+        <p class="text-xs opacity-50 mb-4">
+          ${isPending ? 'This dialog will close automatically once approved.' : 'Only approve if you recognise this device. If the emoji don\'t match, reject.'}
+        </p>
+        <div id="nd-error" class="alert alert-error text-sm mb-2 hidden"></div>
+        <div class="modal-action gap-2">
+          ${isPending
+            ? '<button class="btn btn-ghost btn-sm" id="nd-cancel">Cancel</button>'
+            : '<button class="btn btn-error btn-sm" id="nd-reject">Reject</button><button class="btn btn-primary btn-sm" id="nd-approve">Approve</button>'}
+        </div>
+      </div>
+    `;
+
+    const close = () => { dialog.remove(); };
+
+    if (isPending) {
+      dialog.querySelector('#nd-cancel').addEventListener('click', close);
+    } else {
+      dialog.querySelector('#nd-approve').addEventListener('click', async () => {
+        try {
+          dialog.querySelector('#nd-approve').disabled = true;
+          await this.controller.approveNewDevice(kpB64);
+          close();
+        } catch (e) {
+          console.error('[NewDevice] Approval failed:', e);
+          const errEl = dialog.querySelector('#nd-error');
+          errEl.textContent = 'Approval failed: ' + (e.message || e);
+          errEl.classList.remove('hidden');
+          dialog.querySelector('#nd-approve').disabled = false;
+        }
+      });
+      dialog.querySelector('#nd-reject').addEventListener('click', close);
+    }
+
+    this.shadowRoot.appendChild(dialog);
   }
 
   // ── Actions (delegates to controller) ──────────────────

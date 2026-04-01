@@ -221,6 +221,27 @@ export async function getKeyPackageFingerprint(keyPackageB64) {
 }
 
 /**
+ * Sign arbitrary data with the user's MLS SignaturePrivateKey.
+ * @param {string} userId
+ * @param {string} dataB64 - base64-encoded bytes to sign
+ * @returns {{ signature: string, signerKey: string }} base64 values
+ */
+export async function signData(userId, dataB64) {
+  return await invoke('plugin:openmls|sign_data', { userId, dataB64 });
+}
+
+/**
+ * Verify an MLS signature produced by signData.
+ * @param {string} signerKeyB64 - base64 SignaturePublicKey
+ * @param {string} dataB64 - base64 signed payload
+ * @param {string} signatureB64 - base64 signature
+ * @returns {boolean}
+ */
+export async function verifySignature(signerKeyB64, dataB64, signatureB64) {
+  return await invoke('plugin:openmls|verify_signature', { signerKeyB64, dataB64, signatureB64 });
+}
+
+/**
  * Decommission a client (by signature key) from all loaded groups.
  * Shows a native confirmation dialog, then removes from all groups.
  * Returns {results: [{groupId, commit}], cancelled: bool}
