@@ -254,6 +254,10 @@ export async function clearAllData(userId) {
   return await invoke('plugin:openmls|clear_all_data', { userId });
 }
 
+export async function commitPendingProposals(userId, groupId) {
+  return await invoke('plugin:openmls|commit_pending_proposals', { userId, groupId });
+}
+
 // ── Group ID extraction ─────────────────────────────────────────────
 
 /**

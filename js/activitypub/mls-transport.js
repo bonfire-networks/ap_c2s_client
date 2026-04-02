@@ -17,22 +17,22 @@ const MLS_CONTEXTS = [
   'https://purl.archive.org/socialweb/mls'
 ];
 
-/**
- * Send a pre-built PrivateMessage body to the actor's outbox.
- * NOTE: sending is now done in Rust via mlsService.sendMessage — this is kept for reference/fallback.
- * Build the body with buildPrivateMessageBody (in chat-controller.js).
- *
- * @param {object} actor - current actor
- * @param {object} body - result of buildPrivateMessageBody
- * @returns {object} response from outbox
- */
-export async function sendEncryptedMessage(actor, body) {
-  const res = await postToOutbox(actor, body);
-  if (res && (res.ok === false || res.status >= 400)) {
-    throw new Error('Failed to send encrypted message: ' + (res.status || 'unknown status'));
-  }
-  return res;
-}
+// /**
+//  * Send a pre-built PrivateMessage body to the actor's outbox.
+//  * NOTE: sending is now done in Rust via mlsService.sendMessage — this is kept for reference/fallback.
+//  * Build the body with buildPrivateMessageBody (in chat-controller.js).
+//  *
+//  * @param {object} actor - current actor
+//  * @param {object} body - result of buildPrivateMessageBody
+//  * @returns {object} response from outbox
+//  */
+// export async function sendEncryptedMessage(actor, body, storage) {
+//   const res = await postToOutbox(actor, body, storage);
+//   if (res && (res.ok === false || res.status >= 400)) {
+//     throw new Error('Failed to send encrypted message: ' + (res.status || 'unknown status'));
+//   }
+//   return res;
+// }
 
 /**
  * Send an MLS control message (Welcome or GroupInfo).
@@ -44,12 +44,14 @@ export async function sendEncryptedMessage(actor, body) {
  * @param {string} contextId - AP thread/group context ID
  * @returns {object} response from outbox
  */
-export async function sendMLSControl(actor, type, contentB64, recipients, contextId) {
+export async function sendMLSControl(actor, type, contentB64, recipients, contextId, storage = null) {
+  // Always include own actor so other devices receive MLS messages via own inbox
+  const to = recipients.includes(actor.id) ? recipients : [...recipients, actor.id];
   const controlObj = {
     '@context': MLS_CONTEXTS,
     type,
     attributedTo: actor.id,
-    to: recipients,
+    to,
     mediaType: 'message/mls',
     encoding: 'base64',
     content: contentB64,
@@ -57,7 +59,7 @@ export async function sendMLSControl(actor, type, contentB64, recipients, contex
     context: contextId
   };
 
-  const res = await postToOutbox(actor, controlObj);
+  const res = await postToOutbox(actor, controlObj, storage);
   if (res && (res.ok === false || res.status >= 400)) {
     throw new Error(`Failed to send MLS ${type}: ` + (res.status || 'unknown status'));
   }
@@ -75,7 +77,7 @@ export async function sendMLSControl(actor, type, contentB64, recipients, contex
  * @param {Uint8Array} keyPackageBytes - raw key package bytes
  * @returns {boolean} true if published successfully
  */
-export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = null) {
+export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = null, storage = null) {
   const kpB64 = bytesToBase64(keyPackageBytes);
 
   const keyPackageObj = {
@@ -106,7 +108,7 @@ export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = n
       target
     };
     if (mlsSignature) addActivity.mlsSignature = mlsSignature;
-    res = await postToOutbox(actor, addActivity);
+    res = await postToOutbox(actor, addActivity, storage);
   } else {
     res = await postToOutbox(actor, {
       type: 'Update',
@@ -117,7 +119,7 @@ export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = n
         type: actor.type,
         keyPackages: [keyPackageObj]
       }
-    });
+    }, storage);
   }
 
   return res && res.ok;
@@ -134,7 +136,7 @@ export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = n
  * @param {Uint8Array} keyPackageBytes - raw key package bytes
  * @returns {object} response from outbox
  */
-export async function sendKeyPackageProposal(actor, keyPackageBytes) {
+export async function sendKeyPackageProposal(actor, keyPackageBytes, storage = null) {
   const kpB64 = bytesToBase64(keyPackageBytes);
 
   const res = await postToOutbox(actor, {
@@ -149,7 +151,7 @@ export async function sendKeyPackageProposal(actor, keyPackageBytes) {
       encoding: 'base64',
       content: kpB64,
     }
-  });
+  }, storage);
 
   if (res && (res.ok === false || res.status >= 400)) {
     throw new Error('Failed to send KeyPackage proposal: ' + (res.status || 'unknown status'));
@@ -165,7 +167,7 @@ export async function sendKeyPackageProposal(actor, keyPackageBytes) {
  * @param {Uint8Array} keyPackageBytes - raw key package bytes to remove
  * @returns {boolean} true if removed successfully
  */
-export async function deleteKeyPackage(actor, keyPackageBytes) {
+export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
   const kpB64 = bytesToBase64(keyPackageBytes);
 
   const keyPackages = actor.keyPackages;
@@ -184,7 +186,7 @@ export async function deleteKeyPackage(actor, keyPackageBytes) {
         content: kpB64,
       },
       target,
-    });
+    }, storage);
   } else {
     res = await postToOutbox(actor, {
       type: 'Update',
@@ -195,7 +197,7 @@ export async function deleteKeyPackage(actor, keyPackageBytes) {
         type: actor.type,
         keyPackages: []
       }
-    });
+    }, storage);
   }
 
   return res && res.ok;

@@ -26,8 +26,7 @@ const MLS_CONTEXTS = [
 /** Build the AP PrivateMessage body. `content` is a pendingId — Rust substitutes before sending. */
 function buildPrivateMessageBody(actor, content, recipients, contextId, options = {}) {
   const { isNewThread, inReplyTo, overrides = {} } = options;
-  const otherRecipients = recipients.filter(r => r !== actor.id);
-  const to = isNewThread || otherRecipients.length === 0 ? recipients : otherRecipients;
+  const to = recipients;
   return {
     '@context': MLS_CONTEXTS,
     type: 'PrivateMessage',
@@ -115,6 +114,10 @@ export class ChatController {
     this.storage = storage;
     // messageId → setTimeout handle; cancelled if Read is sent first
     this._pendingAcks = new Map();
+    // groupId → setTimeout handle for non-co-device proposal commit (staggered timer)
+    this._pendingProposalTimers = new Map();
+    // Set true while this device is awaiting co-device approval — blocks decryption attempts
+    this._awaitingApproval = false;
   }
 
   // ── Initialization ─────────────────────────────────────
@@ -138,7 +141,21 @@ export class ChatController {
     console.log('[ChatController] MLSService initialized for actor:', actor.id);
     const kpResult = await this.ensurePublishedKeyPackage(actor);
 
-    return { actor, kpResult };
+    // Resume any co-device leave confirmations that survived a restart
+    const pendingLeaves = [];
+    try {
+      const groups = await this.storage.listGroupsWithLastMessage();
+      for (const { groupId } of groups) {
+        const proposalActivityId = await this.storage.getGroupField(groupId, 'pendingCoDeviceLeave', null);
+        if (proposalActivityId) {
+          pendingLeaves.push({ type: 'coDeviceLeaving', groupId, proposalActivityId });
+        }
+      }
+    } catch (e) {
+      console.warn('[init] Failed to scan for pending co-device leaves:', e);
+    }
+
+    return { actor, kpResult, pendingLeaves };
   }
 
   // ── Group management ───────────────────────────────────
@@ -568,7 +585,7 @@ export class ChatController {
    * Returns the (possibly updated) apId.
    */
   async _sendInvite(actor, groupId, recipient, welcomeBytes, ratchetTreeBytes, apId) {
-    const welcomeRes = await sendMLSControl(actor, 'Welcome', bytesToBase64(welcomeBytes), [recipient], apId || null);
+    const welcomeRes = await sendMLSControl(actor, 'Welcome', bytesToBase64(welcomeBytes), [recipient], apId || null, this.storage);
     if (!apId) {
       apId = await this._resolveApId(welcomeRes);
       if (apId) {
@@ -576,7 +593,7 @@ export class ChatController {
         console.log('[_sendInvite] Stored group AP ID from Welcome:', apId);
       }
     }
-    await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTreeBytes), [recipient], apId || null);
+    await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTreeBytes), [recipient], apId || null, this.storage);
     return apId;
   }
 
@@ -817,6 +834,9 @@ export class ChatController {
       // Process oldest-first so group joins happen before messages
       const itemsToProcess = [...items].reverse();
       const results = [];
+      // Proposals deferred until all other activities in this batch are processed,
+      // so any Commit for the same epoch is applied first
+      const deferredProposals = [];
 
       for (const item of itemsToProcess) {
         const itemId = item.id || item.object?.id;
@@ -831,13 +851,26 @@ export class ChatController {
         try {
           const result = await this.handleActivity(item);
           await this.storage.markProcessed(actor.id, itemId);
-          if (result) {
+          if (result?.proposalBuffered) {
+            // Defer — process after all commits in this batch have been applied
+            deferredProposals.push({ item, result });
+          } else if (result) {
             results.push(result);
           }
         } catch (itemErr) {
           console.error('[pollInbox] Failed to process item:', itemId, itemErr);
-          // Mark as processed to avoid retrying a permanently broken item
           await this.storage.markProcessed(actor.id, itemId);
+        }
+      }
+
+      // Second pass: handle buffered proposals now that any Commits in this batch are applied
+      for (const { result } of deferredProposals) {
+        const { groupId, parsed } = result._deferred;
+        try {
+          const r = await this._handleProposal(groupId, parsed, actor, /* alreadyDecrypted */ true);
+          if (r) results.push(r);
+        } catch (e) {
+          console.warn('[pollInbox] Deferred proposal handling failed:', e);
         }
       }
 
@@ -928,8 +961,16 @@ export class ChatController {
     } else if (parsed.type === 'GroupInfo') {
       return this._handleGroupInfo(groupId, parsed, actor);
     } else if (parsed.type === 'PrivateMessage') {
+      if (this._awaitingApproval) {
+        console.log('[handleActivity] Skipping PrivateMessage — awaiting co-device approval');
+        return null;
+      }
       return this._handlePrivateMessage(groupId, parsed, actor);
     } else if (parsed.type === 'PublicMessage') {
+      if (this._awaitingApproval) {
+        console.log('[handleActivity] Skipping PublicMessage — awaiting co-device approval');
+        return null;
+      }
       return this._handlePublicMessage(groupId, parsed, actor);
     }
 
@@ -951,7 +992,7 @@ export class ChatController {
 
     let finalGroupId = groupId;
     if (nextState.ratchetTree) {
-      finalGroupId = await this._tryJoinGroup(actor, groupId, welcomeBytes, Uint8Array.from(nextState.ratchetTree), parsed);
+      finalGroupId = await this._tryJoinGroup(actor, groupId, welcomeBytes, Uint8Array.from(nextState.ratchetTree), parsed, { wasJoined: !!state.joined });
     }
 
     return { type: 'welcome', groupId: finalGroupId };
@@ -972,7 +1013,7 @@ export class ChatController {
 
     let finalGroupId = groupId;
     if (nextState.welcome) {
-      finalGroupId = await this._tryJoinGroup(actor, groupId, Uint8Array.from(nextState.welcome), ratchetTreeBytes, parsed);
+      finalGroupId = await this._tryJoinGroup(actor, groupId, Uint8Array.from(nextState.welcome), ratchetTreeBytes, parsed, { wasJoined: !!state.joined });
     }
 
     return { type: 'groupinfo', groupId: finalGroupId };
@@ -980,29 +1021,37 @@ export class ChatController {
 
   /**
    * Join a group from Welcome + RatchetTree.
-   * Always deletes any existing group first — Rust join_group silently
-   * no-ops if the group is already in memory, which would leave stale keys.
    *
    * Returns the canonical group ID (the sender's ULID from the Welcome).
    * If the passed groupId was a temporary URI, migrates metadata to the ULID
    * and stores the URI→ULID mapping.
+   *
+   * @param {object} opts
+   * @param {boolean} opts.wasJoined - true if we were already a member (re-invite); deletes
+   *   stale state before joining. False for a first join — do NOT delete until we know
+   *   the Welcome is for this device, to avoid destroying state on echoed Welcome activities.
    */
-  async _tryJoinGroup(actor, groupId, welcomeBytes, ratchetTreeBytes, parsed) {
-    // Delete existing group so the new Welcome is actually processed
-    const { found } = await this.mlsService.getGroup(actor.id, groupId);
-    const wasReset = found;
-    if (found) {
-      await this.mlsService.deleteGroup(actor.id, groupId);
-    }
-
-    // joinFromWelcome returns the actual MLS group_id (sender's ULID)
+  async _tryJoinGroup(actor, groupId, welcomeBytes, ratchetTreeBytes, parsed, { wasJoined = false } = {}) {
+    // Strategy: always try joining WITHOUT deleting first.
+    // - NoMatchingKeyPackage → Welcome is not for this device (co-device Welcome CC'd back,
+    //   or echo); bail without touching group state.
+    // - Success when wasJoined → Rust silently no-op'd on the stale group; delete and retry
+    //   so the epoch actually advances.
+    // - Success when !wasJoined → genuine first join.
     let actualGroupId;
     try {
       actualGroupId = await this.mlsService.joinFromWelcome(actor.id, groupId, welcomeBytes, ratchetTreeBytes);
+      if (wasJoined) {
+        // No-op'd on old group — delete stale state and rejoin to advance epoch
+        await this.mlsService.deleteGroup(actor.id, groupId);
+        actualGroupId = await this.mlsService.joinFromWelcome(actor.id, groupId, welcomeBytes, ratchetTreeBytes);
+      }
+      // Successfully joined — no longer awaiting approval
+      this._awaitingApproval = false;
     } catch (e) {
       if (String(e).includes('NoMatchingKeyPackage')) {
-        // Key package already consumed by an earlier Welcome — already joined, ignore duplicate
-        console.log('[_tryJoinGroup] Duplicate Welcome ignored (key package consumed):', groupId);
+        // Welcome is not for this device (CC'd copy meant for another device/co-device)
+        console.log('[_tryJoinGroup] Welcome not for this device (key package consumed):', groupId);
         return groupId;
       }
       throw e;
@@ -1034,7 +1083,7 @@ export class ChatController {
 
     const inviterUri = parsed.attributedTo;
     const inviter = await this._getNickname(inviterUri);
-    if (wasReset) {
+    if (wasJoined) {
       await this._insertSystemMessage(actualGroupId, `Encryption was reset by ${inviter}. You have been re-invited to the group.`);
     } else {
       await this._insertSystemMessage(actualGroupId, `${inviter} added you to this group.`);
@@ -1066,10 +1115,14 @@ export class ChatController {
       const ciphertext = bytesFromInput(parsed.content);
       const decrypted = await this.mlsService.decrypt(actor.id, groupId, ciphertext);
       console.log('[_handlePrivateMessage] Decrypted:', typeof decrypted, decrypted);
-      // null means a handshake message (Commit/Proposal) — epoch was advanced, sync members
+      // null = Commit (epoch advanced), proposalBuffered = self-remove Proposal
       if (decrypted === null) {
         await this._syncMembersFromMLS(groupId, actor, parsed.attributedTo);
         return { type: 'membershipChange', groupId };
+      }
+      if (decrypted?.proposalBuffered) {
+        // Defer to pollInbox second pass so any Commit in the same batch is applied first
+        return { proposalBuffered: true, _deferred: { groupId, parsed } };
       }
       const { content: rawContent, senderSignatureKey } = decrypted;
       let decryptedContent = typeof rawContent === 'object' ? rawContent : { content: rawContent };
@@ -1298,7 +1351,7 @@ export class ChatController {
       await this.mlsService.clearKeyPackage(actor.id);
       const { keyPackageHex } = await this.mlsService.createKeyPackage(actor.id);
       const kpBytes = bytesFromInput(keyPackageHex);
-      const published = await publishKeyPackage(actor, kpBytes);
+      const published = await publishKeyPackage(actor, kpBytes, null, this.storage);
       if (published) {
         await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
         localStorage.removeItem('actor');
@@ -1326,13 +1379,14 @@ export class ChatController {
       const liveCoDeviceKeys = await this._getLiveCoDeviceKeys(actor);
       const serverHasOtherDevice = await this._actorHasOtherDevices(actor, ownSigKey);
       if (liveCoDeviceKeys.length > 0 || serverHasOtherDevice) {
-        await sendKeyPackageProposal(actor, kpBytes);
+        await sendKeyPackageProposal(actor, kpBytes, this.storage);
         console.log('[KeyPackage] Sent proposal to own inbox for co-device approval');
+        this._awaitingApproval = true;
         const ownFp = await this.mlsService.getOwnFingerprint(actor.id);
         return { type: 'newDevicePending', fingerprint: ownFp?.fingerprint };
       }
 
-      const published = await publishKeyPackage(actor, kpBytes);
+      const published = await publishKeyPackage(actor, kpBytes, null, this.storage);
       if (published) {
         await this.mlsService.markKeyPackagePublished(actor.id, newHex);
         localStorage.removeItem('actor');
@@ -1349,7 +1403,7 @@ export class ChatController {
     // Has key package but not published — self-sign and publish (replenishment)
     const kpBytes = bytesFromInput(keyPackageHex);
     const mlsSignature = await this._signKeyPackage(actor.id, keyPackageHex);
-    const published = await publishKeyPackage(actor, kpBytes, mlsSignature);
+    const published = await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage);
     if (published) {
       await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
       localStorage.removeItem('actor');
@@ -1405,12 +1459,20 @@ export class ChatController {
   async clearAllData() {
     const actor = await getCurrentActor();
 
-    // Rust handles: native dialog → leave all groups → back up & delete SQLite DB
+    // Rust handles: native warning dialog (with irrecoverable warning if no co-devices) → leave all groups → back up & delete SQLite DB
     const response = await this.mlsService.clearAllData(actor.id);
     if (response.cancelled || !response.results) {
       console.warn('[clearAllData] Clear cancelled or failed:', response);
       return false;
     } 
+
+    // Remove this device's key package from the actor profile
+    try {
+      const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id);
+      if (ownSigKey) await this._deleteKeyPackageForDevice(actor, ownSigKey);
+    } catch (e) {
+      console.warn('[clearAllData] Failed to delete key package:', e);
+    }
 
     // Distribute self-remove proposals so other members update their state
     for (const result of response.results) {
@@ -1419,8 +1481,7 @@ export class ChatController {
         const meta = (await this.storage.loadGroupMeta(result.groupId)) || {};
         const apId = meta.apId || null;
         if (apId && recipients.length > 0) {
-          const type = result.isSelfRemove ? 'Proposal' : 'Commit';
-          await sendMLSControl(actor, type, result.commit, recipients, apId);
+          await sendMLSControl(actor, 'PrivateMessage', result.commit, recipients, apId, this.storage);
         }
       } catch (err) {
         console.error(`[clearAllData] Failed to distribute for ${result.groupId}:`, err);
@@ -1445,7 +1506,7 @@ export class ChatController {
     const apId = await this.storage.getGroupField(groupId, 'apId', null);
     console.log('[_distributeCommit] apId:', apId, 'recipients:', recipients, 'commitB64 length:', commitB64?.length);
     if (apId && recipients.length > 0) {
-      await sendMLSControl(actor, 'PrivateMessage', commitB64, recipients, apId);
+      await sendMLSControl(actor, 'PrivateMessage', commitB64, recipients, apId, this.storage);
     }
   }
 
@@ -1564,9 +1625,11 @@ export class ChatController {
     }
     const { fingerprint, signatureKey } = fingerprintResult;
 
-    // If this is our own device's proposal coming back, show pending verification status
+    // If this is our own device's proposal coming back, show pending verification status.
+    // Also guard against ownSigKey being null (MLS not yet initialised) — in that case
+    // kpObject.attributedTo === actor.id is the only reliable signal we sent it ourselves.
     const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id);
-    if (signatureKey === ownSigKey) {
+    if (signatureKey === ownSigKey || (!ownSigKey && kpObject.attributedTo === actor.id)) {
       console.log('[_handleKeyPackageProposal] Own device proposal received — showing pending status');
       const ownFp = await this.mlsService.getOwnFingerprint(actor.id);
       return { type: 'newDevicePending', fingerprint: ownFp?.fingerprint };
@@ -1615,6 +1678,27 @@ export class ChatController {
       } catch (e) { /* unparseable KP — skip */ }
     }
     return false;
+  }
+
+  /**
+   * Find and delete the key package for a specific device (by signatureKey) from the actor profile.
+   * Scans the actor's keyPackages collection for the matching entry and sends a Remove/Update activity.
+   */
+  async _deleteKeyPackageForDevice(actor, signatureKey) {
+    const kps = actor.keyPackages;
+    if (!kps) return;
+    const kpList = Array.isArray(kps) ? kps : (kps.items || []);
+    for (const kp of kpList) {
+      const content = typeof kp === 'string' ? null : kp?.content;
+      if (!content) continue;
+      try {
+        const fp = await this.mlsService.getKeyPackageFingerprint(content);
+        if (fp?.signatureKey === signatureKey) {
+          await deleteKeyPackage(actor, bytesFromInput(content), this.storage);
+          return;
+        }
+      } catch (e) { /* unparseable KP — skip */ }
+    }
   }
 
   /**
@@ -1667,7 +1751,7 @@ export class ChatController {
     const mlsSignature = await this._signKeyPackage(actor.id, kpB64);
 
     // Publish to public keyPackages collection (endorsed by ExistingDeviceA's MLS signature)
-    await publishKeyPackage(actor, kpBytes, mlsSignature);
+    await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage);
 
     // Add to all existing groups
     const groups = await this.storage.listGroupsWithLastMessage();
@@ -1693,6 +1777,12 @@ export class ChatController {
    * The Rust decrypt command handles all subtypes correctly via process_message().
    */
   async _handlePublicMessage(groupId, parsed, actor) {
+    // Cancel any pending proposal commit timer — a commit arrived, someone else won the race
+    if (this._pendingProposalTimers.has(groupId)) {
+      clearTimeout(this._pendingProposalTimers.get(groupId));
+      this._pendingProposalTimers.delete(groupId);
+      console.log('[_handlePublicMessage] Cancelled pending proposal timer for group', groupId);
+    }
     try {
       const msgBytes = bytesFromInput(parsed.content);
       // decrypt handles: StagedCommitMessage (merges epoch), ProposalMessage (buffered), ApplicationMessage
@@ -1702,6 +1792,105 @@ export class ChatController {
       console.warn('[_handlePublicMessage] Failed to process public message:', e);
     }
     return null;
+  }
+
+  /**
+   * Handle a buffered MLS Proposal (self-remove from a leaving device).
+   *
+   * Co-device, sole other device: prompt immediately — no race possible.
+   * Co-device, multiple other devices: staggered timer — device whose timer fires
+   *   first shows the prompt; others cancel when the resulting Commit arrives.
+   * Non-co-device: staggered timer, winner commits directly without prompting.
+   */
+  async _handleProposal(groupId, parsed, actor, alreadyDecrypted = false) {
+    if (!alreadyDecrypted) {
+      const msgBytes = bytesFromInput(parsed.content);
+      let result;
+      try {
+        result = await this.mlsService.decrypt(actor.id, groupId, msgBytes);
+      } catch (e) {
+        console.warn('[_handleProposal] decrypt failed:', e);
+        return null;
+      }
+      if (!result?.proposalBuffered) return null;
+    }
+
+    if (this._pendingProposalTimers.has(groupId)) return null;
+
+    const isCoDevice = parsed.attributedTo === actor.id;
+
+    if (isCoDevice) {
+      const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id).catch(() => null);
+      const fingerprints = await this.mlsService.getGroupFingerprints(actor.id, groupId).catch(() => []);
+      // Leaving device is still in the group at this point (proposal not yet committed)
+      const leavingFp = fingerprints.find(fp => fp.isOwn && fp.signatureKey !== ownSigKey);
+      const otherCoDevices = fingerprints.filter(fp => fp.isOwn && fp.signatureKey !== ownSigKey && fp.signatureKey !== leavingFp?.signatureKey);
+
+      const promptPayload = { type: 'coDeviceLeaving', groupId, proposalActivityId: parsed.id, fingerprint: leavingFp?.fingerprint };
+
+      if (otherCoDevices.length === 0) {
+        // Only us — prompt immediately, no timer needed
+        await this.storage.setGroupField(groupId, 'pendingCoDeviceLeave', parsed.id || true);
+        return promptPayload;
+      }
+
+      // Multiple co-devices may commit — staggered timer, winner prompts
+      const delay = 500 + Math.random() * 2500;
+      this._pendingProposalTimers.set(groupId, setTimeout(async () => {
+        this._pendingProposalTimers.delete(groupId);
+        await this.storage.setGroupField(groupId, 'pendingCoDeviceLeave', parsed.id || true);
+        this.onAsyncResult?.(promptPayload);
+      }, delay));
+      console.log('[_handleProposal] Co-device leave, multiple co-devices — scheduled prompt in', Math.round(delay), 'ms');
+      return null;
+    }
+
+    // Non-co-device — staggered timer, commit directly (RFC §12.4: first commit wins)
+    const delay = 500 + Math.random() * 2500;
+    this._pendingProposalTimers.set(groupId, setTimeout(async () => {
+      this._pendingProposalTimers.delete(groupId);
+      try {
+        const r = await this.mlsService.commitPendingProposals(actor.id, groupId);
+        if (r?.commit) {
+          const members = await this.getGroupMembers(groupId);
+          await this._distributeCommit(actor, groupId, r.commit, members);
+          await this._syncMembersFromMLS(groupId, actor);
+          if (parsed.id) await this._deleteProposalActivity(actor, parsed.id);
+        }
+      } catch (e) {
+        console.warn('[_handleProposal] Commit failed (likely lost race — will process winner):', e);
+      }
+    }, delay));
+    console.log('[_handleProposal] Non-co-device proposal — scheduled commit in', Math.round(delay), 'ms');
+    return null;
+  }
+
+  /**
+   * Commit a pending co-device leave proposal and distribute the result.
+   * Called by the UI after the user confirms the leaving-device prompt.
+   */
+  async commitCoDeviceLeaving(groupId, proposalActivityId) {
+    const actor = await getCurrentActor();
+    const result = await this.mlsService.commitPendingProposals(actor.id, groupId);
+    if (!result?.commit) {
+      console.warn('[commitCoDeviceLeaving] No commit produced for group', groupId);
+      return;
+    }
+    const members = await this.getGroupMembers(groupId);
+    await this._distributeCommit(actor, groupId, result.commit, members);
+    await this._syncMembersFromMLS(groupId, actor);
+    await this.storage.setGroupField(groupId, 'pendingCoDeviceLeave', null);
+    if (proposalActivityId) await this._deleteProposalActivity(actor, proposalActivityId);
+    console.log('[commitCoDeviceLeaving] Done for group', groupId);
+  }
+
+  /** Send a Delete for a Proposal activity so inboxes don't re-serve it. */
+  async _deleteProposalActivity(actor, proposalActivityId) {
+    await postToOutbox(actor, {
+      type: 'Delete',
+      object: proposalActivityId,
+      to: [actor.id],
+    }, this.storage).catch(e => console.warn('[_deleteProposalActivity] Failed:', e));
   }
 
   /**
@@ -1826,7 +2015,8 @@ export class ChatController {
   /** DRY helper: resolve recipients + apId for a group send. */
   async _groupSendContext(groupId, actor) {
     const members = await this.getGroupMembers(groupId);
-    const recipients = members.filter(id => id !== actor.id);
+    // Always include own actor so other devices receive messages via own inbox
+    const recipients = members.includes(actor.id) ? members : [...members, actor.id];
     const apId = await this.storage.getGroupField(groupId, 'apId', null);
     return { recipients, apId };
   }
@@ -1926,7 +2116,11 @@ export class ChatController {
       }
     }
 
-    await deleteKeyPackage(actor, signatureKeyB64);
+    try {
+      await this._deleteKeyPackageForDevice(actor, signatureKeyB64);
+    } catch (e) {
+      console.warn('[removeOwnClient] Failed to delete key package:', e);
+    }
     return { cancelled: false };
   }
 
@@ -1946,6 +2140,7 @@ export class ChatController {
         const accessToken = localStorage.getItem('access_token');
         const res = await this.mlsService.sendMessage(pendingId, actor.outbox, accessToken, apBody);
         if (!res?.ok) await this.mlsService.discardMessage(pendingId);
+        else if (res?.id) await this.storage.markProcessed(actor.id, res.id);
         console.log('[receipt] Sent', payload.type, 'for:', payload.object);
       } catch (e) {
         console.warn('[receipt] Failed to send', payload.type, ':', e.message || e);
@@ -1995,7 +2190,7 @@ export class ChatController {
             attributedTo: actor.id,
             to: [parsed.attributedTo],
             object: outerMessageId
-          });
+          }, this.storage);
           console.log('[receipt] Sent plaintext Failure (no group) for:', outerMessageId);
         }
       } catch (e) {

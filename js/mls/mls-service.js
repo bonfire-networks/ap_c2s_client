@@ -321,6 +321,13 @@ export class MLSService {
     return await this.backend.clearAllData(userId);
   }
 
+  async commitPendingProposals(userId, groupId) {
+    if (!this.backend.commitPendingProposals) return null;
+    const result = await this.backend.commitPendingProposals(userId, groupId);
+    if (result) await this._persistAfterGroupOp(userId, groupId);
+    return result;
+  }
+
   async getGroupMemberIdentities(groupId) {
     return await this.backend.getGroupMemberIdentities(groupId);
   }

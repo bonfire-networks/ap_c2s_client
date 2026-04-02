@@ -392,11 +392,17 @@ export class E2EEChatView extends LitElement {
       const mlsService = new MLSService(backend, storage);
       // console.log('[ChatView] MLSService initialized with backend:', mlsService);
       this.controller = new ChatController(mlsService, storage);
+      this.controller.onAsyncResult = (r) => {
+        if (r.type === 'coDeviceLeaving') this._showDeviceConfirmation({ ...r, isLeaving: true });
+      };
       console.log('[ChatView] ChatController initialized:', this.controller);
 
-      const { actor, kpResult } = await this.controller.init();
+      const { actor, kpResult, pendingLeaves } = await this.controller.init();
       console.log('[ChatView] Actor initialized:', actor);
-      if (kpResult?.type === 'newDevicePending') this._showNewDeviceApproval(kpResult);
+      if (kpResult?.type === 'newDevicePending') this._showDeviceConfirmation(kpResult);
+      for (const leave of (pendingLeaves || [])) {
+        this._showDeviceConfirmation({ ...leave, isLeaving: true });
+      }
       this.currentActorId = actor.id;
       this._sendReadReceipts = await this.controller.storage.loadUserSetting(actor.id, 'sendReadReceipts', false);
       this._ensureActorProfile(actor.id);
@@ -431,31 +437,32 @@ export class E2EEChatView extends LitElement {
         this._sseDebounce = null;
         this._unlistenNewMessage = await window.__TAURI__.event.listen('new-message', () => {
           clearTimeout(this._sseDebounce);
-          this._sseDebounce = setTimeout(async () => {
-            const results = await this.pollInbox();
-            console.log('[SSE] Poll results:', results?.length, results);
-            if (!results?.length) return;
-            const counts = {};
-            for (const r of results) {
-              if (r.type === 'message' && r.from) {
-                const name = this.getActorNickname(r.from);
-                counts[name] = (counts[name] || 0) + 1;
+          this._sseDebounce = setTimeout(() => {
+            this.pollInbox().then(results => {
+              console.log('[SSE] Poll results:', results?.length, results);
+              if (!results?.length) return;
+              const counts = {};
+              for (const r of results) {
+                if (r.type === 'message' && r.from) {
+                  const name = this.getActorNickname(r.from);
+                  counts[name] = (counts[name] || 0) + 1;
+                }
               }
-            }
-            const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            for (const [sender, n] of Object.entries(counts)) {
-              const body = n > 1 ? `${n} messages from ${sender}` : `From ${sender} at ${time}`;
-              console.log('[SSE] Sending notification:', body);
-              invoke?.('show_notification', { title: 'New secure message', body })
-                .catch(e => console.warn('[SSE] Notification failed:', e));
-            }
+              const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+              for (const [sender, n] of Object.entries(counts)) {
+                const body = n > 1 ? `${n} messages from ${sender}` : `From ${sender} at ${time}`;
+                console.log('[SSE] Sending notification:', body);
+                invoke?.('show_notification', { title: 'New secure message', body })
+                  .catch(e => console.warn('[SSE] Notification failed:', e));
+              }
+            }).catch(e => console.warn('[SSE] Poll failed:', e));
           }, 500);
         });
 
         // When SSE reconnects after a drop, poll inbox to catch any missed messages
         this._unlistenSseReconnected = await window.__TAURI__.event.listen('sse-reconnected', () => {
           console.log('[SSE] Reconnected — polling inbox for missed messages');
-          this.pollInbox();
+          this.pollInbox().catch(e => console.warn('[SSE] Reconnect poll failed:', e));
         });
 
         // Drain in-flight DB writes before the window closes to prevent corruption
@@ -678,13 +685,17 @@ export class E2EEChatView extends LitElement {
   }
 
   async pollInbox() {
+    if (this._pollingInbox) return [];
+    this._pollingInbox = true;
     try {
       const results = await this.controller.pollInbox();
       if (results.length > 0) {
         // Handle new device requests before reloading (non-MLS result, no groupId)
         for (const r of results) {
-          if (r.type === 'newDeviceRequest' || r.type === 'newDevicePending') {
-            this._showNewDeviceApproval(r);
+          if (r.type === 'coDeviceLeaving') {
+            this._showDeviceConfirmation({ ...r, isLeaving: true });
+          } else if (r.type === 'newDeviceRequest' || r.type === 'newDevicePending') {
+            this._showDeviceConfirmation(r);
           } else if (r.type === 'newDeviceApproved' || r.type === 'welcome' || r.type === 'groupinfo') {
             // Approved (no-groups case) or joined a group — close pending dialog
             this.shadowRoot.querySelector('#nd-pending-dialog')?.remove();
@@ -707,44 +718,69 @@ export class E2EEChatView extends LitElement {
     } catch (e) {
       console.error('[Inbox] Error:', e);
       return [];
+    } finally {
+      this._pollingInbox = false;
     }
   }
 
-  _showNewDeviceApproval({ fingerprint, kpB64 }) {
-    const isPending = !kpB64;
+  _showDeviceConfirmation({ fingerprint, kpB64, isLeaving = false, groupId = null, proposalActivityId = null }) {
+    const isPending = !kpB64 && !isLeaving;
     if (isPending && this.shadowRoot.querySelector('#nd-pending-dialog')) return; // already showing
     const emojiStr = Array.isArray(fingerprint) ? fingerprint.map(e => e.emoji).join(' ') : (fingerprint || '');
+
+    const title = isLeaving
+      ? 'A device is leaving'
+      : (isPending ? 'Waiting for approval' : 'New device wants to join your account');
+    const description = isLeaving
+      ? 'Confirm removal of this device from your encrypted conversations:'
+      : (isPending
+          ? 'Show this fingerprint to your other device and ask it to approve:'
+          : 'Verify that the fingerprint shown on your new device matches exactly:');
+    const hint = isLeaving
+      ? 'Confirm only if this is the device you intended to remove. The device will lose access to all encrypted conversations.'
+      : (isPending
+          ? 'This dialog will close automatically once approved.'
+          : "Only approve if you recognise this device. If the emoji don't match, reject.");
+    const buttons = isLeaving
+      ? '<button class="btn btn-ghost btn-sm" id="nd-cancel">Dismiss</button><button class="btn btn-error btn-sm" id="nd-approve">Confirm removal</button>'
+      : (isPending
+          ? '<button class="btn btn-ghost btn-sm" id="nd-cancel">Cancel</button>'
+          : '<button class="btn btn-error btn-sm" id="nd-reject">Reject</button><button class="btn btn-primary btn-sm" id="nd-approve">Approve</button>');
+
     const dialog = document.createElement('dialog');
     if (isPending) dialog.id = 'nd-pending-dialog';
     dialog.className = 'modal modal-open';
     dialog.innerHTML = `
       <div class="modal-box max-w-sm">
-        <h3 class="font-bold text-lg mb-2">${isPending ? 'Waiting for approval' : 'New device wants to join your account'}</h3>
-        <p class="text-sm opacity-70 mb-4">
-          ${isPending
-            ? 'Show this fingerprint to your other device and ask it to approve:'
-            : 'Verify that the fingerprint shown on your new device matches exactly:'}
-        </p>
-        <div class="text-3xl text-center tracking-widest py-3 px-4 bg-base-200 rounded-lg mb-4 select-all">
-          ${emojiStr}
-        </div>
-        <p class="text-xs opacity-50 mb-4">
-          ${isPending ? 'This dialog will close automatically once approved.' : 'Only approve if you recognise this device. If the emoji don\'t match, reject.'}
-        </p>
+        <h3 class="font-bold text-lg mb-2">${title}</h3>
+        <p class="text-sm opacity-70 mb-4">${description}</p>
+        ${emojiStr ? `<div class="text-3xl text-center tracking-widest py-3 px-4 bg-base-200 rounded-lg mb-4 select-all">${emojiStr}</div>` : ''}
+        <p class="text-xs opacity-50 mb-4">${hint}</p>
         <div id="nd-error" class="alert alert-error text-sm mb-2 hidden"></div>
-        <div class="modal-action gap-2">
-          ${isPending
-            ? '<button class="btn btn-ghost btn-sm" id="nd-cancel">Cancel</button>'
-            : '<button class="btn btn-error btn-sm" id="nd-reject">Reject</button><button class="btn btn-primary btn-sm" id="nd-approve">Approve</button>'}
-        </div>
+        <div class="modal-action gap-2">${buttons}</div>
       </div>
     `;
 
     const close = () => { dialog.remove(); };
 
-    if (isPending) {
-      dialog.querySelector('#nd-cancel').addEventListener('click', close);
-    } else {
+    dialog.querySelector('#nd-cancel')?.addEventListener('click', close);
+    dialog.querySelector('#nd-reject')?.addEventListener('click', close);
+
+    if (isLeaving) {
+      dialog.querySelector('#nd-approve').addEventListener('click', async () => {
+        try {
+          dialog.querySelector('#nd-approve').disabled = true;
+          await this.controller.commitCoDeviceLeaving(groupId, proposalActivityId);
+          close();
+        } catch (e) {
+          console.error('[NewDevice] Commit leaving failed:', e);
+          const errEl = dialog.querySelector('#nd-error');
+          errEl.textContent = 'Failed to confirm removal: ' + (e.message || e);
+          errEl.classList.remove('hidden');
+          dialog.querySelector('#nd-approve').disabled = false;
+        }
+      });
+    } else if (!isPending) {
       dialog.querySelector('#nd-approve').addEventListener('click', async () => {
         try {
           dialog.querySelector('#nd-approve').disabled = true;
@@ -758,7 +794,6 @@ export class E2EEChatView extends LitElement {
           dialog.querySelector('#nd-approve').disabled = false;
         }
       });
-      dialog.querySelector('#nd-reject').addEventListener('click', close);
     }
 
     this.shadowRoot.appendChild(dialog);

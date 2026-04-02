@@ -15,7 +15,7 @@ import { apFetch, getActorId, getActor } from './auth.js';
  * @param {object} obj - activity/object to post
  * @returns {object} response data with status, ok, and parsed body
  */
-export async function postToOutbox(actor, obj) {
+export async function postToOutbox(actor, obj, storage = null) {
   const outbox = actor.outbox;
   const bodyObj = {
     '@context': 'https://www.w3.org/ns/activitystreams',
@@ -55,6 +55,11 @@ export async function postToOutbox(actor, obj) {
   }
 
   console.log('[postToOutbox] Response:', data.status, data.ok ? 'OK' : 'FAIL', data.id || data.error || '');
+
+  if (storage && data.id) {
+    await storage.markProcessed(actor.id, data.id);
+  }
+
   return data;
 }
 
