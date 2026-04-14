@@ -140,6 +140,9 @@ export async function getCurrentActor() {
         return JSON.parse(actorJSON)
     } else {
         const actorId = localStorage.getItem('actor_id')
+        if (!actorId || !URL.canParse(actorId)) {
+            throw new Error(`Invalid actor_id in localStorage: ${JSON.stringify(actorId)}`)
+        }
         const res = await apFetch(actorId, {
             headers: {
                 Accept:
@@ -300,13 +303,15 @@ export async function logout() {
 }
 
 export async function ensureFreshToken(clientId) {
-  clientId = clientId || localStorage.getItem('client_id')
-  if (!clientId) {
-    dispatchAuthError('Missing client_id - please re-login')
-    return
-  }
   const expires = parseInt(localStorage.getItem('expires'))
+  // If expires is absent/NaN the token was injected directly (e.g. E2E) — skip refresh.
+  if (isNaN(expires)) return
   if (Date.now() > expires) {
+    clientId = clientId || localStorage.getItem('client_id')
+    if (!clientId) {
+      dispatchAuthError('Missing client_id - please re-login')
+      return
+    }
     const actorId = localStorage.getItem('actor_id')
     if (!actorId) {
       dispatchAuthError('Missing actor_id - please re-login')
@@ -354,7 +359,24 @@ export async function ensureFreshToken(clientId) {
   }
 }
 
- export async function apFetch(url, options = {}) {
+/**
+ * Make a protected fetch with a Bearer token.
+ * oauth4webapi's protectedResourceRequest rejects non-https URLs, so for
+ * http:// targets (local dev / E2E) we fall back to plain fetch with an
+ * Authorization header — behaviour is identical.
+ */
+async function bearerFetch(accessToken, method, urlObj, headers, body) {
+    if (urlObj.protocol === 'https:') {
+        return oauth.protectedResourceRequest(accessToken, method, urlObj, headers, body)
+    }
+    return fetch(urlObj, {
+        method: method || 'GET',
+        headers: { ...headers, 'Authorization': `Bearer ${accessToken}` },
+        body
+    })
+}
+
+export async function apFetch(url, options = {}) {
     await ensureFreshToken()
     const accessToken = localStorage.getItem('access_token')
     if (!accessToken) {
@@ -369,8 +391,8 @@ export async function ensureFreshToken(clientId) {
     const urlObj = (typeof url === 'string')
         ? new URL(url)
         : url
-     if (urlObj.origin == URL.parse(origin_url).origin) {
-        const response = await oauth.protectedResourceRequest(
+     if (urlObj.origin == URL.parse(origin_url)?.origin) {
+        const response = await bearerFetch(
             accessToken,
             options.method || 'GET',
             urlObj,
@@ -383,16 +405,21 @@ export async function ensureFreshToken(clientId) {
         return response
     } else {
         const proxyUrl = localStorage.getItem('proxy_url')
-        const response = await oauth.protectedResourceRequest(
+        // In Tauri, fetch is already routed through Rust (no CORS), so fall back
+        // to a direct bearer fetch when no server-side proxy is configured.
+        if (!proxyUrl || window.__TAURI__) {
+            const response = await bearerFetch(accessToken, options.method || 'GET', urlObj, options.headers, options.body)
+            if (response.status === 401 || response.status === 403) {
+                console.warn('[apFetch] Direct cross-origin returned', response.status, 'for', urlObj.toString())
+            }
+            return response
+        }
+        const response = await bearerFetch(
             accessToken,
             'POST',
-            proxyUrl,
-            {
-                'Content-Type': 'application/x-www-form-urlencoded'
-            },
-            new URLSearchParams({
-                id: urlObj.toString()
-            })
+            new URL(proxyUrl),
+            { 'Content-Type': 'application/x-www-form-urlencoded' },
+            new URLSearchParams({ id: urlObj.toString() })
         )
         if (response.status === 401 || response.status === 403) {
           console.warn('[apFetch] Proxy returned', response.status, 'for', urlObj.toString())
