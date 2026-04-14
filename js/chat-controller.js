@@ -1379,8 +1379,14 @@ export class ChatController {
       const liveCoDeviceKeys = await this._getLiveCoDeviceKeys(actor);
       const serverHasOtherDevice = await this._actorHasOtherDevices(actor, ownSigKey);
       if (liveCoDeviceKeys.length > 0 || serverHasOtherDevice) {
-        await sendKeyPackageProposal(actor, kpBytes, this.storage);
-        console.log('[KeyPackage] Sent proposal to own inbox for co-device approval');
+        try {
+          await sendKeyPackageProposal(actor, kpBytes, this.storage);
+          console.log('[KeyPackage] Sent proposal to own inbox for co-device approval');
+        } catch (e) {
+          console.error('[KeyPackage] Failed to send proposal — will retry on next init:', e);
+          // Don't abort init; co-device approval will be triggered again next time
+          return;
+        }
         this._awaitingApproval = true;
         const ownFp = await this.mlsService.getOwnFingerprint(actor.id);
         return { type: 'newDevicePending', fingerprint: ownFp?.fingerprint };
