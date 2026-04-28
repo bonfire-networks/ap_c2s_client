@@ -1408,7 +1408,7 @@ export class ChatController {
 
     // Has key package but not published — self-sign and publish (replenishment)
     const kpBytes = bytesFromInput(keyPackageHex);
-    const mlsSignature = await this._signKeyPackage(actor.id, keyPackageHex);
+    const mlsSignature = await this._signKeyPackage(actor.id, bytesToBase64(kpBytes));
     const published = await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage);
     if (published) {
       await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
@@ -1672,8 +1672,15 @@ export class ChatController {
    * Used on a fresh device or after a full reset (clear_all_data) when there are no local groups yet, so the server profile is the only signal that another device exists and needs to approve this one.
    */
   async _actorHasOtherDevices(actor, ownSigKey) {
-    const kps = actor.keyPackages;
+    let kps = actor.keyPackages;
     if (!kps) return false;
+    // If keyPackages is a collection URL, fetch it to get the items
+    if (typeof kps === 'string') {
+      try {
+        const res = await apFetch(kps, { headers: { Accept: 'application/activity+json,application/json' } });
+        if (res.ok) kps = await res.json();
+      } catch (e) { return false; }
+    }
     const kpList = Array.isArray(kps) ? kps : (kps.items || []);
     for (const kp of kpList) {
       const content = typeof kp === 'string' ? null : kp?.content;
@@ -1877,6 +1884,7 @@ export class ChatController {
    */
   async commitCoDeviceLeaving(groupId, proposalActivityId) {
     const actor = await getCurrentActor();
+    await this.mlsService.getGroup(actor.id, groupId);
     const result = await this.mlsService.commitPendingProposals(actor.id, groupId);
     if (!result?.commit) {
       console.warn('[commitCoDeviceLeaving] No commit produced for group', groupId);

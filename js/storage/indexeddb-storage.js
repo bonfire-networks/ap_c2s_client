@@ -82,7 +82,11 @@ export async function drainWrites() {
  */
 export function initForActor(actorId) {
   const safe = actorId.replace(/[^a-zA-Z0-9._-]/g, '_');
-  db = _openDb(`openmls-db-${safe}`);
+  // If a device_id is set (e.g., by E2E init or multi-instance scenarios), include it
+  // to prevent co-devices on the same origin from sharing IndexedDB state.
+  const deviceId = localStorage.getItem('device_id');
+  const suffix = deviceId ? `-${deviceId.replace(/[^a-zA-Z0-9._-]/g, '_')}` : '';
+  db = _openDb(`openmls-db-${safe}${suffix}`);
 }
 
 /**

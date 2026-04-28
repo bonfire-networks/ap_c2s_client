@@ -420,6 +420,15 @@ export class E2EEChatView extends LitElement {
       await this.loadGroups();
       this.pollInbox();
 
+      // Fallback periodic poll when awaiting co-device approval (no SSE in that state).
+      // Clears itself once approval is received (dialog removed = no longer awaiting).
+      if (this.controller._awaitingApproval) {
+        const approvalPoll = setInterval(() => {
+          if (!this.controller._awaitingApproval) { clearInterval(approvalPoll); return; }
+          this.pollInbox().catch(() => {});
+        }, 5000);
+      }
+
       // Deep-link navigation: Rust calls this via eval() when a deep link targets the chat tab
       // mls://g/{ulid} or mls://m/{ulid} = internal IDs (direct IndexedDB lookup)
       // ap-mls://{instance.tld}/path = shareable links (convert to https:// apId for lookup)
@@ -697,8 +706,11 @@ export class E2EEChatView extends LitElement {
           } else if (r.type === 'newDeviceRequest' || r.type === 'newDevicePending') {
             this._showDeviceConfirmation(r);
           } else if (r.type === 'newDeviceApproved' || r.type === 'welcome' || r.type === 'groupinfo') {
-            // Approved (no-groups case) or joined a group — close pending dialog
-            this.shadowRoot.querySelector('#nd-pending-dialog')?.remove();
+            // Approved (no-groups case) or joined a group — close pending dialog only if
+            // approval actually completed (not a Welcome for a different co-device's KP)
+            if (!this.controller._awaitingApproval) {
+              this.shadowRoot.querySelector('#nd-pending-dialog')?.remove();
+            }
           }
         }
 
@@ -754,7 +766,7 @@ export class E2EEChatView extends LitElement {
       <div class="modal-box max-w-sm">
         <h3 class="font-bold text-lg mb-2">${title}</h3>
         <p class="text-sm opacity-70 mb-4">${description}</p>
-        ${emojiStr ? `<div class="text-3xl text-center tracking-widest py-3 px-4 bg-base-200 rounded-lg mb-4 select-all">${emojiStr}</div>` : ''}
+        ${emojiStr ? `<div data-role="nd-fingerprint" class="text-3xl text-center tracking-widest py-3 px-4 bg-base-200 rounded-lg mb-4 select-all">${emojiStr}</div>` : ''}
         <p class="text-xs opacity-50 mb-4">${hint}</p>
         <div id="nd-error" class="alert alert-error text-sm mb-2 hidden"></div>
         <div class="modal-action gap-2">${buttons}</div>
@@ -2475,6 +2487,7 @@ export class E2EEChatView extends LitElement {
                     <div class="${g.hasUnread ? 'indicator w-full' : ''}">
                       ${g.hasUnread ? html`<span class="indicator-item badge badge-primary badge-xs"></span>` : ''}
                       <a class="w-full ${this.selectedGroupId === g.id ? 'active' : ''}"
+                         data-role="group-item"
                          @click=${() => this._selectGroup(g.id)}>
                         <div class="overflow-hidden flex-1 min-w-0">
                           <div class="font-medium truncate ${g.hasUnread ? 'font-bold' : ''}">${g.name || this._groupMemberNames(g) || g.id}</div>
