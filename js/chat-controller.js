@@ -1981,9 +1981,11 @@ export class ChatController {
     const result = await this.mlsService.leaveGroup(actor.id, groupId);
     if (result?.cancelled) return result;
 
-    // Notify remaining members so their epoch advances
+    // Notify remaining members. Include own actor so co-devices (same actor, different device)
+    // receive the self-remove Proposal via the shared inbox. D1 re-receiving its own proposal
+    // is harmless — the group will be deleted below, so decryption fails and _handleProposal returns early.
     const allMembers = await this.getGroupMembers(groupId);
-    const remaining = allMembers.filter(id => id !== actor.id);
+    const remaining = [...new Set([...allMembers.filter(id => id !== actor.id), actor.id])];
     try {
       await this._distributeCommit(actor, groupId, result.commit, remaining);
     } catch (e) {

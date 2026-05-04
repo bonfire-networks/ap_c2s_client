@@ -395,8 +395,8 @@ export class E2EEChatView extends LitElement {
       this.controller.onAsyncResult = (r) => {
         if (r.type === 'coDeviceLeaving') this._showDeviceConfirmation({ ...r, isLeaving: true });
         if (r.type === 'coDeviceLeaveResolved') {
-          // Another device committed the leave — dismiss any open confirmation dialog
-          this.shadowRoot.querySelector('#nd-approve')?.closest('dialog')?.remove();
+          // Another device committed the leave — dismiss open leaving-confirmation dialog only
+          this.shadowRoot.querySelector('dialog[data-nd-leaving]')?.remove();
         }
       };
       console.log('[ChatView] ChatController initialized:', this.controller);
@@ -708,7 +708,7 @@ export class E2EEChatView extends LitElement {
           if (r.type === 'coDeviceLeaving') {
             this._showDeviceConfirmation({ ...r, isLeaving: true });
           } else if (r.type === 'coDeviceLeaveResolved') {
-            this.shadowRoot.querySelector('#nd-approve')?.closest('dialog')?.remove();
+            this.shadowRoot.querySelector('dialog[data-nd-leaving]')?.remove();
           } else if (r.type === 'newDeviceRequest' || r.type === 'newDevicePending') {
             this._showDeviceConfirmation(r);
           } else if (r.type === 'newDeviceApproved' || r.type === 'welcome' || r.type === 'groupinfo') {
@@ -744,6 +744,7 @@ export class E2EEChatView extends LitElement {
   _showDeviceConfirmation({ fingerprint, kpB64, isLeaving = false, groupId = null, proposalActivityId = null }) {
     const isPending = !kpB64 && !isLeaving;
     if (isPending && this.shadowRoot.querySelector('#nd-pending-dialog')) return; // already showing
+    if (isLeaving && this.shadowRoot.querySelector('dialog[data-nd-leaving]')) return; // already showing
     const emojiStr = Array.isArray(fingerprint) ? fingerprint.map(e => e.emoji).join(' ') : (fingerprint || '');
 
     const title = isLeaving
@@ -767,6 +768,7 @@ export class E2EEChatView extends LitElement {
 
     const dialog = document.createElement('dialog');
     if (isPending) dialog.id = 'nd-pending-dialog';
+    if (isLeaving) dialog.dataset.ndLeaving = 'true';
     dialog.className = 'modal modal-open';
     dialog.innerHTML = `
       <div class="modal-box max-w-sm">

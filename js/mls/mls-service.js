@@ -203,8 +203,8 @@ export class MLSService {
    * @param {Uint8Array} keyPackageBytes - new member's key package
    * @returns {{ welcome: Uint8Array, ratchetTree: Uint8Array, commit: string }}
    */
-  async addMember(userId, groupId, keyPackageBytes) {
-    const { welcome, ratchetTree, commit } = await this.backend.addMember(userId, groupId, keyPackageBytes);
+  async addMember(userId, groupId, keyPackageBytes, { rotateLeaf = true } = {}) {
+    const { welcome, ratchetTree, commit } = await this.backend.addMember(userId, groupId, keyPackageBytes, rotateLeaf);
 
     // Save updated group metadata with new ratchet tree and welcome
     const existingState = (await this.storage.loadGroupMeta(groupId)) || {};
@@ -284,8 +284,8 @@ export class MLSService {
    * @param {number[]} leafIndexes - leaf node indexes to remove
    * @returns {{ commit: string }}
    */
-  async removeGroupMemberClient(userId, groupId, leafIndexes) {
-    const result = await this.backend.removeGroupMemberClient(userId, groupId, leafIndexes);
+  async removeGroupMemberClient(userId, groupId, leafIndexes, { rotateLeaf = true } = {}) {
+    const result = await this.backend.removeGroupMemberClient(userId, groupId, leafIndexes, rotateLeaf);
     await this._persistAfterGroupOp(userId, groupId);
     return result;
   }
@@ -321,9 +321,9 @@ export class MLSService {
     return await this.backend.clearAllData(userId);
   }
 
-  async commitPendingProposals(userId, groupId) {
+  async commitPendingProposals(userId, groupId, { rotateLeaf = true } = {}) {
     if (!this.backend.commitPendingProposals) return null;
-    const result = await this.backend.commitPendingProposals(userId, groupId);
+    const result = await this.backend.commitPendingProposals(userId, groupId, rotateLeaf);
     if (result) await this._persistAfterGroupOp(userId, groupId);
     return result;
   }
