@@ -394,6 +394,10 @@ export class E2EEChatView extends LitElement {
       this.controller = new ChatController(mlsService, storage);
       this.controller.onAsyncResult = (r) => {
         if (r.type === 'coDeviceLeaving') this._showDeviceConfirmation({ ...r, isLeaving: true });
+        if (r.type === 'coDeviceLeaveResolved') {
+          // Another device committed the leave — dismiss any open confirmation dialog
+          this.shadowRoot.querySelector('#nd-approve')?.closest('dialog')?.remove();
+        }
       };
       console.log('[ChatView] ChatController initialized:', this.controller);
 
@@ -703,6 +707,8 @@ export class E2EEChatView extends LitElement {
         for (const r of results) {
           if (r.type === 'coDeviceLeaving') {
             this._showDeviceConfirmation({ ...r, isLeaving: true });
+          } else if (r.type === 'coDeviceLeaveResolved') {
+            this.shadowRoot.querySelector('#nd-approve')?.closest('dialog')?.remove();
           } else if (r.type === 'newDeviceRequest' || r.type === 'newDevicePending') {
             this._showDeviceConfirmation(r);
           } else if (r.type === 'newDeviceApproved' || r.type === 'welcome' || r.type === 'groupinfo') {

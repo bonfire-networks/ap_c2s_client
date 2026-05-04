@@ -114,7 +114,7 @@ export class ChatController {
     this.storage = storage;
     // messageId → setTimeout handle; cancelled if Read is sent first
     this._pendingAcks = new Map();
-    // groupId → setTimeout handle for non-co-device proposal commit (staggered timer)
+    // groupId → setTimeout handle for proposal commit (staggered timer, co-device or non-co-device)
     this._pendingProposalTimers = new Map();
     // Set true while this device is awaiting co-device approval — blocks decryption attempts
     this._awaitingApproval = false;
@@ -1796,6 +1796,12 @@ export class ChatController {
       this._pendingProposalTimers.delete(groupId);
       console.log('[_handlePublicMessage] Cancelled pending proposal timer for group', groupId);
     }
+    // Also dismiss any open co-device confirmation dialog for this group
+    const pendingLeave = await this.storage.getGroupField(groupId, 'pendingCoDeviceLeave', null).catch(() => null);
+    if (pendingLeave) {
+      await this.storage.setGroupField(groupId, 'pendingCoDeviceLeave', null).catch(() => {});
+      this.onAsyncResult?.({ type: 'coDeviceLeaveResolved', groupId });
+    }
     try {
       const msgBytes = bytesFromInput(parsed.content);
       // decrypt handles: StagedCommitMessage (merges epoch), ProposalMessage (buffered), ApplicationMessage
@@ -1810,10 +1816,17 @@ export class ChatController {
   /**
    * Handle a buffered MLS Proposal (self-remove from a leaving device).
    *
-   * Co-device, sole other device: prompt immediately — no race possible.
-   * Co-device, multiple other devices: staggered timer — device whose timer fires
-   *   first shows the prompt; others cancel when the resulting Commit arrives.
-   * Non-co-device: staggered timer, winner commits directly without prompting.
+   * Commit serialization uses deterministic leaf-index ordering (leafIndex × 2s) so
+   * all devices independently arrive at the same commit ordering without coordination.
+   * RFC §12.4: first commit wins; others cancel when the resulting Commit arrives.
+   *
+   * Co-device (same actor, different device): show confirmation dialog at leafIndex×2s slot.
+   *   Multiple co-devices stagger via their leaf indices; each self-cancels on timer fire if
+   *   pendingCoDeviceLeave is already cleared (another co-device committed first).
+   *
+   * Non-co-device (different actor): auto-commit at leafIndex×2s. If the leaving actor has
+   *   surviving co-devices in the group, add CO_DEVICE_WINDOW (10 min) so co-devices get
+   *   priority. Non-co-devices act as last-resort fallback only.
    */
   async _handleProposal(groupId, parsed, actor, alreadyDecrypted = false) {
     if (!alreadyDecrypted) {
@@ -1831,35 +1844,43 @@ export class ChatController {
     if (this._pendingProposalTimers.has(groupId)) return null;
 
     const isCoDevice = parsed.attributedTo === actor.id;
+    const fingerprints = await this.mlsService.getGroupFingerprints(actor.id, groupId).catch(() => []);
+
+    // Our leaf index in the MLS tree — used for deterministic commit ordering
+    const ownFp = fingerprints.find(fp => fp.isCurrentClient);
+    const ownLeafIndex = ownFp?.index ?? 0;
 
     if (isCoDevice) {
       const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id).catch(() => null);
-      const fingerprints = await this.mlsService.getGroupFingerprints(actor.id, groupId).catch(() => []);
       // Leaving device is still in the group at this point (proposal not yet committed)
       const leavingFp = fingerprints.find(fp => fp.isOwn && fp.signatureKey !== ownSigKey);
-      const otherCoDevices = fingerprints.filter(fp => fp.isOwn && fp.signatureKey !== ownSigKey && fp.signatureKey !== leavingFp?.signatureKey);
-
       const promptPayload = { type: 'coDeviceLeaving', groupId, proposalActivityId: parsed.id, fingerprint: leavingFp?.fingerprint };
 
-      if (otherCoDevices.length === 0) {
-        // Only us — prompt immediately, no timer needed
-        await this.storage.setGroupField(groupId, 'pendingCoDeviceLeave', parsed.id || true);
-        return promptPayload;
-      }
-
-      // Multiple co-devices may commit — staggered timer, winner prompts
-      const delay = 500 + Math.random() * 2500;
+      // Stagger by leaf index so only one co-device shows the dialog at a time.
+      // Each slot is 30s — enough time for the user at the earlier-index device to see and
+      // confirm before the next co-device's slot fires. On timer fire, bail out if another
+      // co-device already committed (pendingCoDeviceLeave cleared).
+      const CO_DEVICE_SLOT = 30_000;
+      const delay = ownLeafIndex * CO_DEVICE_SLOT;
       this._pendingProposalTimers.set(groupId, setTimeout(async () => {
         this._pendingProposalTimers.delete(groupId);
-        await this.storage.setGroupField(groupId, 'pendingCoDeviceLeave', parsed.id || true);
-        this.onAsyncResult?.(promptPayload);
+        const stillPending = await this.storage.getGroupField(groupId, 'pendingCoDeviceLeave', null).catch(() => null);
+        // null means already resolved by another co-device
+        if (stillPending === null) {
+          await this.storage.setGroupField(groupId, 'pendingCoDeviceLeave', parsed.id || true);
+          this.onAsyncResult?.(promptPayload);
+        }
       }, delay));
-      console.log('[_handleProposal] Co-device leave, multiple co-devices — scheduled prompt in', Math.round(delay), 'ms');
+      console.log('[_handleProposal] Co-device leave — scheduled dialog in', delay, 'ms (leafIndex', ownLeafIndex, ', slot', CO_DEVICE_SLOT, 'ms)');
       return null;
     }
 
-    // Non-co-device — staggered timer, commit directly (RFC §12.4: first commit wins)
-    const delay = 500 + Math.random() * 2500;
+    // Non-co-device: check if leaving actor has surviving co-devices — if so, wait 10 min first
+    const leavingActorId = parsed.attributedTo;
+    const leavingActorHasCoDevices = fingerprints.some(fp => fp.isOwn && fp.identity === leavingActorId);
+    const CO_DEVICE_WINDOW = leavingActorHasCoDevices ? 10 * 60_000 : 0;
+    const delay = CO_DEVICE_WINDOW + ownLeafIndex * 2000;
+
     this._pendingProposalTimers.set(groupId, setTimeout(async () => {
       this._pendingProposalTimers.delete(groupId);
       try {
@@ -1874,7 +1895,7 @@ export class ChatController {
         console.warn('[_handleProposal] Commit failed (likely lost race — will process winner):', e);
       }
     }, delay));
-    console.log('[_handleProposal] Non-co-device proposal — scheduled commit in', Math.round(delay), 'ms');
+    console.log('[_handleProposal] Non-co-device proposal — scheduled commit in', delay, 'ms (leafIndex', ownLeafIndex, ', co-device window', CO_DEVICE_WINDOW, 'ms)');
     return null;
   }
 
