@@ -817,6 +817,7 @@ export class E2EEChatView extends LitElement {
     }
 
     this.shadowRoot.appendChild(dialog);
+    console.log('[_showDeviceConfirmation] dialog appended, #nd-approve text:', this.shadowRoot.querySelector('#nd-approve')?.textContent?.trim());
   }
 
   // ── Actions (delegates to controller) ──────────────────

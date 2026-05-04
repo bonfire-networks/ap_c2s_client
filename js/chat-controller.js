@@ -518,11 +518,21 @@ export class ChatController {
         }
       }
 
-      // Check if we ourselves were removed
+      // Check if we ourselves were removed (actor-level: all our devices gone)
       if (previous.has(actor.id) && !current.has(actor.id)) {
         await this._insertSystemMessage(groupId, `${removerNickname || 'Someone'} removed you from this group.`);
         await this.mlsService.deleteGroup(actor.id, groupId);
         await this.storage.setGroupField(groupId, 'noLongerMember', true);
+      } else if (previous.has(actor.id) && current.has(actor.id) && previousDevices.size > 0) {
+        // Co-device case: actor still has other devices in the group, but THIS device was removed
+        const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id).catch(() => null);
+        if (ownSigKey && previousDevices.has(ownSigKey) && !currentDevices.has(ownSigKey)) {
+          const isSelfRemove = !removerActorId || removerActorId === actor.id;
+          const msg = isSelfRemove ? 'This device was decommissioned.' : `${removerNickname} removed this device from the group.`;
+          await this._insertSystemMessage(groupId, msg);
+          await this.mlsService.deleteGroup(actor.id, groupId);
+          await this.storage.setGroupField(groupId, 'noLongerMember', true);
+        }
       }
     } catch (e) {
       console.warn('[_syncMembersFromMLS] Failed:', e);
@@ -961,10 +971,8 @@ export class ChatController {
     } else if (parsed.type === 'GroupInfo') {
       return this._handleGroupInfo(groupId, parsed, actor);
     } else if (parsed.type === 'PrivateMessage') {
-      if (this._awaitingApproval) {
-        console.log('[handleActivity] Skipping PrivateMessage — awaiting co-device approval');
-        return null;
-      }
+      // Do not skip here when _awaitingApproval — Commits and Proposals must still be processed.
+      // ApplicationMessage content is skipped inside _handlePrivateMessage after decryption.
       return this._handlePrivateMessage(groupId, parsed, actor);
     } else if (parsed.type === 'PublicMessage') {
       if (this._awaitingApproval) {
@@ -1079,6 +1087,8 @@ export class ChatController {
     const membersToAdd = [actor.id];
     if (parsed.attributedTo) membersToAdd.push(parsed.attributedTo);
     await this.persistMembers(actualGroupId, membersToAdd);
+    // Seed sigKeys so device-level removal detection works after decommission
+    await this._syncMembersFromMLS(actualGroupId, actor);
     await this._replenishKeyPackage(actor);
 
     const inviterUri = parsed.attributedTo;
@@ -1123,6 +1133,12 @@ export class ChatController {
       if (decrypted?.proposalBuffered) {
         // Defer to pollInbox second pass so any Commit in the same batch is applied first
         return { proposalBuffered: true, _deferred: { groupId, parsed } };
+      }
+      // Skip application message content while waiting for new-device approval;
+      // Commits (null) and Proposals (proposalBuffered) above are always handled.
+      if (this._awaitingApproval) {
+        console.log('[_handlePrivateMessage] Skipping application message — awaiting co-device approval');
+        return null;
       }
       const { content: rawContent, senderSignatureKey } = decrypted;
       let decryptedContent = typeof rawContent === 'object' ? rawContent : { content: rawContent };
@@ -1351,7 +1367,9 @@ export class ChatController {
       await this.mlsService.clearKeyPackage(actor.id);
       const { keyPackageHex } = await this.mlsService.createKeyPackage(actor.id);
       const kpBytes = bytesFromInput(keyPackageHex);
-      const published = await publishKeyPackage(actor, kpBytes, null, this.storage);
+      const kpB64 = bytesToBase64(kpBytes);
+      const mlsSignature = await this._signKeyPackage(actor.id, kpB64);
+      const published = await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage);
       if (published) {
         await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
         localStorage.removeItem('actor');
@@ -1572,12 +1590,6 @@ export class ChatController {
     const actorUri = kpObj?.attributedTo || activity.actor;
     if (!kpB64 || !actorUri) return;
 
-    const sig = activity.mlsSignature;
-    if (!sig?.signerKey || !sig?.signature) {
-      console.warn('[_handleKeyPackageAdd] No mlsSignature on Add from', actorUri, '— rejecting');
-      return;
-    }
-
     // Valid signers: any live MLS device for this actor, plus the KP's own key (self-signed replenishment)
     const liveDeviceKeys = await this._getLiveDeviceKeysForActor(actorUri);
 
@@ -1591,18 +1603,28 @@ export class ChatController {
 
     const validSigners = [...liveDeviceKeys, kpSignatureKey].filter(Boolean);
 
-    if (!validSigners.includes(sig.signerKey)) {
-      console.warn('[_handleKeyPackageAdd] mlsSignature signerKey not recognised for', actorUri, '— rejecting KP');
-      return;
-    }
+    const sig = activity.mlsSignature;
+    if (!sig?.signerKey || !sig?.signature) {
+      // Enforce when any known signer exists (live device key or the KP's own key).
+      // The only case where we accept unsigned is a genuinely novel actor with no known keys.
+      if (validSigners.length > 0) {
+        console.warn('[_handleKeyPackageAdd] No mlsSignature on Add from', actorUri, '— rejecting (known devices exist)');
+        return;
+      }
+      console.log('[_handleKeyPackageAdd] Unsigned Add accepted for', actorUri, '(no live known devices)');
+    } else {
+      if (!validSigners.includes(sig.signerKey)) {
+        console.warn('[_handleKeyPackageAdd] mlsSignature signerKey not recognised for', actorUri, '— rejecting KP');
+        return;
+      }
 
-    const valid = await this.mlsService.verifySignature(sig.signerKey, kpB64, sig.signature);
-    if (!valid) {
-      console.warn('[_handleKeyPackageAdd] mlsSignature verification failed for', actorUri, '— rejecting KP');
-      return;
+      const valid = await this.mlsService.verifySignature(sig.signerKey, kpB64, sig.signature);
+      if (!valid) {
+        console.warn('[_handleKeyPackageAdd] mlsSignature verification failed for', actorUri, '— rejecting KP');
+        return;
+      }
+      console.log('[_handleKeyPackageAdd] KP verified for', actorUri, 'signed by', sig.signerKey);
     }
-
-    console.log('[_handleKeyPackageAdd] KP verified for', actorUri, 'signed by', sig.signerKey);
     await this.storage.saveUserField(actorUri, 'keyPackage', kpB64);
 
     // If this is our own KP being endorsed (no groups case), signal the pending dialog to close
@@ -1649,6 +1671,13 @@ export class ChatController {
       return null;
     }
 
+    // If the key is already published in the actor's server-side keyPackages collection,
+    // this proposal was already approved and acted on — skip it (handles stale inbox items).
+    if (await this._isKeyAlreadyPublished(actor, signatureKey)) {
+      console.log('[_handleKeyPackageProposal] Key already published on server, ignoring stale proposal:', signatureKey);
+      return null;
+    }
+
     console.log('[_handleKeyPackageProposal] New co-device key detected, requesting user approval');
     return { type: 'newDeviceRequest', fingerprint, kpB64, signatureKey };
   }
@@ -1668,17 +1697,17 @@ export class ChatController {
   }
 
   /**
-   * Check whether the actor's server-side profile contains a KeyPackage from a different device.
-   * Used on a fresh device or after a full reset (clear_all_data) when there are no local groups yet, so the server profile is the only signal that another device exists and needs to approve this one.
+   * Fetch and iterate the actor's published keyPackages from the server.
+   * Calls predicate(signatureKey) for each parseable entry; returns true on first match.
    */
-  async _actorHasOtherDevices(actor, ownSigKey) {
+  async _forEachPublishedKey(actor, predicate) {
     let kps = actor.keyPackages;
     if (!kps) return false;
-    // If keyPackages is a collection URL, fetch it to get the items
     if (typeof kps === 'string') {
       try {
         const res = await apFetch(kps, { headers: { Accept: 'application/activity+json,application/json' } });
         if (res.ok) kps = await res.json();
+        else return false;
       } catch (e) { return false; }
     }
     const kpList = Array.isArray(kps) ? kps : (kps.items || []);
@@ -1687,10 +1716,23 @@ export class ChatController {
       if (!content) continue;
       try {
         const fp = await this.mlsService.getKeyPackageFingerprint(content);
-        if (fp?.signatureKey && fp.signatureKey !== ownSigKey) return true;
+        if (fp?.signatureKey && predicate(fp.signatureKey)) return true;
       } catch (e) { /* unparseable KP — skip */ }
     }
     return false;
+  }
+
+  /**
+   * Check whether the actor's server-side profile contains a KeyPackage from a different device.
+   * Used on a fresh device or after a full reset (clear_all_data) when there are no local groups yet.
+   */
+  async _actorHasOtherDevices(actor, ownSigKey) {
+    return this._forEachPublishedKey(actor, k => k !== ownSigKey);
+  }
+
+  /** Returns true if signatureKey is already in the actor's published keyPackages on the server. */
+  async _isKeyAlreadyPublished(actor, signatureKey) {
+    return this._forEachPublishedKey(actor, k => k === signatureKey);
   }
 
   /**
@@ -1698,8 +1740,16 @@ export class ChatController {
    * Scans the actor's keyPackages collection for the matching entry and sends a Remove/Update activity.
    */
   async _deleteKeyPackageForDevice(actor, signatureKey) {
-    const kps = actor.keyPackages;
+    // Fetch fresh actor profile so we have the current keyPackages list
+    const freshActor = await getActor(actor.id).catch(() => actor);
+    let kps = freshActor.keyPackages;
     if (!kps) return;
+    if (typeof kps === 'string') {
+      try {
+        const res = await apFetch(kps, { headers: { Accept: 'application/activity+json,application/json' } });
+        if (res.ok) kps = await res.json(); else return;
+      } catch (e) { return; }
+    }
     const kpList = Array.isArray(kps) ? kps : (kps.items || []);
     for (const kp of kpList) {
       const content = typeof kp === 'string' ? null : kp?.content;
@@ -1707,7 +1757,7 @@ export class ChatController {
       try {
         const fp = await this.mlsService.getKeyPackageFingerprint(content);
         if (fp?.signatureKey === signatureKey) {
-          await deleteKeyPackage(actor, bytesFromInput(content), this.storage);
+          await deleteKeyPackage(freshActor, bytesFromInput(content), this.storage);
           return;
         }
       } catch (e) { /* unparseable KP — skip */ }
@@ -1844,6 +1894,7 @@ export class ChatController {
     if (this._pendingProposalTimers.has(groupId)) return null;
 
     const isCoDevice = parsed.attributedTo === actor.id;
+    console.log('[_handleProposal] isCoDevice:', isCoDevice, 'parsed.attributedTo:', parsed.attributedTo, 'actor.id:', actor.id, 'groupId:', groupId);
     const fingerprints = await this.mlsService.getGroupFingerprints(actor.id, groupId).catch(() => []);
 
     // Our leaf index in the MLS tree — used for deterministic commit ordering
@@ -1865,9 +1916,11 @@ export class ChatController {
       this._pendingProposalTimers.set(groupId, setTimeout(async () => {
         this._pendingProposalTimers.delete(groupId);
         const stillPending = await this.storage.getGroupField(groupId, 'pendingCoDeviceLeave', null).catch(() => null);
+        console.log('[_handleProposal] timer fired, stillPending:', stillPending, 'onAsyncResult set:', !!this.onAsyncResult);
         // null means already resolved by another co-device
         if (stillPending === null) {
           await this.storage.setGroupField(groupId, 'pendingCoDeviceLeave', parsed.id || true);
+          console.log('[_handleProposal] calling onAsyncResult with', promptPayload);
           this.onAsyncResult?.(promptPayload);
         }
       }, delay));
@@ -2158,6 +2211,10 @@ export class ChatController {
     } catch (e) {
       console.warn('[removeOwnClient] Failed to delete key package:', e);
     }
+    // Refresh actor cache so _actorHasOtherDevices sees the updated keyPackages
+    await getActor(actor.id).then(fresh => {
+      localStorage.setItem('actor', JSON.stringify(fresh));
+    }).catch(() => {});
     return { cancelled: false };
   }
 

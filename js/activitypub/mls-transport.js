@@ -10,6 +10,7 @@
  */
 
 import { bytesToBase64 } from '../utils.js';
+import { apFetch } from './auth.js';
 import { postToOutbox, fetchActorKeyPackage } from './client.js';
 
 const MLS_CONTEXTS = [
@@ -170,11 +171,26 @@ export async function sendKeyPackageProposal(actor, keyPackageBytes, storage = n
 export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
   const kpB64 = bytesToBase64(keyPackageBytes);
 
-  const keyPackages = actor.keyPackages;
-  const target = keyPackages ? (typeof keyPackages === 'string' ? keyPackages : keyPackages.id) : null;
+  // Fetch the current keyPackages list from the server
+  let kpList = [];
+  const kpField = actor.keyPackages;
+  if (kpField) {
+    let kpCollection = kpField;
+    if (typeof kpCollection === 'string') {
+      try {
+        const res = await apFetch(kpCollection, { headers: { Accept: 'application/activity+json,application/json' } });
+        if (res.ok) kpCollection = await res.json();
+      } catch (_) {}
+    }
+    kpList = Array.isArray(kpCollection) ? kpCollection : (kpCollection?.items || []);
+  }
+
+  const target = kpField ? (typeof kpField === 'string' ? kpField : kpField?.id) : null;
+
 
   let res;
   if (target) {
+    // Remove: collection exists — signal server to remove the specific KP
     res = await postToOutbox(actor, {
       type: 'Remove',
       actor: actor.id,
@@ -188,6 +204,13 @@ export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
       target,
     }, storage);
   } else {
+    // Update: no collection — replace the whole keyPackages list on the actor profile
+    
+    const remaining = kpList.filter(kp => {
+      const content = typeof kp === 'string' ? kp : kp?.content;
+      return content !== kpB64;
+    });
+
     res = await postToOutbox(actor, {
       type: 'Update',
       actor: actor.id,
@@ -195,7 +218,7 @@ export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
       object: {
         id: actor.id,
         type: actor.type,
-        keyPackages: []
+        keyPackages: remaining,
       }
     }, storage);
   }

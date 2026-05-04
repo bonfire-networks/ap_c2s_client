@@ -137,6 +137,7 @@ export async function decrypt(userId, groupId, ciphertext) {
   const result = await invoke('plugin:openmls|decrypt', { userId, groupId, ciphertextB64: b64 });
 
   if (result === null) return null;
+  if (result?.proposalBuffered) return { proposalBuffered: true };
 
   // result is now { text, senderIdentity, senderSignatureKey }
   const { text, senderIdentity, senderSignatureKey } = result;
