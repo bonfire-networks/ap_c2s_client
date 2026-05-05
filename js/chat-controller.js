@@ -12,7 +12,7 @@
 
 import { bytesToBase64, bytesFromInput, groupUri, messageUri } from './utils.js';
 import { getCurrentActor, getActor, getActorId, apFetch, ensureFreshToken } from './activitypub/auth.js';
-import { postToOutbox, fetchActorKeyPackage, resolveActorId, extractApIdFromResponse } from './activitypub/client.js';
+import { postToOutbox, fetchActorKeyPackage, fetchAllActorKeyPackages, resolveActorId, extractApIdFromResponse } from './activitypub/client.js';
 import { sendMLSControl, publishKeyPackage, deleteKeyPackage, sendKeyPackageProposal, parseMLSActivity } from './activitypub/mls-transport.js';
 
 // AP object types that represent regular user content — the only types that should generate receipts
@@ -1467,6 +1467,30 @@ export class ChatController {
     return null;
   }
 
+  /**
+   * Fetch a KeyPackage for actorUri that is not already represented in groupId.
+   * Needed for co-device adds: when an actor already has one device in the group,
+   * pick the KP whose signature key is absent from the current member tree.
+   * Falls back to the single latest KP when actor has only one device.
+   */
+  async _fetchKeyPackageForAdd(actorUri, groupId, ownActorId) {
+    const allKps = await fetchAllActorKeyPackages(actorUri);
+    if (allKps.length === 0) return null;
+    if (allKps.length === 1) return bytesFromInput(allKps[0].content);
+
+    // Get existing members' signature keys so we can skip KPs already in the group
+    const fingerprints = await this.mlsService.getGroupFingerprints(ownActorId, groupId).catch(() => []);
+    const existingSigKeys = new Set(fingerprints.map(fp => fp.signatureKey).filter(Boolean));
+
+    for (const { content } of allKps) {
+      const fp = await this.mlsService.getKeyPackageFingerprint(content).catch(() => null);
+      if (!fp?.signatureKey || !existingSigKeys.has(fp.signatureKey)) {
+        return bytesFromInput(content);
+      }
+    }
+    return null;
+  }
+
   // ── Cleanup ────────────────────────────────────────────
 
   async archiveThread(groupId) {
@@ -1550,8 +1574,8 @@ export class ChatController {
     const recipientUri = await resolveActorId(recipientMention, currentDomain);
     if (!recipientUri) throw new Error(`Could not resolve ${recipientMention}`);
 
-    const kpBytes = await this.fetchLatestKeyPackage(recipientUri);
-    if (!kpBytes) throw new Error(`No KeyPackage found for ${recipientUri}`);
+    const kpBytes = await this._fetchKeyPackageForAdd(recipientUri, groupId, actor.id);
+    if (!kpBytes) throw new Error(`No available KeyPackage for ${recipientUri}`);
 
     const { welcome, ratchetTree, commit } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
 
@@ -1931,7 +1955,7 @@ export class ChatController {
     // Non-co-device: check if leaving actor has surviving co-devices — if so, wait 10 min first
     const leavingActorId = parsed.attributedTo;
     const leavingActorHasCoDevices = fingerprints.some(fp => fp.isOwn && fp.identity === leavingActorId);
-    const CO_DEVICE_WINDOW = leavingActorHasCoDevices ? 10 * 60_000 : 0;
+    const CO_DEVICE_WINDOW = leavingActorHasCoDevices ? (window.__BONFIRE_JS_DEBUG__ ? 10_000 : 10 * 60_000) : 0;
     const delay = CO_DEVICE_WINDOW + ownLeafIndex * 2000;
 
     this._pendingProposalTimers.set(groupId, setTimeout(async () => {

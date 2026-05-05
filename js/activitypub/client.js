@@ -181,57 +181,65 @@ export async function resolveActorId(input, defaultDomain) {
 }
 
 /**
- * Extract key package content from an actor's keyPackages field.
- * Handles collections, arrays, and objects with .content.
- *
- * @param {*} kp - keyPackages field value from actor object
- * @returns {string|null} key package content string, or null
+ * Resolve an actor's keyPackages field to an array of KP objects (each with .content).
+ * Handles URL strings, collections with items, and direct arrays.
  */
-export async function extractKeyPackageContent(kp) {
-  // Handle string (URL to fetch)
+async function resolveKeyPackageList(kp) {
   if (typeof kp === 'string') {
     const res = await apFetch(kp, { headers: { Accept: 'application/activity+json' } });
-    if (!res.ok) return null;
+    if (!res.ok) return [];
     kp = await res.json();
   }
-
-  // Handle collection with items array
-  if (kp && Array.isArray(kp.items) && kp.items.length) {
-    const first = kp.items[0];
-    if (typeof first === 'string') {
-      const res = await apFetch(first, { headers: { Accept: 'application/activity+json' } });
-      if (!res.ok) return null;
-      kp = await res.json();
-    } else {
-      kp = first;
+  if (kp && Array.isArray(kp.items)) kp = kp.items;
+  if (!Array.isArray(kp)) kp = [kp];
+  const results = [];
+  for (const item of kp) {
+    let obj = item;
+    if (typeof obj === 'string') {
+      const res = await apFetch(obj, { headers: { Accept: 'application/activity+json' } });
+      if (!res.ok) continue;
+      obj = await res.json();
     }
+    if (obj?.content) results.push(obj);
   }
+  return results;
+}
 
-  // Handle direct array format
-  if (Array.isArray(kp) && kp.length > 0) {
-    kp = kp[0];
-    if (typeof kp === 'string') {
-      const res = await apFetch(kp, { headers: { Accept: 'application/activity+json' } });
-      if (!res.ok) return null;
-      kp = await res.json();
-    }
-  }
-
-  return kp && kp.content ? kp.content : null;
+/**
+ * Extract key package content from an actor's keyPackages field (first KP only).
+ *
+ * @param {*} kp - keyPackages field value from actor object
+ * @returns {string|null}
+ */
+export async function extractKeyPackageContent(kp) {
+  const items = await resolveKeyPackageList(kp);
+  return items[0]?.content ?? null;
 }
 
 /**
  * Fetch the latest published key package for an actor.
  *
- * @param {string} actorUri - actor URI
+ * @param {string} actorUri
  * @returns {{ content: string, actor: object }|null}
  */
 export async function fetchActorKeyPackage(actorUri) {
   const actor = await getActor(actorUri);
   if (!actor.keyPackages) return null;
-
   const content = await extractKeyPackageContent(actor.keyPackages);
   return content ? { content, actor } : null;
+}
+
+/**
+ * Fetch ALL published key packages for an actor (one per device).
+ *
+ * @param {string} actorUri
+ * @returns {{ content: string, actor: object }[]}
+ */
+export async function fetchAllActorKeyPackages(actorUri) {
+  const actor = await getActor(actorUri);
+  if (!actor.keyPackages) return [];
+  const items = await resolveKeyPackageList(actor.keyPackages);
+  return items.map(kp => ({ content: kp.content, actor }));
 }
 
 /**
