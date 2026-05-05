@@ -139,7 +139,12 @@ export class ChatController {
 
     await this.mlsService.init(actor.id);
     console.log('[ChatController] MLSService initialized for actor:', actor.id);
-    const kpResult = await this.ensurePublishedKeyPackage(actor);
+    let kpResult;
+    try {
+      kpResult = await this.ensurePublishedKeyPackage(actor);
+    } catch (e) {
+      console.warn('[init] ensurePublishedKeyPackage failed, continuing:', e);
+    }
 
     // Resume any co-device leave confirmations that survived a restart
     const pendingLeaves = [];
@@ -1364,6 +1369,8 @@ export class ChatController {
   async _replenishKeyPackage(actor) {
     try {
       console.log('[KeyPackage] Replenishing after group join...');
+      // If actor was reconstructed from stale localStorage (outbox absent), fetch a fresh one
+      if (!actor.outbox) actor = await getCurrentActor();
       await this.mlsService.clearKeyPackage(actor.id);
       const { keyPackageHex } = await this.mlsService.createKeyPackage(actor.id);
       const kpBytes = bytesFromInput(keyPackageHex);
@@ -1614,48 +1621,48 @@ export class ChatController {
     const actorUri = kpObj?.attributedTo || activity.actor;
     if (!kpB64 || !actorUri) return;
 
-    // Valid signers: any live MLS device for this actor, plus the KP's own key (self-signed replenishment)
-    const liveDeviceKeys = await this._getLiveDeviceKeysForActor(actorUri);
+    // Valid signers: live MLS device keys for this actor, from MLS group state only.
+    // Never use server-fetched keys — that would let a malicious server endorse any KP.
+    const validSigners = await this._getLiveDeviceKeysForActor(actorUri);
 
-    let kpSignatureKey = null;
-    try {
-      const fp = await this.mlsService.getKeyPackageFingerprint(kpB64);
-      kpSignatureKey = fp?.signatureKey || null;
-    } catch (e) {
-      console.warn('[_handleKeyPackageAdd] Could not parse KP fingerprint:', e);
-    }
-
-    const validSigners = [...liveDeviceKeys, kpSignatureKey].filter(Boolean);
-
-    const sig = activity.mlsSignature;
-    if (!sig?.signerKey || !sig?.signature) {
-      // Enforce when any known signer exists (live device key or the KP's own key).
-      // The only case where we accept unsigned is a genuinely novel actor with no known keys.
+    const sig = activity.mlsSignature; // bare base64 signature string
+    if (!sig) {
       if (validSigners.length > 0) {
         console.warn('[_handleKeyPackageAdd] No mlsSignature on Add from', actorUri, '— rejecting (known devices exist)');
         return;
       }
       console.log('[_handleKeyPackageAdd] Unsigned Add accepted for', actorUri, '(no live known devices)');
     } else {
-      if (!validSigners.includes(sig.signerKey)) {
-        console.warn('[_handleKeyPackageAdd] mlsSignature signerKey not recognised for', actorUri, '— rejecting KP');
-        return;
+      // Try each known key — receiver iterates independently, signer identity is not trusted from wire
+      let verified = false;
+      for (const key of validSigners) {
+        try {
+          if (await this.mlsService.verifySignature(key, kpB64, sig)) {
+            verified = true;
+            break;
+          }
+        } catch (e) {
+          console.log("Invalid base64 or parse error — treat as failed verification, try next key")
+        }
       }
-
-      const valid = await this.mlsService.verifySignature(sig.signerKey, kpB64, sig.signature);
-      if (!valid) {
+      if (!verified) {
         console.warn('[_handleKeyPackageAdd] mlsSignature verification failed for', actorUri, '— rejecting KP');
         return;
       }
-      console.log('[_handleKeyPackageAdd] KP verified for', actorUri, 'signed by', sig.signerKey);
+      console.log('[_handleKeyPackageAdd] KP verified for', actorUri);
     }
     await this.storage.saveUserField(actorUri, 'keyPackage', kpB64);
 
-    // If this is our own KP being endorsed (no groups case), signal the pending dialog to close
+    // If this is our own KP being endorsed, signal the pending dialog to close
     const actor = await getCurrentActor();
     if (actorUri === actor.id) {
-      const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id);
-      if (kpSignatureKey === ownSigKey) return { type: 'newDeviceApproved' };
+      try {
+        const fp = await this.mlsService.getKeyPackageFingerprint(kpB64);
+        const ownSigKey = await this.mlsService.getOwnSignatureKey(actor.id);
+        if (fp?.signatureKey === ownSigKey) return { type: 'newDeviceApproved' };
+      } catch (e) {
+        console.log("not our KP")
+      }
     }
   }
 
@@ -1810,14 +1817,14 @@ export class ChatController {
   }
 
   /**
-   * Sign a KeyPackage's base64 content with the user's MLS SignaturePrivateKey.
-   * Returns { signerKey, signature } suitable for the mlsSignature field on an Add activity,
-   * or null if the backend doesn't support signing (e.g. WASM stub).
+   * Sign a KeyPackage's base64 content with the user's MLS private signature key.
+   * Returns a bare base64 signature string, or null if signing is unavailable.
+   * Receivers iterate their own MLS-known keys to verify — the signer identity is not transmitted.
    */
   async _signKeyPackage(userId, kpB64) {
     try {
       const result = await this.mlsService.signData(userId, kpB64);
-      return result || null;
+      return result?.signature || null;
     } catch (e) {
       console.warn('[_signKeyPackage] Signing not available:', e);
       return null;
@@ -1952,9 +1959,11 @@ export class ChatController {
       return null;
     }
 
-    // Non-co-device: check if leaving actor has surviving co-devices — if so, wait 10 min first
+    // Non-co-device: check if leaving actor has surviving co-devices — if so, wait 10 min first.
+    // Count fingerprints with the leaving actor's identity: if > 1, there's a surviving co-device
+    // (one is the leaving device itself; any additional one is a co-device that can confirm removal).
     const leavingActorId = parsed.attributedTo;
-    const leavingActorHasCoDevices = fingerprints.some(fp => fp.isOwn && fp.identity === leavingActorId);
+    const leavingActorHasCoDevices = fingerprints.filter(fp => fp.identity === leavingActorId).length > 1;
     const CO_DEVICE_WINDOW = leavingActorHasCoDevices ? (window.__BONFIRE_JS_DEBUG__ ? 10_000 : 10 * 60_000) : 0;
     const delay = CO_DEVICE_WINDOW + ownLeafIndex * 2000;
 
