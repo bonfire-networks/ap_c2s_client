@@ -5,15 +5,9 @@
 import { html } from 'lit';
 import 'iconify-icon';
 
-const daisySheet = new CSSStyleSheet();
-
-// Find the compiled CSS URL from the page's <link> tag (already resolved by HTML)
-const styleLink = document.querySelector('link[href*="styles.css"]');
-if (styleLink) {
-  fetch(styleLink.href)
-    .then(r => r.text())
-    .then(css => daisySheet.replace(css));
-}
+// Tailwind v4 uses @layer rules which WebKit doesn't support in adoptedStyleSheets.
+// Inject a <link> element into each shadow root — browser handles caching natively.
+const _pageLink = document.querySelector('link[href*="styles.css"]');
 
 /** Render an Iconify icon (defaults to Phosphor Duotone).
  *  size: number in px (default 16, i.e. same as Tailwind size-4). */
@@ -24,10 +18,12 @@ export function icon(name, { size = 16, class: cls = '', set = 'ph', style } = {
 }
 
 export function adoptDaisyUI(element) {
-  if (element.shadowRoot) {
-    element.shadowRoot.adoptedStyleSheets = [
-      ...element.shadowRoot.adoptedStyleSheets,
-      daisySheet
-    ];
-  }
+  if (!element.shadowRoot) return;
+  if (element.shadowRoot.querySelector('link[data-daisy]')) return;
+  if (!_pageLink) return;
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.setAttribute('data-daisy', '');
+  link.href = _pageLink.href;
+  element.shadowRoot.prepend(link);
 }
