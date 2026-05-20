@@ -224,8 +224,10 @@ export async function extractKeyPackageContent(kp) {
  */
 export async function fetchActorKeyPackage(actorUri) {
   const actor = await getActor(actorUri);
-  if (!actor.keyPackages) return null;
-  const content = await extractKeyPackageContent(actor.keyPackages);
+  kp = actor.keyPackages || actor["mls:keyPackages"];
+  console.log(`mls:keyPackages`, kp)
+  if (!kp) return null;
+  const content = await extractKeyPackageContent(kp);
   return content ? { content, actor } : null;
 }
 
@@ -237,8 +239,9 @@ export async function fetchActorKeyPackage(actorUri) {
  */
 export async function fetchAllActorKeyPackages(actorUri) {
   const actor = await getActor(actorUri);
-  if (!actor.keyPackages) return [];
-  const items = await resolveKeyPackageList(actor.keyPackages);
+  kp = actor.keyPackages || actor["mls:keyPackages"];
+  if (!kp) return [];
+  const items = await resolveKeyPackageList(kp);
   return items.map(kp => ({ content: kp.content, actor }));
 }
 

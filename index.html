@@ -35,8 +35,9 @@
 
                                   
                       if (!client_id) {
+                      client_id = "https://raw.githubusercontent.com/bonfire-networks/bonfire_ui_common/refs/heads/main/assets/static/tauri/client.jsonld";
   
-                      client_id = window.location.origin + basePath + 'client.jsonld';
+//                       client_id = window.location.origin + basePath + 'client.jsonld';
 
                       localStorage.setItem('appClientId', client_id);
                     }

@@ -1451,6 +1451,7 @@ export class ChatController {
   async fetchLatestKeyPackage(actorUri) {
     try {
       const result = await fetchActorKeyPackage(actorUri);
+      console.log('fetchActorKeyPackage result', result)
       if (result) {
         const { content, actor } = result;
         // Store the actor's profile from the fetched AP object

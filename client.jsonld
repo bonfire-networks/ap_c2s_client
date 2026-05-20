@@ -3,7 +3,7 @@
     "https://www.w3.org/ns/activitystreams",
     "https://purl.archive.org/socialweb/oauth"
   ],
-  "id": "https://e2ee.swf.pub/client.jsonld",
+  "id": "https://raw.githubusercontent.com/bonfire-networks/bonfire_ui_common/refs/heads/main/assets/static/tauri/client.jsonld",
   "name": "E2EE Sample App",
   "summary": "A sample client for end-to-end encrypted activities over ActivityPub",
   "redirectURI": "https://e2ee.swf.pub/",
