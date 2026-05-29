@@ -35,9 +35,13 @@ export async function exportState(_userId) {
 
 // ── Groups ─────────────────────────────────────────────────────────
 
-export async function createGroup(userId, groupId) {
-  const result = await invoke('plugin:openmls|create_group', { userId, groupId });
+export async function createGroup(userId, groupId, ciphersuite = null) {
+  const result = await invoke('plugin:openmls|create_group', { userId, groupId, ciphersuite });
   return { ratchetTree: base64ToUint8(result.ratchetTree) };
+}
+
+export async function bestCommonCiphersuite(memberSuites) {
+  return await invoke('plugin:openmls|best_common_ciphersuite', { memberSuites });
 }
 
 export async function loadGroup(userId, groupId) {
@@ -192,7 +196,7 @@ export async function exportRatchetTree(userId, groupId) {
 
 export async function createKeyPackage(userId) {
   const result = await invoke('plugin:openmls|create_key_package', { userId });
-  return { keyPackageBytes: base64ToUint8(result.keyPackageBytes) };
+  return { keyPackageBytes: base64ToUint8(result.keyPackageBytes), ciphersuite: result.ciphersuite ?? null };
 }
 
 // ── Fingerprints ────────────────────────────────────────────────────

@@ -1215,8 +1215,11 @@ export class E2EEChatView extends LitElement {
     } catch (e) {
       if (e instanceof EncryptionLostError && !this.noLongerMember) {
         this.groupEncryptionLost = true;
+      } else {
+        this.error = typeof e === 'string' ? e : (e.message || String(e));
+        console.error('[sendMessage] failed:', e);
       }
-      await this.loadMessages(this.selectedGroupId);
+      if (this.selectedGroupId) await this.loadMessages(this.selectedGroupId);
     }
     this.loading = false;
   }
@@ -2430,7 +2433,7 @@ export class E2EEChatView extends LitElement {
                     ${this._resolvedRecipients.length > 0 ? html`
                       <div class="flex flex-wrap gap-1">
                         ${this._resolvedRecipients.map((r, i) => html`
-                          <span class="badge gap-1 ${r.resolved && r.hasKey ? 'badge-success' : r.resolved ? 'badge-warning' : 'badge-error'}"
+                          <span class="badge gap-1 ${r.resolved && r.hasKey && !r.error ? 'badge-success' : r.resolved ? 'badge-warning' : 'badge-error'}"
                             title="${r.fingerprint ? r.fingerprint.map(e => `${e.emoji} ${e.description}`).join(', ') : r.error || ''}">
                             ${r.resolved && r.actorUri ? this._renderAvatar(r.actorUri, { size: 16 }) : ''}
                             ${r.error ? html`<span class="text-xs opacity-80">${r.error}</span>` : icon('check', { size: 12 })}

@@ -10,10 +10,10 @@
  * Dependencies are injected via constructor.
  */
 
-import { bytesToBase64, bytesFromInput, groupUri, messageUri } from './utils.js';
+import { bytesToBase64, bytesFromInput, groupUri, messageUri, hasType } from './utils.js';
 import { getCurrentActor, getActor, getActorId, apFetch, ensureFreshToken } from './activitypub/auth.js';
-import { postToOutbox, fetchActorKeyPackage, fetchAllActorKeyPackages, resolveActorId, extractApIdFromResponse } from './activitypub/client.js';
-import { sendMLSControl, publishKeyPackage, deleteKeyPackage, sendKeyPackageProposal, parseMLSActivity } from './activitypub/mls-transport.js';
+import { postToOutbox, fetchActorKeyPackage, fetchAllActorKeyPackages, resolveActorId, extractApIdFromResponse, forEachPublishedKeyPackage } from './activitypub/client.js';
+import { sendMLSControl, publishKeyPackage, deleteKeyPackage, deleteKeyPackageForDevice, sendKeyPackageProposal, parseMLSActivity } from './activitypub/mls-transport.js';
 
 // AP object types that represent regular user content — the only types that should generate receipts
 const CONTENT_TYPES = ['Create', 'Note', 'Article', 'Document', 'Page', 'Image', 'Video', 'Audio', 'Event', 'Question'];
@@ -169,10 +169,10 @@ export class ChatController {
    * Create a new MLS group with a fresh ID.
    * Returns the groupId.
    */
-  async createGroup() {
+  async createGroup(ciphersuite = null) {
     const newGroupId = groupUri();
     const actor = await getCurrentActor();
-    await this.mlsService.createGroup(actor.id, newGroupId);
+    await this.mlsService.createGroup(actor.id, newGroupId, ciphersuite);
     return newGroupId;
   }
 
@@ -746,8 +746,8 @@ export class ChatController {
     }
 
     if (recipients.length > 0) {
-      // New group flow
-      if (!groupId) groupId = await this.createGroup();
+      // New group flow — ciphersuite negotiation and MLS group creation happen inside _sendFirstMessage
+      if (!groupId) groupId = groupUri();
       const { messageApId, errors } = await this._sendFirstMessage(groupId, msgObj, recipients);
       return { groupId, messageApId, errors };
     }
@@ -795,19 +795,46 @@ export class ChatController {
       await this.storage.setGroupField(groupId, 'name', msgObj.name);
     }
 
-    // Save initial members list
     const initialMembers = uniqueActors([actor.id, ...toUris]);
+
+    // Fetch all key packages per recipient to determine a common ciphersuite
+    const recipientKpSets = await Promise.all(
+      toUris.map(async uri => {
+        const kps = await fetchAllActorKeyPackages(uri);
+        return { uri, kps };
+      })
+    );
+
+    // Only include members whose KPs declare a ciphersuite in the negotiation.
+    // Members with undeclared KPs are attempted anyway — Rust will reject incompatible ones per-recipient.
+    const suiteSetsForNegotiation = recipientKpSets
+      .map(({ kps }) => kps.map(kp => kp.ciphersuite?.identifier).filter(Boolean))
+      .filter(suites => suites.length > 0);
+
+    const chosenSuite = suiteSetsForNegotiation.length > 0
+      ? await this.mlsService.bestCommonCiphersuite(suiteSetsForNegotiation)
+      : null;
+
+    // Create the group with the negotiated suite (null = Rust default, i.e. MTI 0x0001)
+    await this.mlsService.createGroup(actor.id, groupId, chosenSuite);
+
+    // Save initial members list after createGroup (which wipes group meta state)
     await this.persistMembers(groupId, initialMembers);
 
-    // Invite each recipient
+    // Invite each recipient using a KP matching the chosen suite where possible
     const successfulInvites = [];
     const errors = [];
-    // Look up or derive AP ID so Welcome, GroupInfo, and PrivateMessage share the same context
     let apId = await this.storage.getGroupField(groupId, 'apId', null);
 
-    for (const recipient of toUris) {
+    for (const { uri: recipient, kps } of recipientKpSets) {
       try {
-        const kpBytes = await this.fetchLatestKeyPackage(recipient);
+        // Prefer a KP matching the chosen suite; for undeclared KPs just attempt and let Rust validate
+        const matchingKp = chosenSuite != null
+          ? kps.find(kp => kp.ciphersuite?.identifier === chosenSuite) ?? kps.find(kp => !kp.ciphersuite)
+          : kps[0];
+        const kpBytes = matchingKp
+          ? bytesFromInput(matchingKp.content)
+          : await this.fetchLatestKeyPackage(recipient);
         if (!kpBytes) {
           errors.push(`No KeyPackage for ${recipient}`);
           continue;
@@ -912,16 +939,21 @@ export class ChatController {
     }
 
     // Co-device KeyPackage proposal: NewDeviceB sends Create { object: KeyPackage } to own actor inbox
-    if (activity.type === 'Create' && activity.object?.type === 'KeyPackage') {
+    if (activity.type === 'Create' && hasType(activity.object, 'KeyPackage')) {
       const actor = await getCurrentActor();
       if (activity.object?.attributedTo === actor.id) {
         return this._handleKeyPackageProposal(activity.object, actor);
       }
     }
 
-    // Add { object: KeyPackage } from actor's keyPackages collection — verify mlsSignature before caching
-    if (activity.type === 'Add' && activity.object?.type === 'KeyPackage') {
-      return this._handleKeyPackageAdd(activity);
+    // Add { object: KeyPackage } from actor's keyPackages collection — verify mlsSignature before caching.
+    // Per spec, object may be a URL string; detect via target URL or inline type.
+    if (activity.type === 'Add') {
+      const target = typeof activity.target === 'string' ? activity.target : activity.target?.id;
+      const actor = await getCurrentActor().catch(() => null);
+      const kpCollUrl = typeof actor?.keyPackages === 'string' ? actor.keyPackages : actor?.keyPackages?.id;
+      const isKpAdd = (kpCollUrl && target === kpCollUrl) || hasType(activity.object, 'KeyPackage');
+      if (isKpAdd) return this._handleKeyPackageAdd(activity);
     }
 
     const parsed = parseMLSActivity(activity);
@@ -1372,11 +1404,11 @@ export class ChatController {
       // If actor was reconstructed from stale localStorage (outbox absent), fetch a fresh one
       if (!actor.outbox) actor = await getCurrentActor();
       await this.mlsService.clearKeyPackage(actor.id);
-      const { keyPackageHex } = await this.mlsService.createKeyPackage(actor.id);
+      const { keyPackageHex, ciphersuite } = await this.mlsService.createKeyPackage(actor.id);
       const kpBytes = bytesFromInput(keyPackageHex);
       const kpB64 = bytesToBase64(kpBytes);
       const mlsSignature = await this._signKeyPackage(actor.id, kpB64);
-      const published = await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage);
+      const published = await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage, ciphersuite);
       if (published) {
         await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
         localStorage.removeItem('actor');
@@ -1391,11 +1423,11 @@ export class ChatController {
    * Ensure the current user has a published key package.
    */
   async ensurePublishedKeyPackage(actor) {
-    const { keyPackageHex, publishedDate } = await this.mlsService.getKeyPackageInfo(actor.id);
+    const { keyPackageHex, publishedDate, ciphersuite: storedCs } = await this.mlsService.getKeyPackageInfo(actor.id);
 
     if (!keyPackageHex) {
       // new key package
-      const { keyPackageHex: newHex } = await this.mlsService.createKeyPackage(actor.id);
+      const { keyPackageHex: newHex, ciphersuite: newCs } = await this.mlsService.createKeyPackage(actor.id);
       const kpBytes = bytesFromInput(newHex);
 
       // If co-devices exist (live in MLS groups, or server has a KP from a different device),
@@ -1417,7 +1449,7 @@ export class ChatController {
         return { type: 'newDevicePending', fingerprint: ownFp?.fingerprint };
       }
 
-      const published = await publishKeyPackage(actor, kpBytes, null, this.storage);
+      const published = await publishKeyPackage(actor, kpBytes, null, this.storage, newCs);
       if (published) {
         await this.mlsService.markKeyPackagePublished(actor.id, newHex);
         localStorage.removeItem('actor');
@@ -1434,7 +1466,7 @@ export class ChatController {
     // Has key package but not published — self-sign and publish (replenishment)
     const kpBytes = bytesFromInput(keyPackageHex);
     const mlsSignature = await this._signKeyPackage(actor.id, bytesToBase64(kpBytes));
-    const published = await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage);
+    const published = await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage, storedCs);
     if (published) {
       await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
       localStorage.removeItem('actor');
@@ -1451,6 +1483,7 @@ export class ChatController {
   async fetchLatestKeyPackage(actorUri) {
     try {
       const result = await fetchActorKeyPackage(actorUri);
+      console.log('attempted fetchActorKeyPackage', result)
       console.log('fetchActorKeyPackage result', result)
       if (result) {
         const { content, actor } = result;
@@ -1484,13 +1517,24 @@ export class ChatController {
   async _fetchKeyPackageForAdd(actorUri, groupId, ownActorId) {
     const allKps = await fetchAllActorKeyPackages(actorUri);
     if (allKps.length === 0) return null;
-    if (allKps.length === 1) return bytesFromInput(allKps[0].content);
 
-    // Get existing members' signature keys so we can skip KPs already in the group
+    // Prefer KPs matching the group's ciphersuite; include undeclared KPs as fallback (Rust will validate)
+    const groupCiphersuite = await this.storage.getGroupField(groupId, 'ciphersuite', null);
+    const candidates = groupCiphersuite != null
+      ? [
+          ...allKps.filter(kp => kp.ciphersuite?.identifier === groupCiphersuite),
+          ...allKps.filter(kp => !kp.ciphersuite),
+        ]
+      : allKps;
+
+    if (candidates.length === 0) return null;
+    if (candidates.length === 1) return bytesFromInput(candidates[0].content);
+
+    // Among matching candidates, pick one whose signature key isn't already in the group
     const fingerprints = await this.mlsService.getGroupFingerprints(ownActorId, groupId).catch(() => []);
     const existingSigKeys = new Set(fingerprints.map(fp => fp.signatureKey).filter(Boolean));
 
-    for (const { content } of allKps) {
+    for (const { content } of candidates) {
       const fp = await this.mlsService.getKeyPackageFingerprint(content).catch(() => null);
       if (!fp?.signatureKey || !existingSigKeys.has(fp.signatureKey)) {
         return bytesFromInput(content);
@@ -1582,8 +1626,12 @@ export class ChatController {
     const recipientUri = await resolveActorId(recipientMention, currentDomain);
     if (!recipientUri) throw new Error(`Could not resolve ${recipientMention}`);
 
+    const groupCiphersuite = await this.storage.getGroupField(groupId, 'ciphersuite', null);
     const kpBytes = await this._fetchKeyPackageForAdd(recipientUri, groupId, actor.id);
-    if (!kpBytes) throw new Error(`No available KeyPackage for ${recipientUri}`);
+    if (!kpBytes) {
+      const suiteInfo = groupCiphersuite != null ? ` (requires ciphersuite 0x${groupCiphersuite.toString(16).padStart(4, '0')})` : '';
+      throw new Error(`No compatible KeyPackage for ${recipientUri}${suiteInfo}`);
+    }
 
     const { welcome, ratchetTree, commit } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
 
@@ -1617,8 +1665,14 @@ export class ChatController {
    *   (b) The KP's own SignaturePublicKey signed it (self-signed replenishment)
    */
   async _handleKeyPackageAdd(activity) {
-    const kpObj = activity.object;
-    const kpB64 = kpObj?.content;
+    let kpObj = activity.object;
+    // Per spec, object may be a URL string — dereference it
+    if (typeof kpObj === 'string') {
+      const res = await apFetch(kpObj, { headers: { Accept: 'application/activity+json' } });
+      if (!res.ok) return;
+      kpObj = await res.json();
+    }
+    const kpB64 = kpObj?.content ?? kpObj?.["mls:content"];
     const actorUri = kpObj?.attributedTo || activity.actor;
     if (!kpB64 || !actorUri) return;
 
@@ -1728,72 +1782,20 @@ export class ChatController {
     return [...keys];
   }
 
-  /**
-   * Fetch and iterate the actor's published keyPackages from the server.
-   * Calls predicate(signatureKey) for each parseable entry; returns true on first match.
-   */
-  async _forEachPublishedKey(actor, predicate) {
-    let kps = actor.keyPackages;
-    if (!kps) return false;
-    if (typeof kps === 'string') {
-      try {
-        const res = await apFetch(kps, { headers: { Accept: 'application/activity+json,application/json' } });
-        if (res.ok) kps = await res.json();
-        else return false;
-      } catch (e) { return false; }
-    }
-    const kpList = Array.isArray(kps) ? kps : (kps.items || []);
-    for (const kp of kpList) {
-      const content = typeof kp === 'string' ? null : kp?.content;
-      if (!content) continue;
-      try {
-        const fp = await this.mlsService.getKeyPackageFingerprint(content);
-        if (fp?.signatureKey && predicate(fp.signatureKey)) return true;
-      } catch (e) { /* unparseable KP — skip */ }
-    }
-    return false;
-  }
-
-  /**
-   * Check whether the actor's server-side profile contains a KeyPackage from a different device.
-   * Used on a fresh device or after a full reset (clear_all_data) when there are no local groups yet.
-   */
+  /** Check whether the actor's server-side profile contains a KeyPackage from a different device. */
   async _actorHasOtherDevices(actor, ownSigKey) {
-    return this._forEachPublishedKey(actor, k => k !== ownSigKey);
+    return forEachPublishedKeyPackage(actor, this.mlsService, k => k !== ownSigKey);
   }
 
   /** Returns true if signatureKey is already in the actor's published keyPackages on the server. */
   async _isKeyAlreadyPublished(actor, signatureKey) {
-    return this._forEachPublishedKey(actor, k => k === signatureKey);
+    return forEachPublishedKeyPackage(actor, this.mlsService, k => k === signatureKey);
   }
 
-  /**
-   * Find and delete the key package for a specific device (by signatureKey) from the actor profile.
-   * Scans the actor's keyPackages collection for the matching entry and sends a Remove/Update activity.
-   */
+  /** Find and delete the key package for a specific device from the actor's keyPackages collection. */
   async _deleteKeyPackageForDevice(actor, signatureKey) {
-    // Fetch fresh actor profile so we have the current keyPackages list
     const freshActor = await getActor(actor.id).catch(() => actor);
-    let kps = freshActor.keyPackages;
-    if (!kps) return;
-    if (typeof kps === 'string') {
-      try {
-        const res = await apFetch(kps, { headers: { Accept: 'application/activity+json,application/json' } });
-        if (res.ok) kps = await res.json(); else return;
-      } catch (e) { return; }
-    }
-    const kpList = Array.isArray(kps) ? kps : (kps.items || []);
-    for (const kp of kpList) {
-      const content = typeof kp === 'string' ? null : kp?.content;
-      if (!content) continue;
-      try {
-        const fp = await this.mlsService.getKeyPackageFingerprint(content);
-        if (fp?.signatureKey === signatureKey) {
-          await deleteKeyPackage(freshActor, bytesFromInput(content), this.storage);
-          return;
-        }
-      } catch (e) { /* unparseable KP — skip */ }
-    }
+    await deleteKeyPackageForDevice(freshActor, signatureKey, this.mlsService, this.storage);
   }
 
   /**
@@ -2451,13 +2453,17 @@ export class ChatController {
 
     let hasKey = false;
     let fingerprint = null;
+    let keyError = null;
     try {
       const kpBytes = await this.fetchLatestKeyPackage(actorUri);
-      hasKey = !!kpBytes;
-      // Extract emoji fingerprint from the key package
       if (kpBytes) {
+        hasKey = true;
         const kpB64 = bytesToBase64(kpBytes);
-        const fp = await this.mlsService.getKeyPackageFingerprint(kpB64);
+        const fp = await this.mlsService.getKeyPackageFingerprint(kpB64).catch(e => {
+          console.warn('[resolveRecipient] getKeyPackageFingerprint failed:', e);
+          keyError = e?.message || String(e);
+          return null;
+        });
         if (fp?.fingerprint) fingerprint = fp.fingerprint;
       }
     } catch {}
@@ -2468,7 +2474,7 @@ export class ChatController {
       displayName: profile?.name || this.getActorNickname(actorUri),
       avatar: profile?.icon || null,
       hasKey, fingerprint,
-      error: hasKey ? null : 'No encryption key available'
+      error: !hasKey ? 'No encryption key available' : keyError || null
     };
   }
 

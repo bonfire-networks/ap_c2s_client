@@ -163,8 +163,14 @@ export async function verifyDb() {
 // Internal helpers
 // ──────────────────────────────────────────────
 
+function _assertKey(value, label) {
+  const valid = typeof value === 'string' || typeof value === 'number' || value instanceof Date ||
+    (Array.isArray(value) && value.every(v => typeof v === 'string' || typeof v === 'number' || v instanceof Date));
+  if (!valid) throw new Error(`[IndexedDB] Invalid key for ${label}: ${JSON.stringify(value)} (${typeof value})`);
+}
+
 async function _updateUserState(userId, updater) {
-  if (!userId) throw new Error('userId is required');
+  _assertKey(userId, 'users.id');
   const rec = await db.table('users').get(userId);
   const current = rec && rec.state ? rec.state : {};
   const next = updater(current);
@@ -178,6 +184,7 @@ async function _updateUserState(userId, updater) {
 // ──────────────────────────────────────────────
 
 export async function saveGroupMeta(id, data) {
+  _assertKey(id, 'groups.id');
   // Preserve top-level fields (name, apId) that live outside `state`
   const existing = await db.table('groups').get(id);
   await db.table('groups').put({ ...existing, id, state: data });
@@ -193,6 +200,7 @@ export async function deleteGroupMeta(id) {
 }
 
 export async function setGroupField(id, field, value) {
+  _assertKey(id, 'groups.id');
   const rec = await db.table('groups').get(id);
   if (rec) {
     await db.table('groups').put({ ...rec, [field]: value });
@@ -234,6 +242,8 @@ export async function listGroupsWithLastMessage() {
 
 export async function saveMessage(groupId, content, id = undefined, isLocal = false, apId = undefined, deliveryStatus = undefined, explicitTimestamp = undefined) {
   const messageId = id || messageUri();
+  _assertKey(messageId, 'messages.id');
+  _assertKey(groupId, 'messages.groupId');
   const timestamp = explicitTimestamp || (content && content.timestamp) || Date.now();
   const rec = { id: messageId, groupId, isLocal, content, timestamp, isRead: isLocal };
   if (apId) rec.apId = apId;
@@ -383,6 +393,8 @@ export async function getActorProfile(actorId) {
 // ──────────────────────────────────────────────
 
 export async function markProcessed(actorId, activityId) {
+  _assertKey(actorId, 'processedActivityIds.actorId');
+  _assertKey(activityId, 'processedActivityIds.activityId');
   const exists = await isProcessed(actorId, activityId);
   if (!exists) {
     await db.table('processedActivityIds').add({ actorId, activityId });
@@ -471,6 +483,7 @@ export const isProcessedActivityId = isProcessed;
 export async function saveState(store, id, state) {
   if (store === 'groups') return saveGroupMeta(id, state);
   if (store === 'users') {
+    _assertKey(id, 'users.id');
     const rec = await db.table('users').get(id);
     await db.table('users').put({ ...rec, id, state });
     return;

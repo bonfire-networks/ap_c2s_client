@@ -73,17 +73,22 @@ export class MLSService {
    * @param {object} [metadata] - initial group metadata (members, name, etc.)
    * @returns {{ ratchetTree: Uint8Array }}
    */
-  async createGroup(userId, groupId, metadata = {}) {
-    const { ratchetTree } = await this.backend.createGroup(userId, groupId);
+  async createGroup(userId, groupId, ciphersuite = null, metadata = {}) {
+    const { ratchetTree } = await this.backend.createGroup(userId, groupId, ciphersuite);
 
     // Save group metadata with ratchet tree
     await this.storage.saveGroupMeta(groupId, {
       ...metadata,
+      ...(ciphersuite != null ? { ciphersuite } : {}),
       ratchetTree: Array.from(ratchetTree)
     });
 
     await this.persistBackendState(userId);
     return { ratchetTree };
+  }
+
+  async bestCommonCiphersuite(memberSuites) {
+    return this.backend.bestCommonCiphersuite(memberSuites);
   }
 
   /**
@@ -236,10 +241,11 @@ export class MLSService {
     if (state?.keyPackage) {
       return {
         keyPackageHex: state.keyPackage,
-        publishedDate: state.publishedDate ?? null
+        publishedDate: state.publishedDate ?? null,
+        ciphersuite: state.keyPackageCiphersuite ?? null,
       };
     }
-    return { keyPackageHex: null, publishedDate: null };
+    return { keyPackageHex: null, publishedDate: null, ciphersuite: null };
   }
 
   /**
@@ -249,13 +255,14 @@ export class MLSService {
    * @returns {{ keyPackageHex: string }}
    */
   async createKeyPackage(userId) {
-    const { keyPackageBytes } = await this.backend.createKeyPackage(userId);
+    const { keyPackageBytes, ciphersuite } = await this.backend.createKeyPackage(userId);
     const keyPackageHex = bytesToHex(keyPackageBytes);
 
     await this.storage.saveUserField(userId, 'keyPackage', keyPackageHex);
+    if (ciphersuite) await this.storage.saveUserField(userId, 'keyPackageCiphersuite', ciphersuite);
     await this.persistBackendState(userId);
 
-    return { keyPackageHex };
+    return { keyPackageHex, ciphersuite: ciphersuite ?? null };
   }
 
   /**

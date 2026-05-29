@@ -9,9 +9,9 @@
  * No MLS crypto here — just constructs AP activities that carry MLS data.
  */
 
-import { bytesToBase64 } from '../utils.js';
+import { bytesToBase64, bytesFromInput, hasType } from '../utils.js';
 import { apFetch } from './auth.js';
-import { postToOutbox, fetchActorKeyPackage } from './client.js';
+import { postToOutbox, fetchActorKeyPackage, resolveCollectionItems, resolveKeyPackageList, extractApIdFromResponse } from './client.js';
 
 const MLS_CONTEXTS = [
   'https://www.w3.org/ns/activitystreams',
@@ -71,18 +71,19 @@ export async function sendMLSControl(actor, type, contentB64, recipients, contex
 /**
  * Publish a key package for the current actor.
  *
- * If the actor has an existing keyPackages collection, sends an Add activity.
- * Otherwise, sends an Update to the actor with the key package.
+ * Sends Create + Add when the actor has a keyPackages collection URI (spec §2.2).
+ * Falls back to Create + Update with an inline anonymous Collection when the server
+ * doesn't expose a collection endpoint.
  *
  * @param {object} actor - current actor
  * @param {Uint8Array} keyPackageBytes - raw key package bytes
+ * @param {string|null} mlsSignature - optional base64 MLS signature
  * @returns {boolean} true if published successfully
  */
-export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = null, storage = null) {
+export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = null, storage = null, ciphersuite = null) {
   const kpB64 = bytesToBase64(keyPackageBytes);
 
   const keyPackageObj = {
-    '@context': MLS_CONTEXTS,
     type: 'KeyPackage',
     attributedTo: actor.id,
     to: 'as:Public',
@@ -90,40 +91,55 @@ export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = n
     mediaType: 'message/mls',
     encoding: 'base64',
     content: kpB64,
-    generator: {
-      type: 'Application',
-      name: 'Bonfire MLS client'
-    }
+    ...(ciphersuite != null ? { ciphersuite } : {}),
+    generator: { type: 'Application', name: 'Bonfire MLS client' },
   };
+  if (mlsSignature) keyPackageObj.mlsSignature = mlsSignature;
 
-  const keyPackages = actor.keyPackages;
-  const target = keyPackages ? (typeof keyPackages === 'string' ? keyPackages : keyPackages.id) : null;
+  // Step 1: Create the KeyPackage object so the server assigns it an id URL
+  const createRes = await postToOutbox(actor, {
+    '@context': MLS_CONTEXTS,
+    type: 'Create',
+    actor: actor.id,
+    to: 'as:Public',
+    object: keyPackageObj,
+  }, storage).catch(e => { console.error('[publishKeyPackage] Create failed:', e); return null; });
+  if (!createRes?.ok) return false;
 
-  let res;
-  if (target) {
-    const addActivity = {
-      type: 'Add',
-      actor: actor.id,
-      to: 'as:Public',
-      object: keyPackageObj,
-      target
-    };
+  const kpId = extractApIdFromResponse(createRes);
+  const kpRef = kpId || keyPackageObj; // fall back to inline object if server didn't return an id
+
+  // Step 2a: Add to collection if the actor exposes a collection URI
+  const kpField = actor.keyPackages || actor["mls:keyPackages"];
+  const collectionUrl = typeof kpField === 'string' ? kpField : kpField?.id;
+  if (collectionUrl) {
+    const addActivity = { type: 'Add', actor: actor.id, to: 'as:Public', object: kpRef, target: collectionUrl };
     if (mlsSignature) addActivity.mlsSignature = mlsSignature;
-    res = await postToOutbox(actor, addActivity, storage);
-  } else {
-    res = await postToOutbox(actor, {
-      type: 'Update',
-      actor: actor.id,
-      to: 'as:Public',
-      object: {
-        id: actor.id,
-        type: actor.type,
-        keyPackages: [keyPackageObj]
-      }
-    }, storage);
+    const addRes = await postToOutbox(actor, addActivity, storage);
+    if (addRes?.ok) return true;
+    // Fall through to Update if Add failed
   }
 
-  return res && res.ok;
+  // Step 2b: Update the actor with an inline anonymous Collection of KP URLs
+  const existingItems = kpField ? await resolveCollectionItems(kpField).catch(() => []) : [];
+  const existingUrls = existingItems
+    .map(item => (typeof item === 'string' ? item : item?.id))
+    .filter(Boolean);
+  const items = kpId ? [...existingUrls, kpId] : [...existingUrls, keyPackageObj];
+
+  const updateRes = await postToOutbox(actor, {
+    '@context': MLS_CONTEXTS,
+    type: 'Update',
+    actor: actor.id,
+    to: 'as:Public',
+    object: {
+      id: actor.id,
+      type: actor.type,
+      keyPackages: { type: 'Collection', totalItems: items.length, items },
+    }
+  }, storage);
+
+  return updateRes?.ok ?? false;
 }
 
 /**
@@ -162,7 +178,7 @@ export async function sendKeyPackageProposal(actor, keyPackageBytes, storage = n
 
 /**
  * Delete (revoke) a key package from the actor's keyPackages collection.
- * Sends an AP Remove activity when a collection exists, or an Update with empty keyPackages when it doesn't (like in publishKeyPackage).
+ * Sends Remove when a collection URL exists, falls back to Update with an inline Collection.
  *
  * @param {object} actor - current actor
  * @param {Uint8Array} keyPackageBytes - raw key package bytes to remove
@@ -170,60 +186,100 @@ export async function sendKeyPackageProposal(actor, keyPackageBytes, storage = n
  */
 export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
   const kpB64 = bytesToBase64(keyPackageBytes);
+  const kpField = actor.keyPackages || actor["mls:keyPackages"];
+  const allItems = kpField ? await resolveCollectionItems(kpField).catch(() => []) : [];
+  const collectionUrl = typeof kpField === 'string' ? kpField : kpField?.id;
 
-  // Fetch the current keyPackages list from the server
-  let kpList = [];
-  const kpField = actor.keyPackages;
-  if (kpField) {
-    let kpCollection = kpField;
-    if (typeof kpCollection === 'string') {
-      try {
-        const res = await apFetch(kpCollection, { headers: { Accept: 'application/activity+json,application/json' } });
-        if (res.ok) kpCollection = await res.json();
-      } catch (_) {}
-    }
-    kpList = Array.isArray(kpCollection) ? kpCollection : (kpCollection?.items || []);
-  }
+  // Find the KP object's URL by matching content (needed for Delete)
+  const kpObjectUrl = allItems
+    .map(item => (typeof item === 'string' ? item : item?.id))
+    .find((_, i) => {
+      const item = allItems[i];
+      const content = typeof item === 'string' ? null : (item?.content ?? item?.["mls:content"]);
+      return content === kpB64;
+    }) ?? null;
 
-  const target = kpField ? (typeof kpField === 'string' ? kpField : kpField?.id) : null;
-
-
-  let res;
-  if (target) {
-    // Remove: collection exists — signal server to remove the specific KP
-    res = await postToOutbox(actor, {
+  // Try Remove + Delete if the actor exposes a collection URL
+  if (collectionUrl) {
+    const removeRes = await postToOutbox(actor, {
+      '@context': MLS_CONTEXTS,
       type: 'Remove',
       actor: actor.id,
-      object: {
-        type: 'KeyPackage',
-        attributedTo: actor.id,
-        mediaType: 'message/mls',
-        encoding: 'base64',
-        content: kpB64,
-      },
-      target,
+      to: 'as:Public',
+      object: kpObjectUrl ?? { type: 'KeyPackage', attributedTo: actor.id, mediaType: 'message/mls', encoding: 'base64', content: kpB64 },
+      target: collectionUrl,
     }, storage);
-  } else {
-    // Update: no collection — replace the whole keyPackages list on the actor profile
-    
-    const remaining = kpList.filter(kp => {
-      const content = typeof kp === 'string' ? kp : kp?.content;
-      return content !== kpB64;
-    });
+    if (removeRes?.ok) {
+      // Delete the object itself (spec §2.2: Remove then Delete)
+      if (kpObjectUrl) {
+        await postToOutbox(actor, {
+          '@context': MLS_CONTEXTS,
+          type: 'Delete',
+          actor: actor.id,
+          to: 'as:Public',
+          object: kpObjectUrl,
+        }, storage);
+      }
+      return true;
+    }
+    // Fall through to Update if Remove failed
+  }
 
-    res = await postToOutbox(actor, {
-      type: 'Update',
+  // Delete the object itself if we know its URL, then Update the inline Collection
+  if (kpObjectUrl) {
+    await postToOutbox(actor, {
+      '@context': MLS_CONTEXTS,
+      type: 'Delete',
       actor: actor.id,
       to: 'as:Public',
-      object: {
-        id: actor.id,
-        type: actor.type,
-        keyPackages: remaining,
-      }
+      object: kpObjectUrl,
     }, storage);
   }
 
-  return res && res.ok;
+  // Update: rebuild the inline Collection minus the removed KP
+  const remaining = allItems.filter(item => {
+    const content = typeof item === 'string' ? null : (item?.content ?? item?.["mls:content"]);
+    const id = typeof item === 'string' ? item : item?.id;
+    return content !== kpB64 && id !== kpObjectUrl;
+  });
+  const items = remaining.map(item => (typeof item === 'string' ? item : (item?.id || item)));
+
+  const updateRes = await postToOutbox(actor, {
+    '@context': MLS_CONTEXTS,
+    type: 'Update',
+    actor: actor.id,
+    to: 'as:Public',
+    object: {
+      id: actor.id,
+      type: actor.type,
+      keyPackages: { type: 'Collection', totalItems: items.length, items },
+    }
+  }, storage);
+
+  return updateRes?.ok ?? false;
+}
+
+/**
+ * Find and delete the key package for a specific device (by signatureKey) from the actor profile.
+ * Scans the actor's keyPackages collection for the matching entry and sends Remove+Delete or Update.
+ *
+ * @param {object} actor - actor object (should be freshly fetched)
+ * @param {string} signatureKey - MLS signature key of the device to remove
+ * @param {object} mlsService - MLS service with getKeyPackageFingerprint
+ * @param {object} storage - optional storage adapter
+ */
+export async function deleteKeyPackageForDevice(actor, signatureKey, mlsService, storage = null) {
+  const kps = actor.keyPackages || actor["mls:keyPackages"];
+  if (!kps) return;
+  for (const { content } of await resolveKeyPackageList(kps).catch(() => [])) {
+    try {
+      const fp = await mlsService.getKeyPackageFingerprint(content);
+      if (fp?.signatureKey === signatureKey) {
+        await deleteKeyPackage(actor, bytesFromInput(content), storage);
+        return;
+      }
+    } catch (e) { /* unparseable KP — skip */ }
+  }
 }
 
 /**
@@ -252,21 +308,23 @@ export function parseMLSActivity(activity) {
     return null;
   }
 
-  const types = Array.isArray(obj.type) ? obj.type : [obj.type];
-
-  if (!obj.content || !obj.encoding || obj.encoding !== 'base64') {
-    console.log('[parseMLSActivity] Rejected: missing content/encoding', { types, hasContent: !!obj.content, encoding: obj.encoding, id: obj.id || activity?.id });
+  const content = obj.content ?? obj["mls:content"];
+  const encoding = obj.encoding ?? obj["mls:encoding"];
+  if (!content || !encoding || encoding !== 'base64') {
+    const types = Array.isArray(obj.type) ? obj.type : [obj.type];
+    console.log('[parseMLSActivity] Rejected: missing content/encoding', { types, hasContent: !!content, encoding, id: obj.id || activity?.id });
     return null;
   }
 
-  const contextId = obj.context || activity.context || null;
+  const contextId = obj.context ?? obj["mls:context"] ?? activity.context ?? null;
 
   let type;
-  if (types.includes('Welcome')) type = 'Welcome';
-  else if (types.includes('GroupInfo')) type = 'GroupInfo';
-  else if (types.includes('PrivateMessage')) type = 'PrivateMessage';
-  else if (types.includes('PublicMessage')) type = 'PublicMessage';
+  if (hasType(obj, 'Welcome')) type = 'Welcome';
+  else if (hasType(obj, 'GroupInfo')) type = 'GroupInfo';
+  else if (hasType(obj, 'PrivateMessage')) type = 'PrivateMessage';
+  else if (hasType(obj, 'PublicMessage')) type = 'PublicMessage';
   else {
+    const types = Array.isArray(obj.type) ? obj.type : [obj.type];
     console.log('[parseMLSActivity] Rejected: unknown MLS type', { types, id: obj.id || activity?.id });
     return null;
   }
@@ -274,9 +332,9 @@ export function parseMLSActivity(activity) {
   return {
     type,
     originalTypes: types, // full original type array — preserved for receipt detection in catch blocks
-    content: obj.content,
+    content,
     context: contextId,
-    encoding: obj.encoding,
+    encoding,
     attributedTo: obj.attributedTo,
     id: obj.id || activity.id,
     to: obj.to,

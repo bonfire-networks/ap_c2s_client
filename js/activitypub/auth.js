@@ -143,14 +143,15 @@ export async function getCurrentActor() {
         if (!actorId || !URL.canParse(actorId)) {
             throw new Error(`Invalid actor_id in localStorage: ${JSON.stringify(actorId)}`)
         }
-        const res = await apFetch(actorId, {
+        // Actor profile endpoint requires HTTP signatures, not Bearer tokens — use plain fetch
+        const res = await fetch(actorId, {
             headers: {
-                Accept:
-                    'application/activity+json,application/lrd+json,application/json'
+                Accept: 'application/activity+json,application/lrd+json,application/json',
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
             }
         })
         if (!res.ok) {
-            throw new Error('Failure fetching actor')
+            throw new Error(`Failure fetching actor (${res.status} ${res.statusText})`)
         }
         const actor = await res.json()
         localStorage.setItem('actor', JSON.stringify(actor))

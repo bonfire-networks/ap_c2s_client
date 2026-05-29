@@ -1,5 +1,12 @@
 // Utility functions: encoding, ID generation, byte conversions
 
+/** Check if an AP object's type field (string or array) includes a given type, ignoring mls: prefix. */
+export function hasType(obj, type) {
+  const t = obj?.type;
+  if (Array.isArray(t)) return t.includes(type) || t.includes(`mls:${type}`);
+  return t === type || t === `mls:${type}`;
+}
+
 import * as ulidx from 'ulidx'
 
 export function bytesToHex(bytes) {
@@ -54,6 +61,28 @@ export function arrayToUint8Array(arr) {
   if (arr instanceof Uint8Array) return arr;
   if (Array.isArray(arr)) return Uint8Array.from(arr);
   return arr;
+}
+
+// MLS ciphersuite identifiers per RFC 9420
+const MLS_CIPHERSUITES = {
+  0x0001: 'MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519',
+  0x0002: 'MLS_128_DHKEMP256_AES128GCM_SHA256_P256',
+  0x0003: 'MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519',
+  0x0004: 'MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448',
+  0x0005: 'MLS_256_DHKEMP521_AES256GCM_SHA512_P521',
+  0x0006: 'MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448',
+  0x0007: 'MLS_256_DHKEMP384_AES256GCM_SHA384_P384',
+};
+
+
+const MLS_CIPHERSUITE_IDS = Object.fromEntries(
+  Object.entries(MLS_CIPHERSUITES).map(([id, name]) => [name, Number(id)])
+);
+
+/** Resolve a ciphersuite name string to its numeric identifier, or null if unknown. */
+export function mlsCiphersuiteIdFromName(name) {
+  if (!name) return null;
+  return MLS_CIPHERSUITE_IDS[name] ?? null;
 }
 
 export function hasKeyPackage(keyPackages) {

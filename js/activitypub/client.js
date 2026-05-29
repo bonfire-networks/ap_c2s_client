@@ -6,6 +6,7 @@
  */
 
 import { apFetch, getActorId, getActor } from './auth.js';
+import { mlsCiphersuiteIdFromName } from '../utils.js';
 
 /**
  * Post an activity to the actor's outbox.
@@ -96,12 +97,7 @@ export async function fetchObject(item, options = {}) {
 
   let json;
   try {
-    const res = await apFetch(id, {
-      headers: {
-        Accept: 'application/activity+json,application/lrd+json,application/json'
-      }
-    });
-    json = await res.json();
+    json = await apFetchJson(id);
   } catch {
     json = typeof item === 'string'
       ? { id: item }
@@ -181,26 +177,49 @@ export async function resolveActorId(input, defaultDomain) {
 }
 
 /**
+ * Resolve an AP Collection/OrderedCollection (or URL, or inline array) to a flat item array.
+ * Follows one level of pagination via `first` if no inline items are present.
+ */
+async function apFetchJson(url) {
+  const origin_url = localStorage.getItem('actor_id') || localStorage.getItem('appUrl');
+  const isSameOrigin = origin_url && new URL(url).origin === new URL(origin_url).origin;
+  const res = isSameOrigin
+    ? await apFetch(url, { headers: { Accept: 'application/activity+json' } })
+    : await fetch(url, { cache: 'no-store', headers: { Accept: 'application/activity+json' } });
+  return res.ok ? res.json() : null;
+}
+
+async function resolveCollectionItems(val) {
+  if (typeof val === 'string') {
+    val = await apFetchJson(val);
+    if (!val) return [];
+  }
+  if (Array.isArray(val)) return val;
+  if (Array.isArray(val?.orderedItems)) return val.orderedItems;
+  if (Array.isArray(val?.items)) return val.items;
+  // Collection with a `first` page link — follow it (first page only; keyPackages collections are small)
+  const pageUrl = typeof val?.first === 'string' ? val.first : val?.first?.id;
+  if (pageUrl) {
+    const page = await apFetchJson(pageUrl);
+    if (page) return page.orderedItems ?? page.items ?? [];
+  }
+  return [];
+}
+
+/**
  * Resolve an actor's keyPackages field to an array of KP objects (each with .content).
- * Handles URL strings, collections with items, and direct arrays.
  */
 async function resolveKeyPackageList(kp) {
-  if (typeof kp === 'string') {
-    const res = await apFetch(kp, { headers: { Accept: 'application/activity+json' } });
-    if (!res.ok) return [];
-    kp = await res.json();
-  }
-  if (kp && Array.isArray(kp.items)) kp = kp.items;
-  if (!Array.isArray(kp)) kp = [kp];
+  const items = await resolveCollectionItems(kp);
   const results = [];
-  for (const item of kp) {
+  for (const item of items) {
     let obj = item;
     if (typeof obj === 'string') {
-      const res = await apFetch(obj, { headers: { Accept: 'application/activity+json' } });
-      if (!res.ok) continue;
-      obj = await res.json();
+      obj = await apFetchJson(obj);
+      if (!obj) continue;
     }
-    if (obj?.content) results.push(obj);
+    const content = obj?.content ?? obj?.["mls:content"];
+    if (content) results.push({ ...obj, content });
   }
   return results;
 }
@@ -222,9 +241,31 @@ export async function extractKeyPackageContent(kp) {
  * @param {string} actorUri
  * @returns {{ content: string, actor: object }|null}
  */
+export { resolveCollectionItems, resolveKeyPackageList };
+
+/**
+ * Iterate an actor's published keyPackages, calling predicate(signatureKey) for each parseable entry.
+ * Returns true on first match.
+ *
+ * @param {object} actor - actor object with keyPackages field
+ * @param {object} mlsService - MLS service with getKeyPackageFingerprint
+ * @param {function} predicate - (signatureKey: string) => boolean
+ */
+export async function forEachPublishedKeyPackage(actor, mlsService, predicate) {
+  const kps = actor.keyPackages || actor["mls:keyPackages"];
+  if (!kps) return false;
+  for (const { content } of await resolveKeyPackageList(kps).catch(() => [])) {
+    try {
+      const fp = await mlsService.getKeyPackageFingerprint(content);
+      if (fp?.signatureKey && predicate(fp.signatureKey)) return true;
+    } catch (e) { /* unparseable KP — skip */ }
+  }
+  return false;
+}
+
 export async function fetchActorKeyPackage(actorUri) {
   const actor = await getActor(actorUri);
-  kp = actor.keyPackages || actor["mls:keyPackages"];
+  const kp = actor.keyPackages || actor["mls:keyPackages"];
   console.log(`mls:keyPackages`, kp)
   if (!kp) return null;
   const content = await extractKeyPackageContent(kp);
@@ -239,10 +280,16 @@ export async function fetchActorKeyPackage(actorUri) {
  */
 export async function fetchAllActorKeyPackages(actorUri) {
   const actor = await getActor(actorUri);
-  kp = actor.keyPackages || actor["mls:keyPackages"];
+  const kp = actor.keyPackages || actor["mls:keyPackages"];
   if (!kp) return [];
   const items = await resolveKeyPackageList(kp);
-  return items.map(kp => ({ content: kp.content, actor }));
+  return items.map(kp => {
+    const cs = kp.ciphersuite;
+    const ciphersuite = typeof cs === 'string'
+      ? (() => { const id = mlsCiphersuiteIdFromName(cs); return id != null ? { identifier: id, name: cs } : null; })()
+      : (cs ?? null);
+    return { content: kp.content, ciphersuite, actor };
+  });
 }
 
 /**

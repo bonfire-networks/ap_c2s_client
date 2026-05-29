@@ -143,7 +143,15 @@ export async function exportState(userId) {
 
 // ── Groups ─────────────────────────────────────────────────
 
-export async function createGroup(userId, groupId) {
+export async function bestCommonCiphersuite(_memberSuites) {
+  // WASM backend only supports MLS_128 suites; return MTI if all sets contain it
+  const MTI = 0x0001;
+  const allHaveMTI = _memberSuites.every(s => s.includes(MTI));
+  return allHaveMTI ? MTI : null;
+}
+
+export async function createGroup(userId, groupId, _ciphersuite = null) {
+  // WASM backend uses a fixed ciphersuite; ciphersuite param is accepted but ignored
   const wasm = await loadWasm();
   const { provider, identity } = requireUser(userId);
 

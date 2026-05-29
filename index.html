@@ -10,7 +10,6 @@
     <link rel="manifest" href="manifest.json" />
     <link href="../dist/styles.css" rel="stylesheet" />
     <script src="../tauri-init.js"></script>
-    <script type="module" src="js/dist/elements/login.js"></script>
     <script type="module" src="js/dist/elements/save.js"></script>
     <script type="module" src="js/dist/elements/home.js"></script>
     <script type="module" src="js/dist/elements/e2ee-chat-view.js"></script>
@@ -23,27 +22,14 @@
       </div>
     </div>
     <script type="module">
-                      let client_id = localStorage.getItem('appClientId');
+      const client_id = localStorage.getItem('appClientId'); // set by pick-instance.html on first launch
 
-                                let basePath = window.location.pathname;
+      let basePath = window.location.pathname;
+      if (basePath.endsWith('index.html')) basePath = basePath.slice(0, -'index.html'.length);
+      if (!basePath.endsWith('/')) basePath += '/';
 
-                                  if (basePath.endsWith('index.html')) {
-                                    basePath = basePath.slice(0, -'index.html'.length);
-                                  }
-
-                                  if (!basePath.endsWith('/')) basePath += '/';
-
-                                  
-                      if (!client_id) {
-                      client_id = "https://raw.githubusercontent.com/bonfire-networks/bonfire_ui_common/refs/heads/main/assets/static/tauri/client.jsonld";
-  
-//                       client_id = window.location.origin + basePath + 'client.jsonld';
-
-                      localStorage.setItem('appClientId', client_id);
-                    }
-
-
-                      let redirect_uri = window.location.origin + window.location.pathname;
+      // Fixed redirect URI matching the CIMD document at bonfirenetworks.org/.well-known/client.jsonld
+      const redirect_uri = window.__TAURI__ ? "tauri://localhost/" : window.location.origin;
 
       document.addEventListener("DOMContentLoaded", () => {
         const params = new URLSearchParams(window.location.search);
@@ -63,10 +49,8 @@
                 success-uri=${redirect_uri}
               />`;
         } else if (!hasToken) {
-          console.log("Rendering <ap-login> (no access_token)");
-          document.getElementById("page").innerHTML = `<ap-login
-                client-id=${client_id}
-                redirect-uri=${redirect_uri} />`;
+          console.log("No access_token — redirecting to pick-instance.html");
+          window.location.replace('../../pick-instance.html');
         } else {
           console.log("Rendering <ap-home> (already logged in)");
           document.getElementById("page").innerHTML = `<ap-home
