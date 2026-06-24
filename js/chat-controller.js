@@ -10,7 +10,7 @@
  * Dependencies are injected via constructor.
  */
 
-import { bytesToBase64, bytesFromInput, groupUri, messageUri, hasType } from './utils.js';
+import { bytesToBase64, bytesFromInput, groupUri, messageUri, hasType, mlsKeyId, mlsEndorsementPayload } from './utils.js';
 import { getCurrentActor, getActor, getActorId, apFetch, ensureFreshToken } from './activitypub/auth.js';
 import { postToOutbox, fetchActorKeyPackage, fetchAllActorKeyPackages, resolveActorId, extractApIdFromResponse, forEachPublishedKeyPackage } from './activitypub/client.js';
 import { sendMLSControl, publishKeyPackage, deleteKeyPackage, deleteKeyPackageForDevice, sendKeyPackageProposal, parseMLSActivity } from './activitypub/mls-transport.js';
@@ -468,6 +468,12 @@ export class ChatController {
       const fingerprints = await this.mlsService.getGroupFingerprints(actor.id, groupId);
       const identities = [...new Set(fingerprints.map(fp => fp.identity).filter(Boolean))];
       if (identities.length === 0) return;
+      // Persist signature keys to cache so endorsement verification works after members leave
+      for (const fp of fingerprints) {
+        if (fp.identity && fp.signatureKey) {
+          await this.storage.saveMlsKnownKey(fp.identity, fp.signatureKey);
+        }
+      }
       const state = (await this.storage.loadGroupMeta(groupId)) || {};
       const previous = new Set(state.members || []);
       // sigKeys: array of { signatureKey, identity } for device-level diffing
@@ -595,8 +601,7 @@ export class ChatController {
   }
 
   /**
-   * Send Welcome + GroupInfo to a recipient, chaining the server-assigned AP ID
-   * from the Welcome as context for the GroupInfo.
+   * Send Welcome to a recipient.
    * Returns the (possibly updated) apId.
    */
   async _sendInvite(actor, groupId, recipient, welcomeBytes, ratchetTreeBytes, apId) {
@@ -608,7 +613,11 @@ export class ChatController {
         console.log('[_sendInvite] Stored group AP ID from Welcome:', apId);
       }
     }
-    await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTreeBytes), [recipient], apId || null, this.storage);
+    // Per RFC 9420, GroupInfo seems only needed for External Joins (§12.4.3.2), not
+    // Welcome-based invites. The ratchet tree is already embedded in our Welcome bytes
+    // via use_ratchet_tree_extension(true). Kept commented for backward compat with
+    // older Bonfire clients that haven't yet been updated to join from Welcome alone.
+    // await sendMLSControl(actor, 'GroupInfo', bytesToBase64(ratchetTreeBytes), [recipient], apId || null, this.storage);
     return apId;
   }
 
@@ -863,6 +872,15 @@ export class ChatController {
 
   // ── Receiving ──────────────────────────────────────────
 
+  async fetchActorKeyPackages(actorId) {
+    const kps = await fetchAllActorKeyPackages(actorId);
+    return (kps ?? []).map(kp => ({
+      kpB64: kp.content,
+      mlsSignature: kp.mlsSignature ?? null,
+      mlsSignerKeyId: kp.mlsSignerKeyId ?? null,
+    }));
+  }
+
   /**
    * Poll inbox and process new activities.
    */
@@ -1003,6 +1021,11 @@ export class ChatController {
     if (!groupId) groupId = contextId;
     console.log('[handleActivity] contextId:', contextId, '→ resolved groupId:', groupId);
 
+    if (!groupId) {
+      console.warn('[handleActivity] Could not resolve groupId for', parsed.type, parsed.id, '— skipping');
+      return null;
+    }
+
     if (parsed.type === 'Welcome') {
       return this._handleWelcome(groupId, parsed, actor);
     } else if (parsed.type === 'GroupInfo') {
@@ -1035,9 +1058,18 @@ export class ChatController {
     }
     await this.storage.saveGroupMeta(groupId, nextState);
 
+    // Try joining immediately. Some senders (e.g. Emissary) embed the ratchet
+    // tree inside the Welcome bytes (RFC 9420 §12.4.3.3), so ratchetTree can be null.
+    // If a separate GroupInfo was already received, use its tree bytes.
+    // If joining fails because the tree is not embedded and no GroupInfo has arrived yet,
+    // we keep the saved welcome bytes and wait — _handleGroupInfo will complete the join.
+    const ratchetTree = nextState.ratchetTree ? Uint8Array.from(nextState.ratchetTree) : null;
     let finalGroupId = groupId;
-    if (nextState.ratchetTree) {
-      finalGroupId = await this._tryJoinGroup(actor, groupId, welcomeBytes, Uint8Array.from(nextState.ratchetTree), parsed, { wasJoined: !!state.joined });
+    try {
+      finalGroupId = await this._tryJoinGroup(actor, groupId, welcomeBytes, ratchetTree, parsed, { wasJoined: !!state.joined });
+    } catch (e) {
+      // Tree not embedded and no GroupInfo yet — wait for separate GroupInfo (old clients)
+      console.warn('[_handleWelcome] Could not join yet (no ratchet tree), waiting for GroupInfo:', e?.message ?? e);
     }
 
     return { type: 'welcome', groupId: finalGroupId };
@@ -1124,7 +1156,7 @@ export class ChatController {
     const membersToAdd = [actor.id];
     if (parsed.attributedTo) membersToAdd.push(parsed.attributedTo);
     await this.persistMembers(actualGroupId, membersToAdd);
-    // Seed sigKeys so device-level removal detection works after decommission
+    // Seed sigKeys + cache leaf signature keys (for endorsement verification) from ratchet tree
     await this._syncMembersFromMLS(actualGroupId, actor);
     await this._replenishKeyPackage(actor);
 
@@ -1180,7 +1212,20 @@ export class ChatController {
       const { content: rawContent, senderSignatureKey } = decrypted;
       let decryptedContent = typeof rawContent === 'object' ? rawContent : { content: rawContent };
 
-      if (parsed.attributedTo) {
+      // Unwrap Create — Emissary and other AP-MLS clients send Create{object: Note}.
+      // Merge: Create fields as base, inner object fields overwrite (so Note's id/type/content win
+      // but Create-only fields like `instrument` are preserved).
+      // Normalize attribution: keep attributedTo (UI expectation), drop actor.
+      const rawTypes0 = Array.isArray(decryptedContent.type) ? decryptedContent.type : [decryptedContent.type];
+      if (rawTypes0.includes('Create') && decryptedContent.object && typeof decryptedContent.object === 'object') {
+        const { object: innerObj, actor, ...createWrapper } = decryptedContent;
+        const merged = { ...createWrapper, ...innerObj };
+        if (!merged.attributedTo && actor) merged.attributedTo = actor;
+        delete merged.actor;
+        decryptedContent = merged;
+      }
+
+      if (!decryptedContent.attributedTo && parsed.attributedTo) {
         decryptedContent.attributedTo = parsed.attributedTo;
       }
 
@@ -1407,8 +1452,8 @@ export class ChatController {
       const { keyPackageHex, ciphersuite } = await this.mlsService.createKeyPackage(actor.id);
       const kpBytes = bytesFromInput(keyPackageHex);
       const kpB64 = bytesToBase64(kpBytes);
-      const mlsSignature = await this._signKeyPackage(actor.id, kpB64);
-      const published = await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage, ciphersuite);
+      const mlsSig = await this._signKeyPackage(actor.id, kpB64);
+      const published = await publishKeyPackage(actor, kpBytes, mlsSig, this.storage, ciphersuite);
       if (published) {
         await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
         localStorage.removeItem('actor');
@@ -1449,7 +1494,8 @@ export class ChatController {
         return { type: 'newDevicePending', fingerprint: ownFp?.fingerprint };
       }
 
-      const published = await publishKeyPackage(actor, kpBytes, null, this.storage, newCs);
+      const mlsSig = await this._signKeyPackage(actor.id, bytesToBase64(kpBytes)).catch(() => null);
+      const published = await publishKeyPackage(actor, kpBytes, mlsSig, this.storage, newCs);
       if (published) {
         await this.mlsService.markKeyPackagePublished(actor.id, newHex);
         localStorage.removeItem('actor');
@@ -1465,8 +1511,8 @@ export class ChatController {
 
     // Has key package but not published — self-sign and publish (replenishment)
     const kpBytes = bytesFromInput(keyPackageHex);
-    const mlsSignature = await this._signKeyPackage(actor.id, bytesToBase64(kpBytes));
-    const published = await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage, storedCs);
+    const mlsSig = await this._signKeyPackage(actor.id, bytesToBase64(kpBytes));
+    const published = await publishKeyPackage(actor, kpBytes, mlsSig, this.storage, storedCs);
     if (published) {
       await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
       localStorage.removeItem('actor');
@@ -1528,16 +1574,16 @@ export class ChatController {
       : allKps;
 
     if (candidates.length === 0) return null;
-    if (candidates.length === 1) return bytesFromInput(candidates[0].content);
+    if (candidates.length === 1) return { kpBytes: bytesFromInput(candidates[0].content), mlsSignature: candidates[0].mlsSignature, mlsSignerKeyId: candidates[0].mlsSignerKeyId };
 
     // Among matching candidates, pick one whose signature key isn't already in the group
     const fingerprints = await this.mlsService.getGroupFingerprints(ownActorId, groupId).catch(() => []);
     const existingSigKeys = new Set(fingerprints.map(fp => fp.signatureKey).filter(Boolean));
 
-    for (const { content } of candidates) {
+    for (const { content, mlsSignature, mlsSignerKeyId } of candidates) {
       const fp = await this.mlsService.getKeyPackageFingerprint(content).catch(() => null);
       if (!fp?.signatureKey || !existingSigKeys.has(fp.signatureKey)) {
-        return bytesFromInput(content);
+        return { kpBytes: bytesFromInput(content), mlsSignature: mlsSignature ?? null, mlsSignerKeyId: mlsSignerKeyId ?? null };
       }
     }
     return null;
@@ -1627,10 +1673,18 @@ export class ChatController {
     if (!recipientUri) throw new Error(`Could not resolve ${recipientMention}`);
 
     const groupCiphersuite = await this.storage.getGroupField(groupId, 'ciphersuite', null);
-    const kpBytes = await this._fetchKeyPackageForAdd(recipientUri, groupId, actor.id);
-    if (!kpBytes) {
+    const kpResult = await this._fetchKeyPackageForAdd(recipientUri, groupId, actor.id);
+    if (!kpResult) {
       const suiteInfo = groupCiphersuite != null ? ` (requires ciphersuite 0x${groupCiphersuite.toString(16).padStart(4, '0')})` : '';
       throw new Error(`No compatible KeyPackage for ${recipientUri}${suiteInfo}`);
+    }
+    const { kpBytes, mlsSignature, mlsSignerKeyId } = kpResult;
+
+    // Verify endorsement before consuming the KP. Unverified KPs must not be silently added.
+    const kpB64 = bytesToBase64(kpBytes);
+    const endorsed = await this._verifyKpEndorsement(kpB64, { mlsSignature, mlsSignerKeyId });
+    if (!endorsed) {
+      return { pending: true, reason: 'unverified_kp', kpB64, recipientUri, mlsSignature, mlsSignerKeyId };
     }
 
     const { welcome, ratchetTree, commit } = await this.mlsService.addMember(actor.id, groupId, kpBytes);
@@ -1676,35 +1730,48 @@ export class ChatController {
     const actorUri = kpObj?.attributedTo || activity.actor;
     if (!kpB64 || !actorUri) return;
 
-    // Valid signers: live MLS device keys for this actor, from MLS group state only.
-    // Never use server-fetched keys — that would let a malicious server endorse any KP.
-    const validSigners = await this._getLiveDeviceKeysForActor(actorUri);
+    const sig = activity.mlsSignature;
+    const signerKeyId = activity.mlsSignerKeyId;
 
-    const sig = activity.mlsSignature; // bare base64 signature string
-    if (!sig) {
-      if (validSigners.length > 0) {
-        console.warn('[_handleKeyPackageAdd] No mlsSignature on Add from', actorUri, '— rejecting (known devices exist)');
+    if (sig && signerKeyId) {
+      // Direct cache lookup — no iteration, never trust server-fetched keys
+      const signerKey = await this.storage.getMlsKnownKey(signerKeyId);
+      if (!signerKey) {
+        console.warn('[_handleKeyPackageAdd] mlsSignerKeyId not in local cache for', actorUri, '— KP needs out-of-band verification');
         return;
       }
-      console.log('[_handleKeyPackageAdd] Unsigned Add accepted for', actorUri, '(no live known devices)');
-    } else {
-      // Try each known key — receiver iterates independently, signer identity is not trusted from wire
-      let verified = false;
-      for (const key of validSigners) {
-        try {
-          if (await this.mlsService.verifySignature(key, kpB64, sig)) {
-            verified = true;
-            break;
-          }
-        } catch (e) {
-          console.log("Invalid base64 or parse error — treat as failed verification, try next key")
-        }
-      }
+      const verified = await this.mlsService.verifySignature(signerKey, mlsEndorsementPayload(kpB64), sig).catch(() => false);
       if (!verified) {
         console.warn('[_handleKeyPackageAdd] mlsSignature verification failed for', actorUri, '— rejecting KP');
         return;
       }
       console.log('[_handleKeyPackageAdd] KP verified for', actorUri);
+    } else if (sig && !signerKeyId) {
+      // Legacy: no signerKeyId, try live group state keys (backward compat with old clients)
+      const validSigners = await this._getLiveDeviceKeysForActor(actorUri);
+      if (validSigners.length > 0) {
+        let verified = false;
+        for (const key of validSigners) {
+          try {
+            if (await this.mlsService.verifySignature(key, mlsEndorsementPayload(kpB64), sig)) {
+              verified = true;
+              break;
+            }
+          } catch { /* try next */ }
+        }
+        if (!verified) {
+          console.warn('[_handleKeyPackageAdd] Legacy mlsSignature verification failed for', actorUri, '— rejecting KP');
+          return;
+        }
+      }
+    } else {
+      // Unsigned — only accept if no known devices for this actor (first device case)
+      const liveKeys = await this._getLiveDeviceKeysForActor(actorUri);
+      if (liveKeys.length > 0) {
+        console.warn('[_handleKeyPackageAdd] Unsigned Add from', actorUri, '— rejecting (known devices exist)');
+        return;
+      }
+      console.log('[_handleKeyPackageAdd] Unsigned Add accepted for', actorUri, '(no known devices)');
     }
     await this.storage.saveUserField(actorUri, 'keyPackage', kpB64);
 
@@ -1820,14 +1887,28 @@ export class ChatController {
   }
 
   /**
+   * Verify the endorsement on a KP. Returns true if endorsed+verified, false otherwise.
+   * @param {string} kpB64 - base64 KP content
+   * @param {{mlsSignature, mlsSignerKeyId}} endorsement - from AP activity or KP object
+   */
+  async _verifyKpEndorsement(kpB64, { mlsSignature, mlsSignerKeyId } = {}) {
+    if (!mlsSignature || !mlsSignerKeyId) return false;
+    const signerKey = await this.storage.getMlsKnownKey(mlsSignerKeyId);
+    if (!signerKey) return false;
+    return this.mlsService.verifySignature(signerKey, mlsEndorsementPayload(kpB64), mlsSignature).catch(() => false);
+  }
+
+  /**
    * Sign a KeyPackage's base64 content with the user's MLS private signature key.
    * Returns a bare base64 signature string, or null if signing is unavailable.
    * Receivers iterate their own MLS-known keys to verify — the signer identity is not transmitted.
    */
   async _signKeyPackage(userId, kpB64) {
     try {
-      const result = await this.mlsService.signData(userId, kpB64);
-      return result?.signature || null;
+      const result = await this.mlsService.signData(userId, mlsEndorsementPayload(kpB64));
+      if (!result?.signature) return null;
+      const signerKeyId = await this.storage.saveMlsKnownKey(userId, result.signerKey);
+      return { signature: result.signature, signerKeyId };
     } catch (e) {
       console.warn('[_signKeyPackage] Signing not available:', e);
       return null;
@@ -1845,10 +1926,10 @@ export class ChatController {
     const kpBytes = bytesFromInput(kpB64);
 
     // Sign the KP content with ExistingDeviceA's MLS key — this is the endorsement
-    const mlsSignature = await this._signKeyPackage(actor.id, kpB64);
+    const mlsSig = await this._signKeyPackage(actor.id, kpB64);
 
     // Publish to public keyPackages collection (endorsed by ExistingDeviceA's MLS signature)
-    await publishKeyPackage(actor, kpBytes, mlsSignature, this.storage);
+    await publishKeyPackage(actor, kpBytes, mlsSig, this.storage);
 
     // Add to all existing groups
     const groups = await this.storage.listGroupsWithLastMessage();

@@ -53,12 +53,11 @@ export async function deleteGroup(userId, groupId) {
 }
 
 export async function joinGroup(userId, groupId, welcomeBytes, ratchetTreeBytes) {
-  const result = await invoke('plugin:openmls|join_group', {
-    userId,
-    groupId,
-    welcomeB64: uint8ToBase64(welcomeBytes),
-    ratchetTreeB64: uint8ToBase64(ratchetTreeBytes),
-  });
+  const args = { userId, groupId, welcomeB64: uint8ToBase64(welcomeBytes) };
+  // ratchetTreeBytes is optional: when absent, OpenMLS reads the tree from the
+  // Welcome's embedded ratchet_tree extension (spec-compliant clients like Emissary).
+  if (ratchetTreeBytes) args.ratchetTreeB64 = uint8ToBase64(ratchetTreeBytes);
+  const result = await invoke('plugin:openmls|join_group', args);
   // Return the actual MLS group_id (sender's ULID) from the Welcome
   return result.groupId;
 }

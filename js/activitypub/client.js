@@ -288,7 +288,7 @@ export async function fetchAllActorKeyPackages(actorUri) {
     const ciphersuite = typeof cs === 'string'
       ? (() => { const id = mlsCiphersuiteIdFromName(cs); return id != null ? { identifier: id, name: cs } : null; })()
       : (cs ?? null);
-    return { content: kp.content, ciphersuite, actor };
+    return { content: kp.content, ciphersuite, mlsSignature: kp.mlsSignature ?? null, mlsSignerKeyId: kp.mlsSignerKeyId ?? null, actor };
   });
 }
 

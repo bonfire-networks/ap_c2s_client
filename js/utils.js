@@ -13,6 +13,36 @@ export function bytesToHex(bytes) {
   return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 }
 
+/**
+ * Derive a stable short ID from an MLS signature public key (base64-encoded).
+ * Result is base64url(SHA-256(rawKeyBytes).slice(0, 12)) — 16 chars, no URI prefix.
+ * Used as mlsSignerKeyId in Add activities and as the cache key in mlsKnownKeys.
+ * @param {string} sigKeyB64 - base64-encoded MLS signature public key
+ * @returns {Promise<string>}
+ */
+export async function mlsKeyId(sigKeyB64) {
+  const rawBytes = base64ToBytes(sigKeyB64);
+  const hashBuf = await crypto.subtle.digest('SHA-256', rawBytes);
+  const hash = new Uint8Array(hashBuf).slice(0, 12);
+  return bytesToBase64(hash).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+/**
+ * Build the canonical signing input for a KP endorsement signature.
+ * Returns base64(UTF8("mlsKeyPackageEndorsement:") || kp_tls_bytes).
+ * Both signer and verifier must call this with the same kpB64.
+ * @param {string} kpB64 - base64-encoded KP TLS bytes
+ * @returns {string} base64-encoded labeled payload
+ */
+export function mlsEndorsementPayload(kpB64) {
+  const labelBytes = new TextEncoder().encode('mlsKeyPackageEndorsement:');
+  const kpBytes = base64ToBytes(kpB64);
+  const combined = new Uint8Array(labelBytes.length + kpBytes.length);
+  combined.set(labelBytes, 0);
+  combined.set(kpBytes, labelBytes.length);
+  return bytesToBase64(combined);
+}
+
 export function bytesToBase64(bytes) {
   if (!bytes) {
     console.warn('bytesToBase64: input is required', bytes);

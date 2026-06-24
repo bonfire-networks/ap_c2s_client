@@ -15,7 +15,12 @@ import { postToOutbox, fetchActorKeyPackage, resolveCollectionItems, resolveKeyP
 
 const MLS_CONTEXTS = [
   'https://www.w3.org/ns/activitystreams',
-  'https://purl.archive.org/socialweb/mls'
+  'https://purl.archive.org/socialweb/mls',
+  // Extension terms for KP endorsement (not yet in the MLS AP spec)
+  {
+    'mlsSignature': 'https://purl.archive.org/socialweb/mls#Signature',
+    'mlsSignerKeyId': 'https://purl.archive.org/socialweb/mls#SignerKeyId',
+  }
 ];
 
 // /**
@@ -80,7 +85,11 @@ export async function sendMLSControl(actor, type, contentB64, recipients, contex
  * @param {string|null} mlsSignature - optional base64 MLS signature
  * @returns {boolean} true if published successfully
  */
-export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = null, storage = null, ciphersuite = null) {
+export async function publishKeyPackage(actor, keyPackageBytes, mlsSig = null, storage = null, ciphersuite = null) {
+  // mlsSig: null | string (bare signature, legacy) | { signature, signerKeyId }
+  const mlsSignature = mlsSig?.signature ?? (typeof mlsSig === 'string' ? mlsSig : null);
+  const mlsSignerKeyId = mlsSig?.signerKeyId ?? null;
+
   const kpB64 = bytesToBase64(keyPackageBytes);
 
   const keyPackageObj = {
@@ -95,6 +104,7 @@ export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = n
     generator: { type: 'Application', name: 'Bonfire MLS client' },
   };
   if (mlsSignature) keyPackageObj.mlsSignature = mlsSignature;
+  if (mlsSignerKeyId) keyPackageObj.mlsSignerKeyId = mlsSignerKeyId;
 
   // Step 1: Create the KeyPackage object so the server assigns it an id URL
   const createRes = await postToOutbox(actor, {
@@ -115,6 +125,7 @@ export async function publishKeyPackage(actor, keyPackageBytes, mlsSignature = n
   if (collectionUrl) {
     const addActivity = { type: 'Add', actor: actor.id, to: 'as:Public', object: kpRef, target: collectionUrl };
     if (mlsSignature) addActivity.mlsSignature = mlsSignature;
+    if (mlsSignerKeyId) addActivity.mlsSignerKeyId = mlsSignerKeyId;
     const addRes = await postToOutbox(actor, addActivity, storage);
     if (addRes?.ok) return true;
     // Fall through to Update if Add failed
@@ -310,8 +321,8 @@ export function parseMLSActivity(activity) {
 
   const content = obj.content ?? obj["mls:content"];
   const encoding = obj.encoding ?? obj["mls:encoding"];
+  const types = Array.isArray(obj.type) ? obj.type : [obj.type];
   if (!content || !encoding || encoding !== 'base64') {
-    const types = Array.isArray(obj.type) ? obj.type : [obj.type];
     console.log('[parseMLSActivity] Rejected: missing content/encoding', { types, hasContent: !!content, encoding, id: obj.id || activity?.id });
     return null;
   }
@@ -324,7 +335,6 @@ export function parseMLSActivity(activity) {
   else if (hasType(obj, 'PrivateMessage')) type = 'PrivateMessage';
   else if (hasType(obj, 'PublicMessage')) type = 'PublicMessage';
   else {
-    const types = Array.isArray(obj.type) ? obj.type : [obj.type];
     console.log('[parseMLSActivity] Rejected: unknown MLS type', { types, id: obj.id || activity?.id });
     return null;
   }

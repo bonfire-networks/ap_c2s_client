@@ -109,15 +109,17 @@ export class MLSService {
   }
 
   /**
-   * Join a group from received Welcome and RatchetTree.
+   * Join a group from received Welcome and optional RatchetTree.
+   *
+   * ratchetTreeBytes may be null/undefined when the Welcome embeds the ratchet tree
+   * via the ratchet_tree extension (RFC 9420 §12.4.3.3)
    *
    * @param {string} userId - actor ID
    * @param {string} groupId - group identifier
    * @param {Uint8Array} welcomeBytes - Welcome message
-   * @param {Uint8Array} ratchetTreeBytes - RatchetTree bytes
-   * @param {object} [metadata] - additional metadata to save (members, etc.)
+   * @param {Uint8Array|null} [ratchetTreeBytes] - RatchetTree bytes, or null if embedded in Welcome
    */
-  async joinFromWelcome(userId, groupId, welcomeBytes, ratchetTreeBytes) {
+  async joinFromWelcome(userId, groupId, welcomeBytes, ratchetTreeBytes = null) {
     // Backend returns the actual MLS group_id (sender's ULID) from the Welcome
     const actualGroupId = await this.backend.joinGroup(userId, groupId, welcomeBytes, ratchetTreeBytes);
     await this.persistBackendState(userId);

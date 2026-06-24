@@ -1667,7 +1667,9 @@ export class E2EEChatView extends LitElement {
     panel.currentActorId = this.currentActorId;
     panel.addEventListener('close', () => panel.remove());
     panel.addEventListener('settings-changed', (e) => { this[`_${e.detail.key}`] = e.detail.value; });
-    this.shadowRoot.appendChild(panel);
+    // Append to document.body so position:fixed is relative to viewport, not
+    // clipped by e2ee-chat-view's overflow:hidden shadow root.
+    document.body.appendChild(panel);
   }
 
   /**

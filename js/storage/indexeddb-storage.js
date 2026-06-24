@@ -4,7 +4,7 @@
  */
 
 import { Dexie } from 'dexie';
-import { messageUri } from '../utils.js';
+import { messageUri, mlsKeyId } from '../utils.js';
 
 function _openDb(dbName) {
   const instance = new Dexie(dbName);
@@ -52,6 +52,13 @@ function _openDb(dbName) {
     users: 'id',
     messages: 'id, groupId, timestamp, isLocal, apId',
     processedActivityIds: '++id, [actorId+activityId]'
+  });
+  instance.version(5).stores({
+    groups: 'id, apId',
+    users: 'id',
+    messages: 'id, groupId, timestamp, isLocal, apId',
+    processedActivityIds: '++id, [actorId+activityId]',
+    mlsKnownKeys: 'keyId, actorId'
   });
   return instance;
 }
@@ -215,6 +222,7 @@ export async function getGroupField(id, field, defaultValue = null) {
 }
 
 export async function getGroupByField(field, value) {
+  if (value == null) return null;
   const rec = await db.table('groups').where(field).equals(value).first();
   return rec ? rec.id : null;
 }
@@ -357,6 +365,36 @@ export async function loadUserState(userId) {
   return rec ? rec.state : null;
 }
 
+// ──────────────────────────────────────────────
+// MLS known signature keys cache
+// ──────────────────────────────────────────────
+
+/**
+ * Cache an MLS signature key for an actor. Returns the derived mlsSignerKeyId.
+ * Idempotent — safe to call multiple times with the same key.
+ * @param {string} actorId
+ * @param {string} sigKeyB64 - base64-encoded MLS SignaturePublicKey
+ * @returns {Promise<string>} keyId (mlsSignerKeyId)
+ */
+export async function saveMlsKnownKey(actorId, sigKeyB64) {
+  const keyId = await mlsKeyId(sigKeyB64);
+  const existing = await db.table('mlsKnownKeys').get(keyId);
+  if (!existing) {
+    await db.table('mlsKnownKeys').put({ keyId, actorId, sigKeyB64, firstSeen: Date.now() });
+  }
+  return keyId;
+}
+
+/**
+ * Look up a cached MLS signature key by its derived ID.
+ * @param {string} keyId - mlsSignerKeyId (base64url SHA-256 prefix)
+ * @returns {Promise<string|null>} base64-encoded SignaturePublicKey, or null
+ */
+export async function getMlsKnownKey(keyId) {
+  const rec = await db.table('mlsKnownKeys').get(keyId);
+  return rec?.sigKeyB64 ?? null;
+}
+
 export async function clearUserKeyData(userId) {
   const state = await loadUserState(userId);
   if (state) {
@@ -402,6 +440,7 @@ export async function markProcessed(actorId, activityId) {
 }
 
 export async function isProcessed(actorId, activityId) {
+  if (actorId == null || activityId == null) return false;
   const found = await db.table('processedActivityIds')
     .where({ actorId, activityId }).first();
   return !!found;

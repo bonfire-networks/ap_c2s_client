@@ -150,6 +150,26 @@
 // clearUserKeyData(userId)
 
 // ──────────────────────────────────────────────
+// MLS known signature keys cache
+// ──────────────────────────────────────────────
+
+/**
+ * Cache an MLS signature key for an actor. Returns the derived mlsSignerKeyId.
+ * Idempotent — safe to call multiple times with the same key.
+ * @param {string} actorId
+ * @param {string} sigKeyB64 - base64-encoded MLS SignaturePublicKey
+ * @returns {Promise<string>} keyId (mlsSignerKeyId)
+ */
+// saveMlsKnownKey(actorId, sigKeyB64)
+
+/**
+ * Look up a cached MLS signature key by its derived ID (mlsSignerKeyId).
+ * @param {string} keyId
+ * @returns {Promise<string|null>} base64-encoded SignaturePublicKey, or null
+ */
+// getMlsKnownKey(keyId)
+
+// ──────────────────────────────────────────────
 // Activity deduplication
 // ──────────────────────────────────────────────
 

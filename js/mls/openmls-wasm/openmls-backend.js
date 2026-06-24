@@ -191,7 +191,9 @@ export async function joinGroup(userId, groupId, welcomeBytes, ratchetTreeBytes)
     return groupId;
   }
 
-  const ratchetTree = wasm.RatchetTree.from_bytes(ratchetTreeBytes);
+  // ratchetTreeBytes is optional: when null/undefined, pass null so the WASM layer
+  // reads the tree from the Welcome's embedded ratchet_tree extension.
+  const ratchetTree = ratchetTreeBytes ? wasm.RatchetTree.from_bytes(ratchetTreeBytes) : null;
   const group = wasm.Group.join(provider, welcomeBytes, ratchetTree);
 
   // Extract actual MLS group_id (sender's ULID) from the joined group
