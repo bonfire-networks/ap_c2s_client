@@ -200,11 +200,11 @@ export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
   const kpField = actor.keyPackages || actor["mls:keyPackages"];
   const collectionUrl = typeof kpField === 'string' ? kpField : kpField?.id;
 
-  // Fetch collection items once — used for URL lookup AND the Update rebuild.
-  const allItems = kpField ? await resolveCollectionItems(kpField).catch(() => []) : [];
+  // resolveKeyPackageList fetches URL-string items so we can match by content and get the id.
+  const allItems = kpField ? await resolveKeyPackageList(kpField).catch(() => []) : [];
   const kpObjectUrl = allItems.reduce((found, item) => {
     if (found) return found;
-    const content = typeof item === 'string' ? null : (item?.content ?? item?.['mls:content']);
+    const content = item?.content ?? item?.['mls:content'];
     return content === kpB64 ? (item?.id ?? null) : null;
   }, null);
 

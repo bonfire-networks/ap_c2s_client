@@ -1073,7 +1073,14 @@ export class ChatController {
     const ratchetTree = nextState.ratchetTree ? Uint8Array.from(nextState.ratchetTree) : null;
     let finalGroupId = groupId;
     try {
-      finalGroupId = await this._tryJoinGroup(actor, groupId, welcomeBytes, ratchetTree, parsed, { wasJoined: !!state.joined });
+      // If we were removed or left intentionally, the Rust MLS state was already deleted by
+      // _syncMembersFromMLS / leaveGroup. The first joinFromWelcome is genuine — don't delete+retry.
+      // noLongerMember/left are stored at the IndexedDB record's top level (via setGroupField),
+      // not inside rec.state — so we must read them via getGroupField, not via loadGroupMeta.
+      const _nlm = state.noLongerMember || await this.storage.getGroupField(groupId, 'noLongerMember', false);
+      const _left = state.left || await this.storage.getGroupField(groupId, 'left', false);
+      const wasJoined = !!state.joined && !_nlm && !_left;
+      finalGroupId = await this._tryJoinGroup(actor, groupId, welcomeBytes, ratchetTree, parsed, { wasJoined });
     } catch (e) {
       // Tree not embedded and no GroupInfo yet — wait for separate GroupInfo (old clients)
       console.warn('[_handleWelcome] Could not join yet (no ratchet tree), waiting for GroupInfo:', e?.message ?? e);
@@ -1097,7 +1104,10 @@ export class ChatController {
 
     let finalGroupId = groupId;
     if (nextState.welcome) {
-      finalGroupId = await this._tryJoinGroup(actor, groupId, Uint8Array.from(nextState.welcome), ratchetTreeBytes, parsed, { wasJoined: !!state.joined });
+      const _nlm = state.noLongerMember || await this.storage.getGroupField(groupId, 'noLongerMember', false);
+      const _left = state.left || await this.storage.getGroupField(groupId, 'left', false);
+      const wasJoined = !!state.joined && !_nlm && !_left;
+      finalGroupId = await this._tryJoinGroup(actor, groupId, Uint8Array.from(nextState.welcome), ratchetTreeBytes, parsed, { wasJoined });
     }
 
     return { type: 'groupinfo', groupId: finalGroupId };
@@ -1145,7 +1155,7 @@ export class ChatController {
     if (actualGroupId !== groupId) {
       console.log('[_tryJoinGroup] Migrating group:', groupId, '→', actualGroupId);
       const oldMeta = (await this.storage.loadGroupMeta(groupId)) || {};
-      const { welcome, ratchetTree, ...rest } = oldMeta;
+      const { welcome, ratchetTree, noLongerMember, left, ...rest } = oldMeta;
       await this.storage.saveGroupMeta(actualGroupId, { ...rest, joined: true });
       // Store URI→ULID mapping so future activities resolve correctly (only if it's actually a URI)
       if (isApUri(groupId)) {
@@ -1154,11 +1164,15 @@ export class ChatController {
       // Clean up temporary group record
       await this.storage.deleteGroupMeta(groupId);
     } else {
-      // Same ID — just mark as joined and clear consumed join tokens
+      // Same ID — just mark as joined and clear consumed join tokens.
+      // Also clear noLongerMember/left: a re-invite means we are a member again.
       const meta = (await this.storage.loadGroupMeta(groupId)) || {};
-      const { welcome, ratchetTree, ...rest } = meta;
+      const { welcome, ratchetTree, noLongerMember, left, ...rest } = meta;
       await this.storage.saveGroupMeta(groupId, { ...rest, joined: true });
     }
+    // Clear top-level re-invite flags on the canonical group (stored via setGroupField, not in rec.state).
+    await this.storage.setGroupField(actualGroupId, 'noLongerMember', false);
+    await this.storage.setGroupField(actualGroupId, 'left', false);
 
     const membersToAdd = [actor.id];
     if (parsed.attributedTo) membersToAdd.push(parsed.attributedTo);
@@ -1410,6 +1424,7 @@ export class ChatController {
       if (e instanceof EncryptionLostError) {
         const meta = await this.storage.loadGroupMeta(groupId).catch(() => null) || {};
         if (meta.noLongerMember || meta.left) return null;
+        // TODO: should we flag raise ^ in test env in order to flag when sending messages to a member who has left the group? 
       }
       const errStr = typeof e === 'string' ? e : (e.message || String(e));
       // MLS can't decrypt messages we sent ourselves — skip silently
@@ -2201,13 +2216,14 @@ export class ChatController {
     const result = await this.mlsService.leaveGroup(actor.id, groupId);
     if (result?.cancelled) return result;
 
-    // Mark as no longer a member BEFORE distributing the commit so any concurrent pollInbox
-    // call sees the flag and won't race loadMessages into showing "Encryption keys lost".
+    // Delete local MLS state and mark non-member BEFORE distributing so that any concurrent
+    // pollInbox call hits found=false (safe EncryptionLostError path) rather than the
+    // PendingProposal state left by mlsService.leaveGroup, which can panic in OpenMLS.
+    await this.mlsService.deleteGroup(actor.id, groupId);
     await this.storage.setGroupField(groupId, 'noLongerMember', true);
 
     // Notify remaining members. Include own actor so co-devices (same actor, different device)
-    // receive the self-remove Proposal via the shared inbox. D1 re-receiving its own proposal
-    // is harmless — the group will be deleted below, so decryption fails and _handleProposal returns early.
+    // receive the self-remove Proposal via the shared inbox.
     const allMembers = await this.getGroupMembers(groupId);
     const remaining = [...new Set([...allMembers.filter(id => id !== actor.id), actor.id])];
     try {
@@ -2215,9 +2231,6 @@ export class ChatController {
     } catch (e) {
       console.warn('[leaveGroup] Failed to distribute commit:', e);
     }
-
-    // Only delete MLS crypto state — preserve message history
-    await this.mlsService.deleteGroup(actor.id, groupId);
     await this._insertSystemMessage(groupId, 'You left this group.');
 
     return { left: true };
