@@ -711,15 +711,17 @@ export class E2EEChatView extends LitElement {
           } else if (r.type === 'coDeviceLeaveResolved') {
             this.shadowRoot.querySelector('dialog[data-nd-leaving]')?.remove();
           } else if (r.type === 'newDeviceRequest' || r.type === 'newDevicePending') {
-            // A device awaiting approval is itself the "new" device — it must not be asked to
-            // approve other (existing) devices whose KPs it hasn't seen before.
-            if (r.type === 'newDeviceRequest' && this.controller._awaitingApproval) {
+            if ((this._autoApproveNewDevice || window.__e2ee_autoApproveNewDevice) && r.kpB64) {
+              // Auto-approve takes priority — even if our own approval is pending, explicitly
+              // approving a co-device (test mode) should not be suppressed.
+              this.shadowRoot.querySelector('#nd-request-dialog')?.remove();
+              await this.controller.approveNewDevice(r.kpB64).catch(e => console.error('[autoApprove]', e));
+              this.shadowRoot.querySelector('#nd-request-dialog')?.remove();
+            } else if (r.type === 'newDeviceRequest' && this.controller._awaitingApproval) {
+              // A device awaiting approval is itself the "new" device — it must not be asked to
+              // approve other (existing) devices whose KPs it hasn't seen before.
               // Suppress: our own approval is pending, so any incoming request is from an
               // existing trusted device. Skip the approval dialog entirely.
-            } else if ((this._autoApproveNewDevice || window.__e2ee_autoApproveNewDevice) && r.kpB64) {
-              this.shadowRoot.querySelector('#nd-request-dialog')?.remove(); // dismiss any existing dialog
-              await this.controller.approveNewDevice(r.kpB64).catch(e => console.error('[autoApprove]', e));
-              this.shadowRoot.querySelector('#nd-request-dialog')?.remove(); // remove dialog if it appeared during approve
             } else {
               this._showDeviceConfirmation(r);
             }

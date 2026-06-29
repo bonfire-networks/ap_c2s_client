@@ -200,8 +200,13 @@ export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
   const kpField = actor.keyPackages || actor["mls:keyPackages"];
   const collectionUrl = typeof kpField === 'string' ? kpField : kpField?.id;
 
-  // Find the KP object's AP ID by matching content (lazy, early-exit)
-  const kpObjectUrl = kpField ? await findKeyPackageUrl(kpField, kpB64) : null;
+  // Fetch collection items once — used for URL lookup AND the Update rebuild.
+  const allItems = kpField ? await resolveCollectionItems(kpField).catch(() => []) : [];
+  const kpObjectUrl = allItems.reduce((found, item) => {
+    if (found) return found;
+    const content = typeof item === 'string' ? null : (item?.content ?? item?.['mls:content']);
+    return content === kpB64 ? (item?.id ?? null) : null;
+  }, null);
 
   // Try Remove + Delete if the actor exposes a collection URL
   if (collectionUrl) {
@@ -214,7 +219,6 @@ export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
       target: collectionUrl,
     }, storage);
     if (removeRes?.ok) {
-      // Delete the object itself (spec §2.2: Remove then Delete)
       if (kpObjectUrl) {
         await postToOutbox(actor, {
           '@context': MLS_CONTEXTS,
@@ -226,10 +230,10 @@ export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
       }
       return true;
     }
-    // Fall through to Update if Remove failed
+    // Fall through to Update if Remove failed (e.g. server doesn't support Remove on this collection)
   }
 
-  // Delete the object itself if we know its URL, then Update the inline Collection
+  // Delete the object itself if we know its URL
   if (kpObjectUrl) {
     await postToOutbox(actor, {
       '@context': MLS_CONTEXTS,
@@ -240,7 +244,7 @@ export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
     }, storage);
   }
 
-  // Update: rebuild the inline Collection minus the removed KP
+  // Update: rebuild the Collection minus the removed KP
   const remaining = allItems.filter(item => {
     const content = typeof item === 'string' ? null : (item?.content ?? item?.["mls:content"]);
     const id = typeof item === 'string' ? item : item?.id;
