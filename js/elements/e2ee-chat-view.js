@@ -1,4 +1,5 @@
 import { html, css, LitElement } from 'lit'
+import { unsafeHTML } from 'lit/directives/unsafe-html.js'
 import { relativeTime, formatFileSize } from '../utils.js'
 import { ChatController, EncryptionLostError, groupDeliveryByActor } from '../chat-controller.js'
 import { MLSService } from '../mls/mls-service.js'
@@ -382,7 +383,7 @@ export class E2EEChatView extends LitElement {
       } catch (dbErr) {
         const msg = `Local chat database is corrupted and cannot be opened.\n\n${dbErr}\n\nYour account and encryption keys are not affected.`;
         if (window.__TAURI__?.core?.invoke) {
-          await window.__TAURI__.core.invoke('show_crash_dialog', { message: msg });
+          await window.__TAURI__.core.invoke('show_crash_dialog', { message: msg, isDbCorruption: true });
         } else {
           alert(msg);
         }
@@ -710,12 +711,26 @@ export class E2EEChatView extends LitElement {
           } else if (r.type === 'coDeviceLeaveResolved') {
             this.shadowRoot.querySelector('dialog[data-nd-leaving]')?.remove();
           } else if (r.type === 'newDeviceRequest' || r.type === 'newDevicePending') {
-            this._showDeviceConfirmation(r);
+            // A device awaiting approval is itself the "new" device — it must not be asked to
+            // approve other (existing) devices whose KPs it hasn't seen before.
+            if (r.type === 'newDeviceRequest' && this.controller._awaitingApproval) {
+              // Suppress: our own approval is pending, so any incoming request is from an
+              // existing trusted device. Skip the approval dialog entirely.
+            } else if ((this._autoApproveNewDevice || window.__e2ee_autoApproveNewDevice) && r.kpB64) {
+              this.shadowRoot.querySelector('#nd-request-dialog')?.remove(); // dismiss any existing dialog
+              await this.controller.approveNewDevice(r.kpB64).catch(e => console.error('[autoApprove]', e));
+              this.shadowRoot.querySelector('#nd-request-dialog')?.remove(); // remove dialog if it appeared during approve
+            } else {
+              this._showDeviceConfirmation(r);
+            }
           } else if (r.type === 'newDeviceApproved' || r.type === 'welcome' || r.type === 'groupinfo') {
             // Approved (no-groups case) or joined a group — close pending dialog only if
-            // approval actually completed (not a Welcome for a different co-device's KP)
+            // approval actually completed (not a Welcome for a different co-device's KP).
+            // Also close request dialog: if another device approved the pending new device,
+            // we no longer need to show the approval request on this device either.
             if (!this.controller._awaitingApproval) {
               this.shadowRoot.querySelector('#nd-pending-dialog')?.remove();
+              this.shadowRoot.querySelector('#nd-request-dialog')?.remove();
             }
           }
         }
@@ -743,7 +758,15 @@ export class E2EEChatView extends LitElement {
 
   _showDeviceConfirmation({ fingerprint, kpB64, isLeaving = false, groupId = null, proposalActivityId = null }) {
     const isPending = !kpB64 && !isLeaving;
+    // Auto-approve: skip dialog and directly approve (used in tests to bypass @proposal UX).
+    // Also checks window.__e2ee_autoApproveNewDevice so the flag can be set before element init.
+    if ((this._autoApproveNewDevice || window.__e2ee_autoApproveNewDevice) && kpB64 && !isLeaving) {
+      this.shadowRoot.querySelector('#nd-request-dialog')?.remove();
+      this.controller.approveNewDevice(kpB64).catch(e => console.error('[autoApprove]', e));
+      return;
+    }
     if (isPending && this.shadowRoot.querySelector('#nd-pending-dialog')) return; // already showing
+    if (!isPending && !isLeaving && this.shadowRoot.querySelector('#nd-request-dialog')) return; // already showing
     if (isLeaving && this.shadowRoot.querySelector('dialog[data-nd-leaving]')) return; // already showing
     const emojiStr = Array.isArray(fingerprint) ? fingerprint.map(e => e.emoji).join(' ') : (fingerprint || '');
 
@@ -768,6 +791,7 @@ export class E2EEChatView extends LitElement {
 
     const dialog = document.createElement('dialog');
     if (isPending) dialog.id = 'nd-pending-dialog';
+    if (!isPending && !isLeaving) dialog.id = 'nd-request-dialog';
     if (isLeaving) dialog.dataset.ndLeaving = 'true';
     dialog.className = 'modal modal-open';
     dialog.innerHTML = `
@@ -2208,8 +2232,14 @@ export class E2EEChatView extends LitElement {
     const isOwnMsg = msg.isLocal || msg.attributedTo === this.currentActorId;
     const isEditing = this._editingId === msg.id;
     const isMediaType = ['Image', 'Audio', 'Video', 'Document'].includes(msg.type);
+    // For media types, content IS the binary data (not a text body) — always render without bubble
+    const isMediaOnly = isMediaType && !msg.attachment?.length;
 
-    const bubble = html`
+    const bubble = isMediaOnly
+      ? (this._attachmentsReady
+          ? this._renderMediaObject(msg, { msg, isOwn: isOwnMsg, isTopLevel: true })
+          : html`<div class="w-32 h-24 rounded-lg bg-base-300 mt-1"></div>`)
+      : html`
       <div class="chat-bubble text-sm py-2 px-3" style="--bubble-bg:color-mix(in srgb,${color} 15%,var(--color-base-200,#f0f0f0))">
         ${hasSummary ? html`
           <div class="italic text-xs opacity-80 mb-1">${msg.summary}</div>
@@ -2226,7 +2256,7 @@ export class E2EEChatView extends LitElement {
             <button class="btn btn-ghost btn-xs" @click=${() => { this._editingId = null; this.requestUpdate(); }}>Cancel</button>
           </div>
         ` : html`
-          ${isMediaType ? (this._attachmentsReady ? this._renderMediaObject(msg, { msg, isOwn: isOwnMsg, isTopLevel: true }) : html`<div class="w-32 h-24 rounded-lg bg-base-300"></div>`) : (!hasSummary || showContent ? html`<span>${msg.content}</span>` : '')}
+          ${isMediaType ? (this._attachmentsReady ? this._renderMediaObject(msg, { msg, isOwn: isOwnMsg, isTopLevel: true }) : html`<div class="w-32 h-24 rounded-lg bg-base-300"></div>`) : (!hasSummary || showContent ? html`<span>${unsafeHTML(msg.content || '')}</span>` : '')}
           ${(!isMediaType && msg.attachment?.length && this._attachmentsReady) ? html`<div class="flex flex-wrap gap-2 mt-1">${msg.attachment.map(att => this._renderMediaObject(att, { msg, isOwn: isOwnMsg }))}</div>` : ''}
         `}
       </div>

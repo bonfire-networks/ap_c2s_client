@@ -141,9 +141,9 @@ export class MLSService {
    * Persists ratchet tree metadata after encryption (ratchet advances).
    */
   async encrypt(userId, groupId, plaintext, attachmentIds = []) {
-    const pendingId = await this.backend.encrypt(userId, groupId, plaintext, attachmentIds);
+    const result = await this.backend.encrypt(userId, groupId, plaintext, attachmentIds);
     await this._persistAfterGroupOp(userId, groupId);
-    return pendingId;
+    return result; // { pendingId, plaintext: sanitizedJsonString }
   }
 
   /**

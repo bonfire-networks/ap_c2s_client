@@ -11,7 +11,7 @@
 
 import { bytesToBase64, bytesFromInput, hasType } from '../utils.js';
 import { apFetch } from './auth.js';
-import { postToOutbox, fetchActorKeyPackage, resolveCollectionItems, resolveKeyPackageList, extractApIdFromResponse } from './client.js';
+import { postToOutbox, fetchActorKeyPackage, resolveCollectionItems, resolveKeyPackageList, findKeyPackageUrl, extractApIdFromResponse } from './client.js';
 
 const MLS_CONTEXTS = [
   'https://www.w3.org/ns/activitystreams',
@@ -50,17 +50,17 @@ const MLS_CONTEXTS = [
  * @param {string} contextId - AP thread/group context ID
  * @returns {object} response from outbox
  */
-export async function sendMLSControl(actor, type, contentB64, recipients, contextId, storage = null) {
+export async function sendMLSControl(actor, type, contentB64, recipients, contextId, storage = null, { usePrefix = false } = {}) {
   // Always include own actor so other devices receive MLS messages via own inbox
   const to = recipients.includes(actor.id) ? recipients : [...recipients, actor.id];
+  const prefixedType = usePrefix ? `mls:${type}` : type;
   const controlObj = {
     '@context': MLS_CONTEXTS,
-    type,
+    type: prefixedType,
     attributedTo: actor.id,
     to,
     mediaType: 'message/mls',
-    encoding: 'base64',
-    content: contentB64,
+    ...(usePrefix ? { 'mls:encoding': 'base64', 'mls:content': contentB64 } : { encoding: 'base64', content: contentB64 }),
     summary: `MLS ${type} for group ${contextId}`,
     context: contextId
   };
@@ -198,17 +198,10 @@ export async function sendKeyPackageProposal(actor, keyPackageBytes, storage = n
 export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
   const kpB64 = bytesToBase64(keyPackageBytes);
   const kpField = actor.keyPackages || actor["mls:keyPackages"];
-  const allItems = kpField ? await resolveCollectionItems(kpField).catch(() => []) : [];
   const collectionUrl = typeof kpField === 'string' ? kpField : kpField?.id;
 
-  // Find the KP object's URL by matching content (needed for Delete)
-  const kpObjectUrl = allItems
-    .map(item => (typeof item === 'string' ? item : item?.id))
-    .find((_, i) => {
-      const item = allItems[i];
-      const content = typeof item === 'string' ? null : (item?.content ?? item?.["mls:content"]);
-      return content === kpB64;
-    }) ?? null;
+  // Find the KP object's AP ID by matching content (lazy, early-exit)
+  const kpObjectUrl = kpField ? await findKeyPackageUrl(kpField, kpB64) : null;
 
   // Try Remove + Delete if the actor exposes a collection URL
   if (collectionUrl) {

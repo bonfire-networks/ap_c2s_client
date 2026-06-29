@@ -25,17 +25,16 @@ const MLS_CONTEXTS = [
 
 /** Build the AP PrivateMessage body. `content` is a pendingId — Rust substitutes before sending. */
 function buildPrivateMessageBody(actor, content, recipients, contextId, options = {}) {
-  const { isNewThread, inReplyTo, overrides = {} } = options;
+  const { isNewThread, inReplyTo, usePrefix = false, overrides = {} } = options;
   const to = recipients;
   return {
     '@context': MLS_CONTEXTS,
-    type: 'PrivateMessage',
+    type: usePrefix ? 'mls:PrivateMessage' : 'PrivateMessage',
     attributedTo: actor.id,
     to,
     summary: 'This is an encrypted message. Please read it using a compatible MLS-capable app.',
     mediaType: 'message/mls',
-    encoding: 'base64',
-    content,
+    ...(usePrefix ? { 'mls:encoding': 'base64', 'mls:content': content } : { encoding: 'base64', content }),
     context: contextId || undefined,
     inReplyTo: inReplyTo || contextId || undefined,
     ...overrides,
@@ -112,6 +111,8 @@ export class ChatController {
   constructor(mlsService, storage) {
     this.mlsService = mlsService;
     this.storage = storage;
+    // Expose storage globally so tests can call it directly (same instance as ctrl.storage)
+    window.__chatStorage = storage;
     // messageId → setTimeout handle; cancelled if Read is sent first
     this._pendingAcks = new Map();
     // groupId → setTimeout handle for proposal commit (staggered timer, co-device or non-co-device)
@@ -356,7 +357,7 @@ export class ChatController {
       const enabled = groupOverride !== null ? groupOverride : globalEnabled;
       if (enabled) {
         const { recipients, apId } = await this._groupSendContext(groupId, actor);
-        this._sendEncryptedActivity(groupId, {
+        await this._sendEncryptedActivity(groupId, {
           type: 'Read', id: messageUri(),
           object: messageId,
         }, recipients, apId);
@@ -604,8 +605,8 @@ export class ChatController {
    * Send Welcome to a recipient.
    * Returns the (possibly updated) apId.
    */
-  async _sendInvite(actor, groupId, recipient, welcomeBytes, ratchetTreeBytes, apId) {
-    const welcomeRes = await sendMLSControl(actor, 'Welcome', bytesToBase64(welcomeBytes), [recipient], apId || null, this.storage);
+  async _sendInvite(actor, groupId, recipient, welcomeBytes, ratchetTreeBytes, apId, { usePrefix = false } = {}) {
+    const welcomeRes = await sendMLSControl(actor, 'Welcome', bytesToBase64(welcomeBytes), [recipient], apId || null, this.storage, { usePrefix });
     if (!apId) {
       apId = await this._resolveApId(welcomeRes);
       if (apId) {
@@ -643,7 +644,7 @@ export class ChatController {
    * @param {string} [options.inReplyTo] - reply-to ID
    * @returns {string|null} AP message ID
    */
-  async _transmitEncrypted(groupId, msgObj, { isNewThread = false, inReplyTo } = {}) {
+  async _transmitEncrypted(groupId, msgObj, { isNewThread = false, inReplyTo, usePrefix = false, overrides = {} } = {}) {
     const actor = await getCurrentActor();
 
     // Generate client-side message ID and embed in content before encryption
@@ -657,8 +658,10 @@ export class ChatController {
       ? JSON.parse(JSON.stringify(contentWithId, (k, v) => INTERNAL_FIELDS.has(k) ? undefined : v))
       : contentWithId;
 
-    // Encrypt — Rust substitutes __pending_attachment_id:ID__ placeholders, stores ciphertext, returns pendingId
-    const pendingId = await this.mlsService.encrypt(actor.id, groupId, cleanContent, attachmentIds);
+    // Encrypt — Rust sanitizes HTML, substitutes attachment placeholders, returns { pendingId, plaintext }
+    const { pendingId, plaintext: encryptedObj } = await this.mlsService.encrypt(actor.id, groupId, cleanContent, attachmentIds);
+    // Re-add display-only fields stripped before encryption (needed for local render: thumbnails, paths)
+    const storedObj = { ...encryptedObj, _localPath: msgObj._localPath, _thumbDataUrl: msgObj._thumbDataUrl };
 
     // Get recipients and AP context ID
     const members = await this.getGroupMembers(groupId);
@@ -670,10 +673,12 @@ export class ChatController {
     const apBody = buildPrivateMessageBody(actor, pendingId, recipients, apId || null, {
       isNewThread,
       inReplyTo: inReplyTo || apId || null,
+      usePrefix,
+      overrides,
     });
 
-    // Save as pending optimistically with the client-generated ID
-    await this.storage.saveMessage(groupId, { ...msgObj, status: 'sending' }, msgId, true);
+    // Save optimistically with the actual object that was encrypted (sanitized content + display fields)
+    await this.storage.saveMessage(groupId, { ...storedObj, status: 'sending' }, msgId, true);
 
     try {
       await ensureFreshToken();
@@ -693,7 +698,7 @@ export class ChatController {
       const deliveryStatus = otherRecipients.length > 0
         ? Object.fromEntries(otherRecipients.map(r => [r, { status: 'sent' }]))
         : null;
-      await this.storage.saveMessage(groupId, msgObj, msgId, true, messageApId || undefined, deliveryStatus);
+      await this.storage.saveMessage(groupId, storedObj, msgId, true, messageApId || undefined, deliveryStatus);
       console.log('[_transmitEncrypted] Confirmed message:', msgId, 'apId:', messageApId, 'in group:', groupId);
 
       // Mark the activity ID or object ID as processed so pollInbox won't reprocess the echo
@@ -715,7 +720,7 @@ export class ChatController {
       await this.mlsService.discardMessage(pendingId);
       const errStr = typeof e === 'string' ? e : (e.message || String(e));
       console.error('[_transmitEncrypted] Failed to send, saving as failed:', errStr);
-      await this.storage.saveMessage(groupId, { ...msgObj, status: 'failed', error: errStr }, msgId, true);
+      await this.storage.saveMessage(groupId, { ...storedObj, status: 'failed', error: errStr }, msgId, true);
       throw e;
     }
   }
@@ -736,14 +741,15 @@ export class ChatController {
    * Returns `{ groupId, messageApId?, errors? }`.
    *
    * @param {string|null} groupId - existing group, or null to create a new one
-   * @param {{ name?, summary?, content, inReplyTo?, attachments? }} fields - message content
+   * @param {{ name?, summary?, content, inReplyTo?, attachments?, type? }} fields - message content
    * @param {string[]} [recipients] - webfinger mentions or URIs (new group only)
    */
-  async sendMessage(groupId, { name, summary, content, inReplyTo, attachments } = {}, recipients = []) {
+  async sendMessage(groupId, { name, summary, content, inReplyTo, attachments, type, usePrefix = false, overrides = {} } = {}, recipients = []) {
     const actor = await getCurrentActor();
 
     // Single media file with no text → top-level typed object (Image/Audio/Video)
     // Multiple files or files+text → Note with attachment array
+    // Explicit type (e.g. 'Article') → override type on the built object
     let msgObj;
     if (!content?.trim() && attachments?.length === 1) {
       const att = attachments[0];
@@ -752,6 +758,7 @@ export class ChatController {
       if (inReplyTo) msgObj.inReplyTo = inReplyTo;
     } else {
       msgObj = await this._buildNoteObject({ name, summary, content, inReplyTo, attachments });
+      if (type && type !== 'Note') msgObj.type = type;
     }
 
     if (recipients.length > 0) {
@@ -766,7 +773,7 @@ export class ChatController {
     const { found } = await this.mlsService.getGroup(actor.id, groupId);
     if (!found) throw new EncryptionLostError(groupId);
 
-    const messageApId = await this._transmitEncrypted(groupId, msgObj, { inReplyTo });
+    const messageApId = await this._transmitEncrypted(groupId, msgObj, { inReplyTo, usePrefix, overrides });
     return { groupId, messageApId };
   }
 
@@ -1448,6 +1455,8 @@ export class ChatController {
       console.log('[KeyPackage] Replenishing after group join...');
       // If actor was reconstructed from stale localStorage (outbox absent), fetch a fresh one
       if (!actor.outbox) actor = await getCurrentActor();
+      // Capture old KP hex BEFORE clearing so we can remove it from server after the new one is published
+      const oldKpHex = await this.mlsService.getKeyPackageHex(actor.id);
       await this.mlsService.clearKeyPackage(actor.id);
       const { keyPackageHex, ciphersuite } = await this.mlsService.createKeyPackage(actor.id);
       const kpBytes = bytesFromInput(keyPackageHex);
@@ -1458,6 +1467,13 @@ export class ChatController {
         await this.mlsService.markKeyPackagePublished(actor.id, keyPackageHex);
         localStorage.removeItem('actor');
         console.log('[KeyPackage] Fresh key package published');
+        // Remove old KP from server collection (spec §KP lifecycle: Remove after consumed)
+        if (oldKpHex) {
+          const oldKpBytes = bytesFromInput(oldKpHex);
+          await deleteKeyPackage(actor, oldKpBytes, this.storage).catch(e =>
+            console.warn('[KeyPackage] Failed to remove old KP from collection:', e)
+          );
+        }
       }
     } catch (e) {
       console.error('[KeyPackage] Failed to replenish:', e);
@@ -1665,7 +1681,7 @@ export class ChatController {
    * @param {string} recipientMention - @user@domain or actor URI
    * @returns {string} resolved actor URI of the added member
    */
-  async addMemberToGroup(groupId, recipientMention) {
+  async addMemberToGroup(groupId, recipientMention, { usePrefix = false } = {}) {
     const actor = await getCurrentActor();
     const currentDomain = new URL(actor.id).hostname;
 
@@ -1682,6 +1698,16 @@ export class ChatController {
 
     // Verify endorsement before consuming the KP. Unverified KPs must not be silently added.
     const kpB64 = bytesToBase64(kpBytes);
+
+    // Bootstrap trust for first-contact actors (e.g. cross-server): if the actor's key is not yet in mlsKnownKeys, extract the signature key embedded in the KP and cache it.
+    // Trust anchor: we fetched the KP directly from the actor's AP endpoint, so this is TOFU. 
+    if (mlsSignerKeyId && mlsSignature && !(await this.storage.getMlsKnownKey(mlsSignerKeyId))) {
+      const fp = await this.mlsService.getKeyPackageFingerprint(kpB64).catch(() => null);
+      if (fp?.signatureKey) {
+        await this.storage.saveMlsKnownKey(mlsSignerKeyId, fp.signatureKey);
+      }
+    }
+
     const endorsed = await this._verifyKpEndorsement(kpB64, { mlsSignature, mlsSignerKeyId });
     if (!endorsed) {
       return { pending: true, reason: 'unverified_kp', kpB64, recipientUri, mlsSignature, mlsSignerKeyId };
@@ -1692,7 +1718,7 @@ export class ChatController {
     const apId = await this.storage.getGroupField(groupId, 'apId', null);
 
     // Welcome + GroupInfo (ratchet tree) to the new member
-    await this._sendInvite(actor, groupId, recipientUri, welcome, ratchetTree, apId);
+    await this._sendInvite(actor, groupId, recipientUri, welcome, ratchetTree, apId, { usePrefix });
 
     // Commit to all existing members so their epoch advances
     const allMembers = await this.getGroupMembers(groupId);
@@ -1772,6 +1798,12 @@ export class ChatController {
         return;
       }
       console.log('[_handleKeyPackageAdd] Unsigned Add accepted for', actorUri, '(no known devices)');
+    }
+    // 3-step auth step 3 (spec §authentication): confirm KP is in actor's published collection
+    const liveKps = await fetchAllActorKeyPackages(actorUri).catch(() => []);
+    if (!(liveKps ?? []).some(kp => kp.content === kpB64)) {
+      console.warn('[_handleKeyPackageAdd] KP not in actor collection — rejecting (spec 3-step auth)');
+      return;
     }
     await this.storage.saveUserField(actorUri, 'keyPackage', kpB64);
 
@@ -1940,6 +1972,9 @@ export class ChatController {
         await this._sendInvite(actor, groupId, actor.id, welcome, ratchetTree, apId);
         const existingMembers = (await this.getGroupMembers(groupId)).filter(id => id !== actor.id);
         await this._distributeCommit(actor, groupId, commit, existingMembers);
+        // Seed mlsKnownKeys with the new device's signature key so subsequent addMemberToGroup
+        // calls can verify its self-signed replenished KP after joining consumes the init key.
+        await this._syncMembersFromMLS(groupId, actor);
       } catch (e) {
         console.warn('[approveNewDevice] Could not add co-device to group', groupId, e);
       }
@@ -2121,15 +2156,21 @@ export class ChatController {
    */
   async removeGroupMember(groupId, actorIdentity) {
     const actor = await getCurrentActor();
+    await this.mlsService.getGroup(actor.id, groupId).catch(() => {}); // ensure loaded in Rust memory
     const result = await this.mlsService.removeGroupMember(actor.id, groupId, actorIdentity);
     if (result?.cancelled) return result;
 
-    // Get live MLS members (already updated after remove), persist for page reloads
+    // Get live MLS members (already updated after remove), persist for page reloads.
+    // Explicitly filter out the removed actor in case MLS state is lost and getGroupMembers
+    // falls back to the stale IndexedDB list (which still includes the removed actor).
     const currentMembers = await this.getGroupMembers(groupId);
-    const remaining = currentMembers.filter(id => id !== actor.id);
-    await this.persistMembers(groupId, currentMembers, { replace: true });
+    const afterRemoval = currentMembers.filter(id => id !== actorIdentity);
+    const remaining = afterRemoval.filter(id => id !== actor.id);
+    await this.persistMembers(groupId, afterRemoval, { replace: true });
     try {
-      await this._distributeCommit(actor, groupId, result.commit, remaining);
+      // Include the removed actor so they receive the Commit and learn they were excluded.
+      // In MLS the removed party must process the Commit to update their local state.
+      await this._distributeCommit(actor, groupId, result.commit, [...remaining, actorIdentity]);
     } catch (e) {
       console.warn('[removeGroupMember] Failed to distribute commit:', e);
     }
@@ -2189,9 +2230,9 @@ export class ChatController {
   }
 
   async editMessage(groupId, messageId, newContent) {
-    const stored = await this.storage.getMessage(messageId);
+    const stored = await this._resolveMessage(messageId);
     const updatedContent = { ...(stored?.content || {}), content: newContent };
-    return this.updateMessageObject(groupId, messageId, updatedContent, stored?.timestamp);
+    return this.updateMessageObject(groupId, stored?.id || messageId, updatedContent, stored?.timestamp);
   }
 
   /**
@@ -2203,12 +2244,12 @@ export class ChatController {
   async deleteMessage(groupId, messageId) {
     const actor = await getCurrentActor();
     const { recipients, apId } = await this._groupSendContext(groupId, actor);
-    const msg = await this.storage.getMessage(messageId);
-    if (msg) this._deleteAttachmentFiles(_collectLocalPaths(msg.content || msg));
-    await this.storage.tombstoneMessage(messageId);
-    this._sendEncryptedActivity(groupId, {
+    const stored = await this._resolveMessage(messageId);
+    if (stored) this._deleteAttachmentFiles(_collectLocalPaths(stored.content || stored));
+    await this.storage.tombstoneMessage(stored?.id || messageId);
+    await this._sendEncryptedActivity(groupId, {
       type: 'Delete', id: messageUri(),
-      object: messageId,
+      object: stored?.id || messageId,
     }, recipients, apId);
   }
 
@@ -2250,7 +2291,7 @@ export class ChatController {
     const { recipients, apId } = await this._groupSendContext(groupId, actor);
     const activityId = messageUri();
     await this.storage.addReaction(messageId, actor.id, emoji, activityId);
-    this._sendEncryptedActivity(groupId, {
+    await this._sendEncryptedActivity(groupId, {
       type: 'Like', id: activityId,
       object: messageId,
       content: emoji,
@@ -2262,7 +2303,7 @@ export class ChatController {
     const { recipients, apId } = await this._groupSendContext(groupId, actor);
     const reactionActivityId = await this.storage.getReactionActivityId(messageId, actor.id, emoji);
     await this.storage.removeReaction(messageId, actor.id, emoji);
-    this._sendEncryptedActivity(groupId, {
+    await this._sendEncryptedActivity(groupId, {
       type: 'Undo', id: messageUri(),
       object: {
         type: 'Like',
@@ -2286,7 +2327,7 @@ export class ChatController {
       type: 'Announce', attributedTo: actor.id,
       object: messageId, content: null, timestamp: Date.now(),
     }, announceId, true, undefined);
-    this._sendEncryptedActivity(groupId, {
+    await this._sendEncryptedActivity(groupId, {
       type: 'Announce', id: announceId,
       object: objectPayload,
     }, recipients, apId);
@@ -2294,7 +2335,7 @@ export class ChatController {
     if (comment.trim()) {
       const noteId = messageUri();
       await this._saveAnnounceComment(groupId, announceId, actor.id, comment, true, noteId);
-      this._sendEncryptedActivity(groupId, {
+      await this._sendEncryptedActivity(groupId, {
         type: 'Note', id: noteId, content: comment, inReplyTo: announceId,
       }, recipients, apId);
     }
@@ -2342,10 +2383,12 @@ export class ChatController {
    * `overrides` are merged into the outer AP activity (e.g. for type arrays or plaintext fields).
    */
   _sendEncryptedActivity(groupId, payload, recipients, contextId, inReplyTo, overrides = {}) {
-    (async () => {
+    return (async () => {
       try {
         const actor = await getCurrentActor();
-        const pendingId = await this.mlsService.encrypt(actor.id, groupId, payload);
+        // Ensure the MLS group is loaded into Rust memory before encrypt — getGroup loads from SQLite.
+        await this.mlsService.getGroup(actor.id, groupId).catch(() => {});
+        const { pendingId } = await this.mlsService.encrypt(actor.id, groupId, payload);
         const apBody = buildPrivateMessageBody(actor, pendingId, recipients, contextId, { inReplyTo, overrides });
         await ensureFreshToken();
         const accessToken = localStorage.getItem('access_token');

@@ -241,6 +241,29 @@ export async function extractKeyPackageContent(kp) {
  * @param {string} actorUri
  * @returns {{ content: string, actor: object }|null}
  */
+/**
+ * Find a KP object's AP ID within a keyPackages collection field by matching content (base64).
+ * Expands URL-string items lazily and exits on first match — avoids fetching all items.
+ *
+ * @param {*} kpField - keyPackages field value from actor object
+ * @param {string} kpB64 - base64 content to match
+ * @returns {string|null} AP ID of the matching KP object, or null if not found
+ */
+export async function findKeyPackageUrl(kpField, kpB64) {
+  const items = await resolveCollectionItems(kpField).catch(() => []);
+  for (const item of items) {
+    if (typeof item === 'string') {
+      const obj = await apFetchJson(item).catch(() => null);
+      const content = obj?.content ?? obj?.['mls:content'];
+      if (content === kpB64) return item;
+    } else {
+      const content = item?.content ?? item?.['mls:content'];
+      if (content === kpB64) return item?.id ?? null;
+    }
+  }
+  return null;
+}
+
 export { resolveCollectionItems, resolveKeyPackageList };
 
 /**
