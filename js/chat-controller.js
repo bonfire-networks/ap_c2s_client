@@ -1402,6 +1402,15 @@ export class ChatController {
       }
     } catch (e) {
       console.error('[Handler] Failed to decrypt message:', e);
+      // No MLS state for this group. If we intentionally left, silently drop so we don't
+      // store an error entry that races loadMessages into showing "Encryption keys lost".
+      // If encryption was unexpectedly lost, re-throw so pollInbox marks it processed
+      // without pushing a result — the UI will show "Encryption keys lost" correctly when
+      // the user opens the group and loadMessages detects encryptionAvailable=false.
+      if (e instanceof EncryptionLostError) {
+        const meta = await this.storage.loadGroupMeta(groupId).catch(() => null) || {};
+        if (meta.noLongerMember || meta.left) return null;
+      }
       const errStr = typeof e === 'string' ? e : (e.message || String(e));
       // MLS can't decrypt messages we sent ourselves — skip silently
       if (errStr.includes('CannotDecryptOwnMessage')) {
@@ -2192,6 +2201,10 @@ export class ChatController {
     const result = await this.mlsService.leaveGroup(actor.id, groupId);
     if (result?.cancelled) return result;
 
+    // Mark as no longer a member BEFORE distributing the commit so any concurrent pollInbox
+    // call sees the flag and won't race loadMessages into showing "Encryption keys lost".
+    await this.storage.setGroupField(groupId, 'noLongerMember', true);
+
     // Notify remaining members. Include own actor so co-devices (same actor, different device)
     // receive the self-remove Proposal via the shared inbox. D1 re-receiving its own proposal
     // is harmless — the group will be deleted below, so decryption fails and _handleProposal returns early.
@@ -2205,7 +2218,6 @@ export class ChatController {
 
     // Only delete MLS crypto state — preserve message history
     await this.mlsService.deleteGroup(actor.id, groupId);
-    await this.storage.setGroupField(groupId, 'noLongerMember', true);
     await this._insertSystemMessage(groupId, 'You left this group.');
 
     return { left: true };
