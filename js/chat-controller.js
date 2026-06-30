@@ -15,8 +15,8 @@ import { getCurrentActor, getActor, getActorId, apFetch, ensureFreshToken } from
 import { postToOutbox, fetchActorKeyPackage, fetchAllActorKeyPackages, resolveActorId, extractApIdFromResponse, forEachPublishedKeyPackage } from './activitypub/client.js';
 import { sendMLSControl, publishKeyPackage, deleteKeyPackage, deleteKeyPackageForDevice, sendKeyPackageProposal, parseMLSActivity } from './activitypub/mls-transport.js';
 
-// AP object types that represent regular user content — the only types that should generate receipts
-const CONTENT_TYPES = ['Create', 'Note', 'Article', 'Document', 'Page', 'Image', 'Video', 'Audio', 'Event', 'Question'];
+// Types that receive a Read receipt when scrolled into view (excludes media — those get Listen/View)
+const TEXT_RECEIPT_TYPES = new Set(['Note', 'Article', 'Page', 'Question']);
 
 const MLS_CONTEXTS = [
   'https://www.w3.org/ns/activitystreams',
@@ -79,7 +79,7 @@ function isApUri(value) {
  * Legacy entries have { status } and are keyed by actorId.
  */
 export function groupDeliveryByActor(ds) {
-  const STATUS_RANK = ['keys_broken', 'failed', 'sent', 'acknowledged', 'read'];
+  const STATUS_RANK = ['keys_broken', 'failed', 'sent', 'acknowledged', 'Read', 'Listen', 'View'];
   const perActorBest = new Map();
   const byActor = new Map();
   for (const [key, entry] of Object.entries(ds)) {
@@ -344,10 +344,10 @@ export class ChatController {
     const actor = await getCurrentActor();
     const msg = await this.storage.getMessage(messageId);
     const msgType = msg?.content?.type;
-    const isSendableContent = msg && !msg.isLocal
+    const isSendableText = msg && !msg.isLocal
       && !msg.content?.error
-      && (!msgType || CONTENT_TYPES.includes(msgType));
-    if (isSendableContent) {
+      && TEXT_RECEIPT_TYPES.has(msgType);
+    if (isSendableText) {
       if (this._pendingAcks.has(messageId)) {
         clearTimeout(this._pendingAcks.get(messageId));
         this._pendingAcks.delete(messageId);
@@ -355,14 +355,22 @@ export class ChatController {
       const groupOverride = await this.storage.getGroupField(groupId, 'readReceiptsOverride', null);
       const globalEnabled = await this.storage.loadUserSetting(actor.id, 'sendReadReceipts', false);
       const enabled = groupOverride !== null ? groupOverride : globalEnabled;
-      if (enabled) {
-        const { recipients, apId } = await this._groupSendContext(groupId, actor);
-        await this._sendEncryptedActivity(groupId, {
-          type: 'Read', id: messageUri(),
-          object: messageId,
-        }, recipients, apId);
-      }
+      if (enabled) await this._sendReceipt(groupId, 'Read', messageId);
     }
+  }
+
+  async _sendReceipt(groupId, type, messageId) {
+    const actor = await getCurrentActor();
+    const { recipients, apId } = await this._groupSendContext(groupId, actor);
+    await this._sendEncryptedActivity(groupId, { type, id: messageUri(), object: messageId }, recipients, apId);
+  }
+
+  async markMessageListened(messageId, groupId) {
+    await this._sendReceipt(groupId, 'Listen', messageId);
+  }
+
+  async markMessageViewed(messageId, groupId) {
+    await this._sendReceipt(groupId, 'View', messageId);
   }
 
   async getGroupFingerprints(groupId) {
@@ -553,11 +561,12 @@ export class ChatController {
 
   // ── System messages ───────────────────────────────────
 
-  async _insertSystemMessage(groupId, text) {
+  async _insertSystemMessage(groupId, text, { relatedMessageId } = {}) {
     const id = `system-${Date.now()}`;
     await this.storage.saveMessage(groupId, {
       type: 'system',
       content: text,
+      ...(relatedMessageId ? { relatedMessageId } : {}),
     }, id, true);
   }
 
@@ -1283,6 +1292,9 @@ export class ChatController {
             : { ...existing.content, ...obj };
           await this.storage.saveMessage(groupId, updatedContent, targetId, existing.isLocal, existing.apId, existing.deliveryStatus, existing.timestamp);
           await this.storage.saveGroupMeta(groupId, { ...(await this.storage.loadGroupMeta(groupId) || {}), hasUnread: true });
+        } else if (existing) {
+          const nick = await this._getNickname(parsed.attributedTo);
+          await this._insertSystemMessage(groupId, `${nick || "Someone"} tried to edit a message they did not send.`, { relatedMessageId: targetId });
         }
         return { type: 'update', groupId };
       }
@@ -1295,6 +1307,9 @@ export class ChatController {
         if (existing && existing.content?.attributedTo === parsed.attributedTo) {
           await this.storage.tombstoneMessage(targetId);
           await this.storage.saveGroupMeta(groupId, { ...(await this.storage.loadGroupMeta(groupId) || {}), hasUnread: true });
+        } else if (existing) {
+          const nick = await this._getNickname(parsed.attributedTo);
+          await this._insertSystemMessage(groupId, `${nick || "Someone"} tried to delete a message they did not send.`, { relatedMessageId: targetId });
         }
         return { type: 'delete', groupId };
       }
@@ -1345,16 +1360,20 @@ export class ChatController {
         return { type: 'announce', groupId };
       }
 
-      // Read receipt
-      if (innerTypes.includes('Read') && decryptedContent.object) {
+      // Activity receipts: Read, Listen, View — AP MLS draft §activities; stored using AP verb names
+      const receiptStatus = innerTypes.includes('Read') ? 'Read'
+        : innerTypes.includes('Listen') ? 'Listen'
+        : innerTypes.includes('View') ? 'View'
+        : null;
+      if (receiptStatus && decryptedContent.object) {
         const targetId = this._objectId(decryptedContent.object);
         const existing = await this._resolveMessage(targetId);
         if (existing) {
           const key = senderSignatureKey || parsed.attributedTo;
-          const entry = senderSignatureKey ? { actorId: parsed.attributedTo, status: 'read', timestamp: Date.now() } : { status: 'read', timestamp: Date.now() };
+          const entry = senderSignatureKey ? { actorId: parsed.attributedTo, status: receiptStatus, timestamp: Date.now() } : { status: receiptStatus, timestamp: Date.now() };
           await this.storage.updateDeliveryStatus(existing.id, key, entry);
         }
-        return { type: 'read', groupId };
+        return { type: receiptStatus, groupId };
       }
 
       // Use inner ap-mls:// id if present, fall back to outer AP id
@@ -1369,6 +1388,9 @@ export class ChatController {
         }
       }
 
+      // Silently discard IntransitiveActivity — AP MLS spec §traffic-analysis dummy messages
+      if (innerTypes.includes('IntransitiveActivity')) return { type: 'ignored', groupId };
+
       // Store with outer AP ID for deep link resolution; tag with sender's client key
       const messageApId = (messageId !== outerMessageId) ? outerMessageId : undefined;
       if (senderSignatureKey) decryptedContent._senderClientKey = senderSignatureKey;
@@ -1380,10 +1402,8 @@ export class ChatController {
 
       // Send encrypted Acknowledge receipt only for regular content messages, debounced so
       // a Read receipt sent first will cancel it (Read implies Acknowledge).
-      // Naked messages (no type) are treated as Notes. System messages and receipts are excluded.
-      const isContent = decryptedContent != null
-        && !decryptedContent.error
-        && (!decryptedContent.type || CONTENT_TYPES.includes(decryptedContent.type));
+      // Anything that reaches here is displayable content (activity types returned early above).
+      const isContent = decryptedContent != null && !decryptedContent.error;
       if (isContent) {
         this._scheduleAck(groupId, messageId, parsed, actor);
       }
@@ -2485,6 +2505,11 @@ export class ChatController {
     const msg = await this.storage.getMessage(referencedId) || await this.storage.getMessageByApId(referencedId);
     if (msg) {
       const key = senderSignatureKey || parsed.attributedTo;
+      // Don't overwrite engagement receipts (Read/Listen/View) with a plain Acknowledge
+      const existing = msg.deliveryStatus?.[key];
+      if (existing && ['Read', 'Listen', 'View'].includes(existing.status)) {
+        return { type: 'receipt', groupId: msg.groupId };
+      }
       const entry = senderSignatureKey ? { actorId: parsed.attributedTo, status: 'acknowledged' } : { status: 'acknowledged' };
       await this.storage.updateDeliveryStatus(msg.id, key, entry);
       console.log('[receipt] Acknowledged by', parsed.attributedTo, '(client:', senderSignatureKey?.slice(0, 8), ') for message:', msg.id);

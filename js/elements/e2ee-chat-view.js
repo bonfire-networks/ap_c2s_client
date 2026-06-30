@@ -1055,7 +1055,13 @@ export class E2EEChatView extends LitElement {
     const onDelete = obj._localPath && msg
       ? () => this._handleDeleteStoredAttachment(obj, msg, isOwn && !isTopLevel)
       : null;
-    const openLightbox = src ? () => { this._lightbox = { src, type: obj.type, name: obj.name }; } : null;
+    const sendEngageReceipt = (msg?.id && !isOwn)
+      ? (type) => this.controller?.[type === 'View' ? 'markMessageViewed' : type === 'Listen' ? 'markMessageListened' : 'markMessageRead']?.(msg.id, this.selectedGroupId)
+      : null;
+    const openLightbox = src ? () => {
+      this._lightbox = { src, type: obj.type, name: obj.name };
+      sendEngageReceipt?.(obj.type === 'Image' ? 'View' : 'Read');
+    } : null;
     if (obj.type === 'Image') {
       console.log(`[renderMediaObject] Image: thumbDataUrl=${!!obj._thumbDataUrl} thumbFailed=${!!obj._thumbFailed} localPath=${obj._localPath}`);
       const isGif = /\.gif$/i.test(obj.name || '') || obj.mediaType === 'image/gif';
@@ -1121,27 +1127,33 @@ export class E2EEChatView extends LitElement {
       if (activated)
         return html`<span class="loading loading-spinner loading-xs mt-1 opacity-50"></span>`;
       return html`<button type="button" class="btn btn-sm btn-circle btn-ghost mt-1" title=${obj.name || 'Play audio'}
-        @click=${() => { this._audioActivated.add(key); this._mediaObjectUrl(obj, { eager: true }); this.requestUpdate(); }}>
+        @click=${() => {
+          this._audioActivated.add(key); this._mediaObjectUrl(obj, { eager: true }); this.requestUpdate();
+          sendEngageReceipt?.('Listen');
+        }}>
         ${icon('play', { size: 16 })}
       </button>`;
     }
     if (obj.type === 'Video') {
       if (!src) {
         return html`<button type="button" class="btn btn-sm btn-ghost gap-1 mt-1"
-          @click=${() => { this._mediaObjectUrl(obj, { eager: true, autoOpen: true }); }}>
+          @click=${() => {
+            this._mediaObjectUrl(obj, { eager: true, autoOpen: true });
+            sendEngageReceipt?.('View');
+          }}>
           ${icon('film', { size: 14 })} ${obj.name || 'Video'}
         </button>`;
       }
       return html`<video controls preload="metadata" src=${src} class="mt-1 max-w-xs rounded-lg block"></video>`;
     }
-    // Documents: decompress on click, then save/open
+    // Documents: decompress on click, then save/open; receipt fires on user action, not passive scroll
     const isPdf = /\.pdf$/i.test(obj.name || '');
-    const onOpen = isPdf && src ? openLightbox : null;
+    const onOpen = isPdf && src ? openLightbox : null; // PDF → Read via openLightbox
     const onSave = tempPath
-      ? () => this.controller?.mlsService?.saveAttachmentAs?.(tempPath, obj.name || 'file')
+      ? () => { this.controller?.mlsService?.saveAttachmentAs?.(tempPath, obj.name || 'file'); sendEngageReceipt?.('Read'); }
       : null;
     const onServeAndSave = !src && obj._localPath
-      ? () => { this._mediaObjectUrl(obj, { eager: true, autoOpen: isPdf }); }
+      ? () => { this._mediaObjectUrl(obj, { eager: true, autoOpen: isPdf }); sendEngageReceipt?.('Read'); }
       : null;
     return this._renderFileChip({ name: obj.name, size: obj.size, onClick: onOpen || onSave || onServeAndSave, onRemove: onDelete });
   }
@@ -1479,7 +1491,11 @@ export class E2EEChatView extends LitElement {
   }
 
   decryptedSummary(msg) {
-    return typeof msg === 'string' ? msg : msg && (msg.summary || msg.content);
+    if (typeof msg === 'string') return msg;
+    if (!msg) return null;
+    const MEDIA_TYPES = ['Audio', 'Video', 'Image', 'Document'];
+    if (MEDIA_TYPES.includes(msg.type)) return msg.name || msg.summary || msg.type;
+    return msg.name || msg.summary || (typeof msg.content === 'string' ? msg.content : msg.type);
   }
 
   _getMessagesList() {
@@ -2129,8 +2145,11 @@ export class E2EEChatView extends LitElement {
     }
 
     if (msg && msg.type === 'system') {
+      const viewLink = msg.relatedMessageId
+        ? html` <button class="link link-hover" @click=${() => this.scrollToMessage(msg.relatedMessageId)}>↑ view</button>`
+        : '';
       return html`
-        <div class="alert alert-warning text-xs my-1 py-1 px-2 opacity-80">${msg.content}</div>
+        <div class="alert alert-warning text-xs my-1 py-1 px-2 opacity-80">${msg.content}${viewLink}</div>
       `;
     }
 
