@@ -51,8 +51,8 @@ const MLS_CONTEXTS = [
  * @returns {object} response from outbox
  */
 export async function sendMLSControl(actor, type, contentB64, recipients, contextId, storage = null, { usePrefix = false } = {}) {
-  // Always include own actor so other devices receive MLS messages via own inbox
-  const to = recipients.includes(actor.id) ? recipients : [...recipients, actor.id];
+  // Always include own actor so other devices receive MLS messages via own inbox. Deduplicate.
+  const to = [...new Set([...recipients, actor.id])];
   const prefixedType = usePrefix ? `mls:${type}` : type;
   const controlObj = {
     '@context': MLS_CONTEXTS,

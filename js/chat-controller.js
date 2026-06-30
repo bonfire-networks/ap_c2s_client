@@ -26,7 +26,8 @@ const MLS_CONTEXTS = [
 /** Build the AP PrivateMessage body. `content` is a pendingId — Rust substitutes before sending. */
 function buildPrivateMessageBody(actor, content, recipients, contextId, options = {}) {
   const { isNewThread, inReplyTo, usePrefix = false, overrides = {} } = options;
-  const to = recipients;
+  // Always include own actor so co-devices receive via the shared inbox. Deduplicate.
+  const to = [...new Set([...recipients, actor.id])];
   return {
     '@context': MLS_CONTEXTS,
     type: usePrefix ? 'mls:PrivateMessage' : 'PrivateMessage',
@@ -673,8 +674,7 @@ export class ChatController {
     const storedObj = { ...encryptedObj, _localPath: msgObj._localPath, _thumbDataUrl: msgObj._thumbDataUrl };
 
     // Get recipients and AP context ID
-    const members = await this.getGroupMembers(groupId);
-    const recipients = members.length > 0 ? members : [actor.id];
+    const recipients = await this.getGroupMembers(groupId);
     const apId = await this.storage.getGroupField(groupId, 'apId', null);
     console.log('[_transmitEncrypted] apId:', apId, 'groupId:', groupId, 'msgId:', msgId);
 
@@ -1680,15 +1680,11 @@ export class ChatController {
       console.warn('[clearAllData] Failed to delete key package:', e);
     }
 
-    // Distribute self-remove proposals so other members update their state
+    // Distribute self-remove proposals so other members (and co-devices) update their state
     for (const result of response.results) {
       try {
         const recipients = await this.getGroupMembers(result.groupId);
-        const meta = (await this.storage.loadGroupMeta(result.groupId)) || {};
-        const apId = meta.apId || null;
-        if (apId && recipients.length > 0) {
-          await sendMLSControl(actor, 'PrivateMessage', result.commit, recipients, apId, this.storage);
-        }
+        await this._distributeCommit(actor, result.groupId, result.commit, recipients);
       } catch (err) {
         console.error(`[clearAllData] Failed to distribute for ${result.groupId}:`, err);
       }
@@ -1710,8 +1706,8 @@ export class ChatController {
    */
   async _distributeCommit(actor, groupId, commitB64, recipients) {
     const apId = await this.storage.getGroupField(groupId, 'apId', null);
-    console.log('[_distributeCommit] apId:', apId, 'recipients:', recipients, 'commitB64 length:', commitB64?.length);
-    if (apId && recipients.length > 0) {
+    // sendMLSControl always adds actor.id so co-devices receive even when recipients is empty.
+    if (apId) {
       await sendMLSControl(actor, 'PrivateMessage', commitB64, recipients, apId, this.storage);
     }
   }
@@ -1767,7 +1763,6 @@ export class ChatController {
     // Commit to all existing members so their epoch advances
     const allMembers = await this.getGroupMembers(groupId);
     const existingMembers = allMembers.filter(id => id !== recipientUri && id !== actor.id);
-    console.log('[addMemberToGroup] allMembers:', allMembers, 'existingMembers (excluding new):', existingMembers, 'commit length:', commit?.length);
     await this._distributeCommit(actor, groupId, commit, existingMembers);
 
     // Persist updated member list — each client inserts a local system message when they process the Commit
@@ -2242,10 +2237,7 @@ export class ChatController {
     await this.mlsService.deleteGroup(actor.id, groupId);
     await this.storage.setGroupField(groupId, 'noLongerMember', true);
 
-    // Notify remaining members. Include own actor so co-devices (same actor, different device)
-    // receive the self-remove Proposal via the shared inbox.
-    const allMembers = await this.getGroupMembers(groupId);
-    const remaining = [...new Set([...allMembers.filter(id => id !== actor.id), actor.id])];
+    const remaining = await this.getGroupMembers(groupId);
     try {
       await this._distributeCommit(actor, groupId, result.commit, remaining);
     } catch (e) {
@@ -2307,9 +2299,7 @@ export class ChatController {
 
   /** DRY helper: resolve recipients + apId for a group send. */
   async _groupSendContext(groupId, actor) {
-    const members = await this.getGroupMembers(groupId);
-    // Always include own actor so other devices receive messages via own inbox
-    const recipients = members.includes(actor.id) ? members : [...members, actor.id];
+    const recipients = await this.getGroupMembers(groupId);
     const apId = await this.storage.getGroupField(groupId, 'apId', null);
     return { recipients, apId };
   }
@@ -2403,7 +2393,8 @@ export class ChatController {
     // Distribute commits for each affected group
     for (const { groupId, commit } of response.results) {
       try {
-        await this._distributeCommit(actor, groupId, commit, await this.getGroupMembers(groupId));
+        const recipients = await this.getGroupMembers(groupId);
+        await this._distributeCommit(actor, groupId, commit, recipients);
       } catch (err) {
         console.error(`[removeOwnClient] Failed to distribute commit for group ${groupId}:`, err);
       }
