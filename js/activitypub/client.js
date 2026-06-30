@@ -189,7 +189,7 @@ async function apFetchJson(url) {
   return res.ok ? res.json() : null;
 }
 
-async function resolveCollectionItems(val) {
+async function resolveCollectionItems(val, upTo = Infinity) {
   if (typeof val === 'string') {
     val = await apFetchJson(val);
     if (!val) return [];
@@ -197,11 +197,18 @@ async function resolveCollectionItems(val) {
   if (Array.isArray(val)) return val;
   if (Array.isArray(val?.orderedItems)) return val.orderedItems;
   if (Array.isArray(val?.items)) return val.items;
-  // Collection with a `first` page link — follow it (first page only; keyPackages collections are small)
-  const pageUrl = typeof val?.first === 'string' ? val.first : val?.first?.id;
+  // Paginated collection — follow pages until we have upTo items
+  let pageUrl = typeof val?.first === 'string' ? val.first : val?.first?.id;
   if (pageUrl) {
-    const page = await apFetchJson(pageUrl);
-    if (page) return page.orderedItems ?? page.items ?? [];
+    const all = [];
+    do {
+      const page = await apFetchJson(pageUrl);
+      if (!page) break;
+      all.push(...(page.orderedItems ?? page.items ?? []));
+      if (all.length >= upTo) break;
+      pageUrl = typeof page.next === 'string' ? page.next : page.next?.id ?? null;
+    } while (pageUrl);
+    return all;
   }
   return [];
 }
@@ -209,8 +216,8 @@ async function resolveCollectionItems(val) {
 /**
  * Resolve an actor's keyPackages field to an array of KP objects (each with .content).
  */
-async function resolveKeyPackageList(kp) {
-  const items = await resolveCollectionItems(kp);
+async function resolveKeyPackageList(kp, upTo = Infinity) {
+  const items = await resolveCollectionItems(kp, upTo);
   const results = [];
   for (const item of items) {
     let obj = item;
@@ -231,7 +238,7 @@ async function resolveKeyPackageList(kp) {
  * @returns {string|null}
  */
 export async function extractKeyPackageContent(kp) {
-  const items = await resolveKeyPackageList(kp);
+  const items = await resolveKeyPackageList(kp, 1);
   return items[0]?.content ?? null;
 }
 
@@ -277,7 +284,7 @@ export { resolveCollectionItems, resolveKeyPackageList };
 export async function forEachPublishedKeyPackage(actor, mlsService, predicate) {
   const kps = actor.keyPackages || actor["mls:keyPackages"];
   if (!kps) return false;
-  for (const { content } of await resolveKeyPackageList(kps).catch(() => [])) {
+  for (const { content } of await resolveKeyPackageList(kps, 50).catch(() => [])) {
     try {
       const fp = await mlsService.getKeyPackageFingerprint(content);
       if (fp?.signatureKey && predicate(fp.signatureKey)) return true;

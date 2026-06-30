@@ -132,7 +132,9 @@ export async function publishKeyPackage(actor, keyPackageBytes, mlsSig = null, s
   }
 
   // Step 2b: Update the actor with an inline anonymous Collection of KP URLs
-  const existingItems = kpField ? await resolveCollectionItems(kpField).catch(() => []) : [];
+  // upTo 50: only need existing KP URLs to build the updated collection; bounded to avoid
+  // fetching an unbounded set of accumulated stale KPs from paginated collections.
+  const existingItems = kpField ? await resolveCollectionItems(kpField, 50).catch(() => []) : [];
   const existingUrls = existingItems
     .map(item => (typeof item === 'string' ? item : item?.id))
     .filter(Boolean);
@@ -201,7 +203,9 @@ export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
   const collectionUrl = typeof kpField === 'string' ? kpField : kpField?.id;
 
   // resolveKeyPackageList fetches URL-string items so we can match by content and get the id.
-  const allItems = kpField ? await resolveKeyPackageList(kpField).catch(() => []) : [];
+  // upTo 50: targeted delete only needs to find this one KP; if not in the first 50 entries the
+  // content-based Remove fallback below still works without fetching an unbounded collection.
+  const allItems = kpField ? await resolveKeyPackageList(kpField, 50).catch(() => []) : [];
   const kpObjectUrl = allItems.reduce((found, item) => {
     if (found) return found;
     const content = item?.content ?? item?.['mls:content'];
@@ -279,14 +283,19 @@ export async function deleteKeyPackage(actor, keyPackageBytes, storage = null) {
 export async function deleteKeyPackageForDevice(actor, signatureKey, mlsService, storage = null) {
   const kps = actor.keyPackages || actor["mls:keyPackages"];
   if (!kps) return;
-  for (const { content } of await resolveKeyPackageList(kps).catch(() => [])) {
-    try {
-      const fp = await mlsService.getKeyPackageFingerprint(content);
-      if (fp?.signatureKey === signatureKey) {
-        await deleteKeyPackage(actor, bytesFromInput(content), storage);
-        return;
-      }
-    } catch (e) { /* unparseable KP — skip */ }
+  // Iterate the full page; re-fetch only if we deleted something (deletions shift subsequent pages).
+  let deletedAny = true;
+  while (deletedAny) {
+    deletedAny = false;
+    for (const { content } of await resolveKeyPackageList(kps).catch(() => [])) {
+      try {
+        const fp = await mlsService.getKeyPackageFingerprint(content);
+        if (fp?.signatureKey === signatureKey) {
+          await deleteKeyPackage(actor, bytesFromInput(content), storage);
+          deletedAny = true;
+        }
+      } catch (e) { /* unparseable KP — skip */ }
+    }
   }
 }
 

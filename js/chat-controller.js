@@ -899,8 +899,11 @@ export class ChatController {
 
   /**
    * Poll inbox and process new activities.
+   * @param {object} opts
+   * @param {number} [opts.maxItems=Infinity] - stop after processing this many new items (used by
+   *   e2e tests to drain incrementally across afterEach hooks without hitting IPC timeouts)
    */
-  async pollInbox() {
+  async pollInbox({ maxItems = Infinity } = {}) {
     try {
       const actor = await getCurrentActor();
       const { fetchInboxItems } = await import('./activitypub/client.js');
@@ -914,6 +917,8 @@ export class ChatController {
       // so any Commit for the same epoch is applied first
       const deferredProposals = [];
 
+      let newItemsProcessed = 0;
+
       for (const item of itemsToProcess) {
         const itemId = item.id || item.object?.id;
         if (!itemId) continue;
@@ -923,10 +928,13 @@ export class ChatController {
           continue;
         }
 
+        if (newItemsProcessed >= maxItems) break;
+
         console.log('[pollInbox] Processing item:', itemId, 'type:', item.type || item.object?.type);
         try {
           const result = await this.handleActivity(item);
           await this.storage.markProcessed(actor.id, itemId);
+          newItemsProcessed++;
           if (result?.proposalBuffered) {
             // Defer — process after all commits in this batch have been applied
             deferredProposals.push({ item, result });
@@ -936,6 +944,7 @@ export class ChatController {
         } catch (itemErr) {
           console.error('[pollInbox] Failed to process item:', itemId, itemErr);
           await this.storage.markProcessed(actor.id, itemId);
+          newItemsProcessed++;
         }
       }
 
