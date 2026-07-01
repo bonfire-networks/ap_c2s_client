@@ -714,9 +714,10 @@ export class E2EEChatView extends LitElement {
             if ((this._autoApproveNewDevice || window.__e2ee_autoApproveNewDevice) && r.kpB64) {
               // Auto-approve takes priority — even if our own approval is pending, explicitly
               // approving a co-device (test mode) should not be suppressed.
+              // Fire-and-forget: approveNewDevice calls postToOutbox which blocks with inline Oban;
+              // awaiting it here would stall pollInbox for 2+ min and hit the IPC timeout.
               this.shadowRoot.querySelector('#nd-request-dialog')?.remove();
-              await this.controller.approveNewDevice(r.kpB64).catch(e => console.error('[autoApprove]', e));
-              this.shadowRoot.querySelector('#nd-request-dialog')?.remove();
+              this.controller.approveNewDevice(r.kpB64).catch(e => console.error('[autoApprove]', e));
             } else if (r.type === 'newDeviceRequest' && this.controller._awaitingApproval) {
               // A device awaiting approval is itself the "new" device — it must not be asked to
               // approve other (existing) devices whose KPs it hasn't seen before.

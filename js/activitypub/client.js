@@ -74,7 +74,7 @@ export async function postToOutbox(actor, obj, storage = null) {
  * @param {string[]} [options.required] - required properties (skip fetch if present)
  * @returns {object} the resolved object
  */
-export async function fetchObject(item, options = {}) {
+export async function resolveObject(item, options = {}) {
   const { noCache, required } = options;
 
   if (required && typeof item === 'object' && required.every(p => p in item)) {
@@ -119,7 +119,10 @@ export async function fetchObject(item, options = {}) {
  */
 export function resolveId(item) {
   if (typeof item === 'string') return item;
-  if (typeof item === 'object' && item && item.id && typeof item.id === 'string') return item.id;
+  if (typeof item === 'object' && item) {
+    if (typeof item.id === 'string') return item.id;
+    if (typeof item.href === 'string') return item.href; // AS2 Link type
+  }
   return null;
 }
 
@@ -129,27 +132,46 @@ export function resolveId(item) {
  * @param {string|object} coll - collection URL or object
  * @yields {object} each item in the collection (fully resolved)
  */
-export async function* iterateCollection(coll) {
-  const collection = await fetchObject(coll, { noCache: true });
+export async function* iterateCollection(coll, { upTo = Infinity, stopWhen, resolveInnerObjects = false } = {}) {
+  const collection = await resolveObject(coll, { noCache: true });
+  let count = 0;
 
-  async function resolveAll(arr) {
-    return Promise.all(
-      arr.map(i => fetchObject(i, { required: ['id', 'type', 'published'] }))
-    );
+  async function* yieldItems(arr) {
+    for (const raw of arr) {
+      if (count++ >= upTo) return;
+      // Check predicate on the raw ID before fetching — avoids a dereference for already-processed items.
+      const rawId = resolveId(raw);
+      if (stopWhen && rawId && await stopWhen(rawId)) return;
+      let item = await resolveObject(raw, { required: ['id', 'type', 'published'] });
+      if (resolveInnerObjects && typeof item?.object === 'string') {
+        item = { ...item, object: await resolveObject(item.object) };
+      }
+      yield item;
+    }
   }
 
-  if (collection.items) {
-    for (const obj of await resolveAll(collection.items)) yield obj;
-  } else if (collection.orderedItems) {
-    for (const obj of await resolveAll(collection.orderedItems)) yield obj;
+  // Resolve a page reference (URL string or embedded object) to a page with items.
+  // Unwraps OrderedCollection envelopes: some servers return ?page=N as {type:OrderedCollection, first: page}
+  // rather than returning the CollectionPage directly.
+  async function resolvePage(ref) {
+    let p = typeof ref === 'string' ? await resolveObject(ref, { noCache: true }) : ref;
+    while (p && !p.items && !p.orderedItems && p.first) {
+      p = typeof p.first === 'string'
+        ? await resolveObject(p.first, { noCache: true })
+        : p.first;
+    }
+    return p;
+  }
+
+  if (collection.items || collection.orderedItems) {
+    yield* yieldItems(collection.items || collection.orderedItems);
   } else if (collection.first) {
-    let pageId = resolveId(collection.first);
-    do {
-      const page = await fetchObject(pageId, { noCache: true });
-      const items = page.items || page.orderedItems || [];
-      for (const obj of await resolveAll(items)) yield obj;
-      pageId = resolveId(page.next);
-    } while (pageId);
+    let page = await resolvePage(collection.first);
+    while (page) {
+      yield* yieldItems(page.items || page.orderedItems || []);
+      const nextId = resolveId(page.next);
+      page = nextId ? await resolvePage(nextId) : null;
+    }
   }
 }
 
@@ -329,45 +351,19 @@ export async function fetchAllActorKeyPackages(actorUri) {
  * @param {object} actor - actor object with .inbox
  * @returns {Array} inbox items
  */
-export async function fetchInboxItems(actor) {
-  const inboxUrl = typeof actor.inbox === 'string' ? actor.inbox : actor.inbox.id;
-  const res = await apFetch(inboxUrl, { headers: { Accept: 'application/activity+json' } });
-  if (!res.ok) {
-    console.warn('[AP Client] Failed to fetch inbox, status:', res.status);
-    return [];
-  }
-
-  const inbox = await res.json();
-  console.log('[fetchInboxItems] Raw response keys:', Object.keys(inbox), 'totalItems:', inbox.totalItems, 'type:', inbox.type);
-  let items = [];
-
-  // Check for direct items in response
-  if (inbox.orderedItems && Array.isArray(inbox.orderedItems)) {
-    items = inbox.orderedItems;
-  } else if (inbox.items && Array.isArray(inbox.items)) {
-    items = inbox.items;
-  }
-
-  // If still no items and there's a first page
-  if (items.length === 0 && inbox.first) {
-    if (typeof inbox.first === 'object' && (inbox.first.orderedItems || inbox.first.items)) {
-      items = inbox.first.orderedItems || inbox.first.items;
-    } else {
-      const firstPageUrl = typeof inbox.first === 'string' ? inbox.first : inbox.first.id;
-      if (firstPageUrl) {
-        try {
-          const pageRes = await apFetch(firstPageUrl, { headers: { Accept: 'application/activity+json' } });
-          if (pageRes.ok) {
-            const page = await pageRes.json();
-            items = page.orderedItems || page.items || [];
-          }
-        } catch (e) {
-          console.error('[AP Client] Error fetching first page:', e);
-        }
-      }
+export async function fetchInboxItems(actor, { upTo = 10000, isProcessed, resolveInnerObjects = true } = {}) {
+  // Prefer the spec-defined mls:messages collection (MLS-only filtered view) over the full inbox.
+  const coll = actor['mls:messages'] || actor.messages || actor.inbox;
+  const items = [];
+  try {
+    // stopWhen is checked on raw IDs before dereferencing — collection is newest-first, so
+    // the first already-processed ID means all older items are also done.
+    for await (const item of iterateCollection(coll, { upTo, stopWhen: isProcessed, resolveInnerObjects })) {
+      items.push(item);
     }
+  } catch (e) {
+    console.warn('[fetchInboxItems] Failed to fetch collection:', e);
   }
-
   console.log('[fetchInboxItems] Total items:', items.length,
     items.length > 0 ? 'First item type:' : '',
     items.length > 0 ? (items[0]?.type || items[0]?.object?.type || 'unknown') : '');

@@ -907,7 +907,9 @@ export class ChatController {
     try {
       const actor = await getCurrentActor();
       const { fetchInboxItems } = await import('./activitypub/client.js');
-      const items = await fetchInboxItems(actor);
+      const items = await fetchInboxItems(actor, {
+        isProcessed: id => this.storage.isProcessed(actor.id, id),
+      });
       console.log('[pollInbox] Fetched', items.length, 'inbox items');
 
       // Process oldest-first so group joins happen before messages
@@ -1144,26 +1146,26 @@ export class ChatController {
    *   the Welcome is for this device, to avoid destroying state on echoed Welcome activities.
    */
   async _tryJoinGroup(actor, groupId, welcomeBytes, ratchetTreeBytes, parsed, { wasJoined = false } = {}) {
-    // Strategy: always try joining WITHOUT deleting first.
-    // - NoMatchingKeyPackage → Welcome is not for this device (co-device Welcome CC'd back,
-    //   or echo); bail without touching group state.
-    // - Success when wasJoined → Rust silently no-op'd on the stale group; delete and retry
-    //   so the epoch actually advances.
-    // - Success when !wasJoined → genuine first join.
+    // Rust handles all join cases atomically:
+    // - NoMatchingKeyPackage → Welcome not for this device (co-device or other member's Welcome
+    //   landed in our inbox); keep existing state untouched, restore joined flag.
+    // - Success when group already existed in Rust → stale state replaced in-place (re-invite /
+    //   group reset); no JS-level delete+retry needed.
+    // - Success when group was absent → genuine first join.
     let actualGroupId;
     try {
       actualGroupId = await this.mlsService.joinFromWelcome(actor.id, groupId, welcomeBytes, ratchetTreeBytes);
-      if (wasJoined) {
-        // No-op'd on old group — delete stale state and rejoin to advance epoch
-        await this.mlsService.deleteGroup(actor.id, groupId);
-        actualGroupId = await this.mlsService.joinFromWelcome(actor.id, groupId, welcomeBytes, ratchetTreeBytes);
-      }
       // Successfully joined — no longer awaiting approval
       this._awaitingApproval = false;
     } catch (e) {
       if (String(e).includes('NoMatchingKeyPackage')) {
-        // Welcome is not for this device (CC'd copy meant for another device/co-device)
-        console.log('[_tryJoinGroup] Welcome not for this device (key package consumed):', groupId);
+        // Welcome is not for this device (CC'd copy meant for another device/co-device).
+        // Restore joined flag if _handleWelcome temporarily cleared it.
+        if (wasJoined) {
+          const meta = (await this.storage.loadGroupMeta(groupId)) || {};
+          await this.storage.saveGroupMeta(groupId, { ...meta, joined: true });
+        }
+        console.log('[_tryJoinGroup] Welcome not for this device:', groupId);
         return groupId;
       }
       throw e;
@@ -1453,7 +1455,10 @@ export class ChatController {
       if (e instanceof EncryptionLostError) {
         const meta = await this.storage.loadGroupMeta(groupId).catch(() => null) || {};
         if (meta.noLongerMember || meta.left) return null;
-        // TODO: should we flag raise ^ in test env in order to flag when sending messages to a member who has left the group? 
+        // TODO: should we flag raise ^ in test env in order to flag when sending messages to a member who has left the group?
+        // New device awaiting co-device approval — group not yet joined, silently drop rather than
+        // saving an error entry or sending a failure receipt for every message during the wait.
+        if (this._awaitingApproval) return null;
       }
       const errStr = typeof e === 'string' ? e : (e.message || String(e));
       // MLS can't decrypt messages we sent ourselves — skip silently
@@ -1643,7 +1648,6 @@ export class ChatController {
       : allKps;
 
     if (candidates.length === 0) return null;
-    if (candidates.length === 1) return { kpBytes: bytesFromInput(candidates[0].content), mlsSignature: candidates[0].mlsSignature, mlsSignerKeyId: candidates[0].mlsSignerKeyId };
 
     // Among matching candidates, pick one whose signature key isn't already in the group
     const fingerprints = await this.mlsService.getGroupFingerprints(ownActorId, groupId).catch(() => []);
